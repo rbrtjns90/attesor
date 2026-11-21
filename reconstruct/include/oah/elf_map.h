@@ -3,6 +3,10 @@
 
 #include "oah/types.h"
 
+#if defined(__APPLE__)
+#include <limits.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,6 +47,7 @@ typedef struct {
 #if defined(__APPLE__)
     const char *launcher;
     bool interpret;
+    u64 instruction_limit;
 #endif
     unsigned load_segments;
     u8 *heap_mapping;
@@ -55,6 +60,25 @@ typedef struct {
 bool oah_map_elf(oah_image *img, const char *path);
 bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot);
 int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode);
+#if defined(__APPLE__)
+#define OAH_SCRIPT_DEPTH 4
+#define OAH_SCRIPT_PREFIX (2 * OAH_SCRIPT_DEPTH + 1)
+
+typedef struct {
+    char executable[PATH_MAX];
+    struct {
+        char path[PATH_MAX];
+        char directive[256];
+        char *interpreter;
+        char *option;
+    } scripts[OAH_SCRIPT_DEPTH];
+    unsigned depth;
+} oah_darwin_program;
+
+bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot,
+                               const char *path, bool guest_exec);
+size_t oah_darwin_program_prefix(oah_darwin_program *program, char **argv);
+#endif
 void oah_unmap_elf(oah_image *img);
 
 /* Return up to *len contiguous guest bytes and update *len to their count. */

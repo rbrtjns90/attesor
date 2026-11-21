@@ -16,7 +16,7 @@
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s [--interpret] [--sysroot DIR] <x86_64-elf> [args...]\n", argv0);
+    fprintf(stderr, "usage: %s [--interpret] [--max-insns N] [--sysroot DIR] <program> [args...]\n", argv0);
 }
 
 static u64 setup_stack(oah_image *img, int argc, char **argv, char **envp)
@@ -112,12 +112,23 @@ int main(int argc, char **argv, char **envp)
 #if defined(__APPLE__)
     size_t exec_env_count = 0;
 #endif
+    u64 instruction_limit = 100000000ull;
     int guest_arg = 1;
     while (guest_arg < argc) {
         const char *option = argv[guest_arg];
         if (strcmp(option, "--interpret") == 0) {
             interpret = true;
             guest_arg++;
+        } else if (strcmp(option, "--max-insns") == 0 && guest_arg + 1 < argc) {
+            const char *value = argv[guest_arg + 1];
+            char *end;
+            errno = 0;
+            instruction_limit = strtoull(value, &end, 10);
+            if (*value < '0' || *value > '9' || *end || errno || !instruction_limit) {
+                usage(argv[0]);
+                return 2;
+            }
+            guest_arg += 2;
         } else if (strcmp(option, "--sysroot") == 0 && guest_arg + 1 < argc) {
             sysroot = argv[guest_arg + 1];
             guest_arg += 2;
@@ -167,28 +178,55 @@ int main(int argc, char **argv, char **envp)
     }
 #endif
     const char *program = exec_path ? exec_path : argv[guest_arg];
+    int program_argc = argc - guest_arg;
+    char **program_argv = argv + guest_arg;
+    char **script_argv = NULL;
+#if defined(__APPLE__)
+    oah_darwin_program resolved;
+    if (!exec_path) {
+        if (!oah_darwin_resolve_program(&resolved, sysroot, program, false)) {
+            fprintf(stderr, "oah: cannot load %s (%s)\n", program, strerror(errno));
+            return 127;
+        }
+        program = resolved.executable;
+        char *prefix[OAH_SCRIPT_PREFIX];
+        size_t prefix_count = oah_darwin_program_prefix(&resolved, prefix);
+        if (prefix_count) {
+            script_argv = calloc((size_t)program_argc + prefix_count, sizeof(*script_argv));
+            if (!script_argv) {
+                return 127;
+            }
+            memcpy(script_argv, prefix, prefix_count * sizeof(*script_argv));
+            memcpy(script_argv + prefix_count, program_argv + 1, (size_t)program_argc * sizeof(*script_argv));
+            program_argc += (int)prefix_count - 1;
+            program_argv = script_argv;
+        }
+    }
+#endif
     if (!oah_map_elf_sysroot(&img, program, sysroot)) {
         fprintf(stderr, "oah: cannot load %s (%s)\n", program,
                 errno == ENOTSUP ? "dynamic ELF requires --sysroot"
                 : errno ? strerror(errno) : "invalid x86-64 ELF");
+        free(script_argv);
         return 127;
     }
 
 #if defined(__APPLE__)
     img.interpret = interpret;
+    img.instruction_limit = instruction_limit;
     if (_NSGetExecutablePath(executable, &executable_size) == 0 && realpath(executable, launcher)) {
         img.launcher = launcher;
     }
 #endif
 
-    rsp = setup_stack(&img, argc - guest_arg, argv + guest_arg, envp);
+    rsp = setup_stack(&img, program_argc, program_argv, envp);
+    free(script_argv);
     if (!rsp) {
         fprintf(stderr, "oah: failed to allocate guest stack\n");
         oah_unmap_elf(&img);
         return 127;
     }
 
-    const u64 instruction_limit = 100000000ull;
     oah_guest_init(&guest, img.interp_entry ? img.interp_entry : img.entry, rsp);
 #if defined(__APPLE__)
     run = interpret ? oah_interp_run(&guest, &img, instruction_limit)

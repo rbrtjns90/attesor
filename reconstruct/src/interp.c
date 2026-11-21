@@ -94,11 +94,11 @@ static void store_reg(oah_guest *g, u8 reg, u8 width, bool rex, u64 value)
 static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 next)
 {
     u8 op = in->vector_opcode;
-    bool fp_alu = op == 0x58 || op == 0x59 || op == 0x5c || op == 0x5e || op == 0x5f;
+    bool fp_alu = op == 0x58 || op == 0x59 || op == 0x5c || op == 0x5d || op == 0x5e || op == 0x5f;
     bool fp_compare = op == 0x2e || op == 0x2f;
     unsigned width = op == 0xc4 ? 2
                    : op == 0x2a ? in->src_width
-                   : (fp_alu || fp_compare || op == 0x2c || op == 0x5a) ? in->opsize
+                   : (fp_alu || fp_compare || op == 0xc2 || op == 0x2c || op == 0x51 || op == 0x5a) ? in->opsize
                    : (op == 0x6e || op == 0x7e || op == OAH_VECTOR_SCALAR_LOAD || op == OAH_VECTOR_SCALAR_STORE) ? in->opsize
                    : ((op >= 0x12 && op <= 0x17) || op == 0x7a || op == 0xd6) ? 8 : 16;
     bool store = op == 0xe7 || op == OAH_VECTOR_SCALAR_STORE || op == 0x11 || op == 0x29 || op == 0x7f || op == 0x7e || op == 0xd6 ||
@@ -139,6 +139,36 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         break;
     }
+    case OAH_VECTOR_ADD_PACKED_FLOAT:
+        for (unsigned i = 0; i < 16; i += in->opsize) {
+            if (in->opsize == 4) {
+                float lhs, rhs;
+                memcpy(&lhs, xmm + i, sizeof(lhs));
+                memcpy(&rhs, other + i, sizeof(rhs));
+                lhs += rhs;
+                memcpy(xmm + i, &lhs, sizeof(lhs));
+            } else {
+                double lhs, rhs;
+                memcpy(&lhs, xmm + i, sizeof(lhs));
+                memcpy(&rhs, other + i, sizeof(rhs));
+                lhs += rhs;
+                memcpy(xmm + i, &lhs, sizeof(lhs));
+            }
+        }
+        break;
+    case 0x51:
+        if (width == 4) {
+            float value;
+            memcpy(&value, other, sizeof(value));
+            value = sqrtf(value);
+            memcpy(xmm, &value, sizeof(value));
+        } else {
+            double value;
+            memcpy(&value, other, sizeof(value));
+            value = sqrt(value);
+            memcpy(xmm, &value, sizeof(value));
+        }
+        break;
     case 0x5a:
         if (width == 4) {
             float value;
@@ -184,8 +214,9 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         break;
     }
+    case 0xc2:
     case 0x2e: case 0x2f:
-    case 0x58: case 0x59: case 0x5c: case 0x5e: case 0x5f: {
+    case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5e: case 0x5f: {
         double lhs, rhs;
         if (width == 4) {
             float a, b;
@@ -197,8 +228,22 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             memcpy(&lhs, xmm, 8);
             memcpy(&rhs, other, 8);
         }
-        if (op == 0x5f) {
-            if (!(lhs > rhs)) {
+        if (op == 0xc2) {
+            bool unordered = __builtin_isunordered(lhs, rhs);
+            bool matches;
+            switch (in->imm & 7) {
+            case 0: matches = lhs == rhs; break;
+            case 1: matches = lhs < rhs; break;
+            case 2: matches = lhs <= rhs; break;
+            case 3: matches = unordered; break;
+            case 4: matches = lhs != rhs; break;
+            case 5: matches = !(lhs < rhs); break;
+            case 6: matches = !(lhs <= rhs); break;
+            default: matches = !unordered; break;
+            }
+            memset(xmm, matches ? 255 : 0, width);
+        } else if (op == 0x5d || op == 0x5f) {
+            if (!(op == 0x5d ? lhs < rhs : lhs > rhs)) {
                 memmove(xmm, other, width);
             }
         } else if (fp_compare) {
@@ -231,6 +276,15 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         break;
     case OAH_VECTOR_SCALAR_STORE:
         memmove(other, xmm, width);
+        break;
+    case 0xf4:
+        for (unsigned offset = 0; offset < 16; offset += 8) {
+            u32 lhs, rhs;
+            memcpy(&lhs, xmm + offset, sizeof(lhs));
+            memcpy(&rhs, other + offset, sizeof(rhs));
+            u64 product = (u64)lhs * rhs;
+            memcpy(xmm + offset, &product, sizeof(product));
+        }
         break;
     case 0xd4:
     case 0xfe: {
@@ -286,6 +340,10 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     case 0x6c:
         memcpy(xmm + 8, other, 8);
         break;
+    case 0x14:
+    case 0x15:
+    case OAH_VECTOR_UNPACK_LOW_DOUBLE:
+    case OAH_VECTOR_UNPACK_HIGH_DOUBLE:
     case 0x60:
     case 0x61:
     case 0x62:
@@ -293,8 +351,11 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     case 0x69:
     case 0x6a:
     case 0x6d: {
-        unsigned lane = op == 0x6d ? 8 : 1u << (op & 3);
-        unsigned start = op >= 0x68 ? 8 : 0;
+        unsigned lane = op == 0x6d || op == OAH_VECTOR_UNPACK_LOW_DOUBLE ||
+                        op == OAH_VECTOR_UNPACK_HIGH_DOUBLE ? 8 :
+                        op == 0x14 || op == 0x15 ? 4 : 1u << (op & 3);
+        unsigned start = op == 0x15 || op == OAH_VECTOR_UNPACK_HIGH_DOUBLE ||
+                         op >= 0x68 ? 8 : 0;
         u8 values[16];
         for (unsigned offset = 0; offset < 8; offset += lane) {
             memcpy(values + 2 * offset, xmm + start + offset, lane);
@@ -309,6 +370,15 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             memcpy(&value, other, sizeof(value));
         }
         memcpy(xmm + (in->imm & 7) * 2, &value, sizeof(value));
+        break;
+    }
+    case OAH_VECTOR_SHUFFLE_PACKED_SINGLE: {
+        u8 result[16];
+        for (unsigned lane = 0; lane < 4; lane++) {
+            unsigned selected = (in->imm >> (lane * 2)) & 3;
+            memcpy(result + lane * 4, (lane < 2 ? xmm : other) + selected * 4, 4);
+        }
+        memcpy(xmm, result, sizeof(result));
         break;
     }
     case 0xc6: {
@@ -338,7 +408,26 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         memcpy(xmm, values, sizeof(values));
         break;
     }
+    case 0x71:
+    case 0x72:
     case 0x73: {
+        if (in->cc == 2 || in->cc == 4 || in->cc == 6) {
+            unsigned lane = 2u << (op - 0x71);
+            unsigned bits = lane * 8;
+            unsigned count = in->imm < bits ? (unsigned)in->imm : bits;
+            for (unsigned offset = 0; offset < 16; offset += lane) {
+                u64 value = 0;
+                memcpy(&value, other + offset, lane);
+                if (in->cc == 4) {
+                    s64 signed_value = lane == 2 ? (int16_t)value : (s32)value;
+                    value = (u64)(signed_value >> (count < bits ? count : bits - 1));
+                } else {
+                    value = count == bits ? 0 : in->cc == 2 ? value >> count : value << count;
+                }
+                memcpy(other + offset, &value, lane);
+            }
+            break;
+        }
         unsigned count = in->imm < 16 ? (unsigned)in->imm : 16;
         u8 values[16] = {0};
         if (in->cc == 7) {
@@ -371,14 +460,16 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         break;
     case 0x57:
     case 0xef:
+    case 0x55:
+    case 0x56:
     case 0xdf:
     case 0x54:
     case 0xdb:
     case 0xeb:
         for (unsigned i = 0; i < 16; i++) {
-            xmm[i] = op == 0xdf ? ~xmm[i] & other[i]
+            xmm[i] = (op == 0xdf || op == 0x55) ? ~xmm[i] & other[i]
                    : (op == 0xdb || op == 0x54) ? xmm[i] & other[i]
-                   : op == 0xeb ? xmm[i] | other[i] : xmm[i] ^ other[i];
+                   : (op == 0xeb || op == 0x56) ? xmm[i] | other[i] : xmm[i] ^ other[i];
         }
         break;
     case 0xd7: {

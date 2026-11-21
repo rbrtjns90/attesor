@@ -160,6 +160,112 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
     }
     return open(resolved, flags | O_NOFOLLOW, (mode_t)mode);
 }
+/* Resolve the guest program without passing a guest script to a host shell. */
+bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot,
+                               const char *path, bool guest_exec)
+{
+    program->depth = 0;
+    for (;;) {
+        char *resolved = program->executable;
+        int fd = -1;
+        if (guest_exec && sysroot && path[0] == '/') {
+            fd = oah_sysroot_open(sysroot, path, O_RDONLY | O_CLOEXEC | O_NONBLOCK, 0);
+            if (fd < 0 && errno != ENOENT && errno != ENOTDIR) {
+                return false;
+            }
+        }
+        if (fd < 0) {
+            fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        }
+        if (fd < 0) {
+            return false;
+        }
+        struct stat st;
+        char bytes[256];
+        ssize_t length = -1;
+        int error = 0;
+        if (fstat(fd, &st) < 0 || fcntl(fd, F_GETPATH, resolved) < 0) {
+            error = errno;
+        } else if (!S_ISREG(st.st_mode) || (guest_exec && access(resolved, X_OK) < 0)) {
+            error = EACCES;
+        } else {
+            length = pread(fd, bytes, sizeof(bytes), 0);
+            if (length < 0) {
+                error = errno;
+            }
+        }
+        close(fd);
+        if (error) {
+            errno = error;
+            return false;
+        }
+        if (length >= 2 && bytes[0] == '#' && bytes[1] == '!') {
+            if (program->depth == OAH_SCRIPT_DEPTH) {
+                errno = ELOOP;
+                return false;
+            }
+            unsigned depth = program->depth++;
+            char *line = program->scripts[depth].directive;
+            const char *newline = memchr(bytes, '\n', length);
+            size_t size = newline ? (size_t)(newline - bytes) : (size_t)length;
+            if (size >= sizeof(bytes)) {
+                errno = ENOEXEC;
+                return false;
+            }
+            memcpy(line, bytes, size);
+            while (size > 2 && (line[size - 1] == ' ' || line[size - 1] == '\t')) {
+                size--;
+            }
+            line[size] = 0;
+            char *interpreter = line + 2 + strspn(line + 2, " \t");
+            if (!*interpreter) {
+                errno = ENOEXEC;
+                return false;
+            }
+            char *option = interpreter + strcspn(interpreter, " \t");
+            if (*option) {
+                *option++ = 0;
+                option += strspn(option, " \t");
+            }
+            strcpy(program->scripts[depth].path, resolved);
+            program->scripts[depth].interpreter = interpreter;
+            program->scripts[depth].option = *option ? option : NULL;
+            path = interpreter;
+            guest_exec = true;
+            continue;
+        }
+        Elf64_Ehdr header;
+        if (length >= (ssize_t)sizeof(header)) {
+            memcpy(&header, bytes, sizeof(header));
+            if (!memcmp(header.e_ident, ELFMAG, SELFMAG) &&
+                header.e_ident[EI_CLASS] == ELFCLASS64 &&
+                header.e_ident[EI_DATA] == ELFDATA2LSB && header.e_machine == EM_X86_64) {
+                return true;
+            }
+        }
+        errno = ENOEXEC;
+        return false;
+    }
+}
+
+size_t oah_darwin_program_prefix(oah_darwin_program *program, char **argv)
+{
+    unsigned depth = program->depth;
+    if (!depth) {
+        return 0;
+    }
+    size_t count = 0;
+    argv[count++] = program->scripts[depth - 1].interpreter;
+    while (depth) {
+        depth--;
+        if (program->scripts[depth].option) {
+            argv[count++] = program->scripts[depth].option;
+        }
+        argv[count++] = program->scripts[depth].path;
+    }
+    return count;
+}
+
 #endif
 
 static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)

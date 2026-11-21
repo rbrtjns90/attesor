@@ -2,12 +2,12 @@
 
 This tree is a **from-scratch, evidence-based reconstruction** of Apple's
 `RosettaLinux/rosetta` translator. It does **not** continue the earlier
-`rosetta_*.c` rewrite (that tree mixed guessed names with empty tests).
+[`rosetta_*.c` rewrite](../legacy/translator/) (that tree mixed guessed names with empty tests).
 
 Sources of truth, in order:
 
 1. The original ELF (optional, gitignored): drop it at `bin/rosetta`
-2. `../rosetta_decomp.c` (Ghidra dump of that ELF)
+2. [`rosetta_decomp.c`](../research/decompilation/rosetta_decomp.c) (Ghidra dump of that ELF)
 
 Do **not** commit the binary. `make inventory-binary` regenerates
 `inventory/from_binary/` from it.

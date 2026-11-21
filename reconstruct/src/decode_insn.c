@@ -378,13 +378,18 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             out->opsize = opsize;
             goto done;
         }
+        bool shuffle_ps = !operand_override && !repeat && !repeat_not_equal && ext == 0xc6;
         bool shuffle_words = (repeat || repeat_not_equal) && !operand_override && ext == 0x70;
         bool scalar_move = !operand_override && (repeat || repeat_not_equal) &&
                            (ext == 0x10 || ext == 0x11);
         bool scalar_fp = !operand_override && (repeat || repeat_not_equal) &&
-                         (ext == 0x2a || ext == 0x2c || ext == 0x58 || ext == 0x59 ||
-                          ext == 0x5a || ext == 0x5c || ext == 0x5e || ext == 0x5f);
+                         (ext == 0x2a || ext == 0x2c || ext == 0x51 || ext == 0x58 || ext == 0x59 ||
+                          ext == 0x5a || ext == 0x5c || ext == 0x5d || ext == 0x5e || ext == 0x5f || ext == 0xc2);
         bool compare_fp = !repeat && !repeat_not_equal && (ext == 0x2e || ext == 0x2f);
+        bool add_packed_fp = !repeat && !repeat_not_equal && ext == 0x58;
+        bool unpack_fp = !repeat && !repeat_not_equal && (ext == 0x14 || ext == 0x15);
+        bool logic_ps = !operand_override && !repeat && !repeat_not_equal &&
+                        ext >= 0x54 && ext <= 0x57;
         bool vector_move = ((!operand_override && !repeat &&
                             (ext == 0x10 || ext == 0x11 || (ext >= 0x12 && ext <= 0x17 && ext != 0x14 && ext != 0x15) || ext == 0x28 || ext == 0x29))) ||
                            ((operand_override || repeat) && (ext == 0x6f || ext == 0x7f));
@@ -392,11 +397,11 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                          ext == 0x12 || ext == 0x13 || ext == 0x16 || ext == 0x17 ||
                          (ext >= 0x60 && ext <= 0x62) || (ext >= 0x68 && ext <= 0x6a) ||
                          (ext >= 0x64 && ext <= 0x67) || (ext >= 0x74 && ext <= 0x76) ||
-                         ext == 0x54 || ext == 0x28 || ext == 0x29 || ext == 0x6d || ext == 0x70 || ext == 0x73 ||
+                         (ext >= 0x54 && ext <= 0x57) || ext == 0x28 || ext == 0x29 || ext == 0x6d || (ext >= 0x70 && ext <= 0x73) ||
                          ext == 0xc4 || ext == 0xc6 || ext == 0xe7 || ext == 0xd4 || ext == 0xd6 || ext == 0xd7 || ext == 0xda ||
-                         ext == 0xde || ext == 0xfc || ext == 0xdb || ext == 0xdf || ext == 0xeb || ext == 0xef || ext == 0xf8 || ext == 0xfe);
-        if (shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
-            (!operand_override && !repeat && ext == 0x57) || (repeat && ext == 0x7e)))) {
+                         ext == 0xde || ext == 0xfc || ext == 0xdb || ext == 0xdf || ext == 0xeb || ext == 0xef || ext == 0xf4 || ext == 0xf8 || ext == 0xfe);
+        if (add_packed_fp || unpack_fp || logic_ps || shuffle_ps || shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
+            (repeat && ext == 0x7e)))) {
             take(&d);
             u8 vector_modrm = take(&d);
             decode_rm(&d, out, vector_modrm, rex, address32, segment);
@@ -409,17 +414,29 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             }
             out->op = OAH_OP_VECTOR;
             out->vector_opcode = repeat && ext == 0x7e ? 0x7a : ext;
-            if (ext == 0x73) {
+            if (ext >= 0x71 && ext <= 0x73) {
                 u8 group = (vector_modrm >> 3) & 7;
-                if (out->memory || (group != 3 && group != 7)) {
+                bool shift = group == 2 || group == 6 ||
+                             (ext == 0x73 ? group == 3 || group == 7 : group == 4);
+                if (out->memory || !shift) {
                     return false;
                 }
                 out->cc = group;
             }
-            if (ext == 0xc4 || ext == 0xc6 || ext == 0x70 || ext == 0x73) {
+            if (ext == 0xc2 || ext == 0xc4 || ext == 0xc6 || (ext >= 0x70 && ext <= 0x73)) {
                 out->imm = take(&d);
             }
             out->opsize = (rex & 8) ? 8 : 4;
+            if (add_packed_fp) {
+                out->vector_opcode = OAH_VECTOR_ADD_PACKED_FLOAT;
+                out->opsize = operand_override ? 8 : 4;
+            }
+            if (unpack_fp && operand_override) {
+                out->vector_opcode = ext == 0x14 ? OAH_VECTOR_UNPACK_LOW_DOUBLE : OAH_VECTOR_UNPACK_HIGH_DOUBLE;
+            }
+            if (shuffle_ps) {
+                out->vector_opcode = OAH_VECTOR_SHUFFLE_PACKED_SINGLE;
+            }
             if (shuffle_words) {
                 out->vector_opcode = repeat ? OAH_VECTOR_SHUFFLE_HIGH_WORDS : OAH_VECTOR_SHUFFLE_LOW_WORDS;
             }
@@ -431,7 +448,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                 out->opsize = repeat_not_equal || operand_override ? 8 : 4;
                 out->src_width = rex & 8 ? 8 : 4;
             }
-            out->aligned = ext == 0xe7 || ext == 0x28 || ext == 0x29 ||
+            out->aligned = add_packed_fp || ext == 0xe7 || ext == 0x28 || ext == 0x29 ||
                            (operand_override && (ext == 0x6f || ext == 0x7f));
             goto done;
         }

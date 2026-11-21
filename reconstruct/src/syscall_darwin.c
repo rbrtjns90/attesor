@@ -5,7 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <libproc.h>
 #include <poll.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +52,17 @@ static s64 linux_error(int error)
     case EPROTONOSUPPORT: return -LINUX_EPROTONOSUPPORT;
     case ESOCKTNOSUPPORT: return -LINUX_ESOCKTNOSUPPORT;
     case EAFNOSUPPORT: return -LINUX_EAFNOSUPPORT;
+    case EADDRINUSE: return -98;
+    case EADDRNOTAVAIL: return -99;
+    case ENETUNREACH: return -101;
+    case ECONNABORTED: return -103;
+    case ECONNRESET: return -104;
+    case EISCONN: return -106;
     case ENOTCONN: return -LINUX_ENOTCONN;
+    case ECONNREFUSED: return -111;
+    case EHOSTUNREACH: return -113;
+    case EALREADY: return -114;
+    case EINPROGRESS: return -115;
     case ETIMEDOUT: return -LINUX_ETIMEDOUT;
     default:
         /* The POSIX errors through ERANGE share numbers except those above. */
@@ -73,6 +86,7 @@ typedef struct guest_child {
 } guest_child;
 
 static guest_child *children;
+static int vfork_release_fd = -1;
 
 static void record_signal(int signal)
 {
@@ -174,6 +188,10 @@ static s64 guest_fork(void)
         return linux_error(error);
     }
     if (!pid) {
+        if (vfork_release_fd >= 0) {
+            close(vfork_release_fd);
+            vfork_release_fd = -1;
+        }
         free(entry);
         while (children) {
             forget_child(children->pid);
@@ -183,6 +201,38 @@ static s64 guest_fork(void)
     } else {
         *entry = (guest_child){pid, children};
         children = entry;
+    }
+    return pid;
+}
+
+/* The child has a private address space, but the parent resumes only
+ * after the child's exec or exit closes the notification descriptor. */
+static s64 guest_vfork(void)
+{
+    int notification[2];
+    if (pipe(notification) < 0) {
+        return linux_error(errno);
+    }
+    if (fcntl(notification[1], F_SETFD, FD_CLOEXEC) < 0) {
+        int error = errno;
+        close(notification[0]);
+        close(notification[1]);
+        return linux_error(error);
+    }
+    s64 pid = guest_fork();
+    if (!pid) {
+        close(notification[0]);
+        vfork_release_fd = notification[1];
+    } else {
+        close(notification[1]);
+        if (pid > 0) {
+            char ignored;
+            ssize_t count;
+            do {
+                count = read(notification[0], &ignored, sizeof(ignored));
+            } while (count > 0 || (count < 0 && errno == EINTR));
+        }
+        close(notification[0]);
     }
     return pid;
 }
@@ -327,7 +377,9 @@ static bool sysroot_path(const oah_image *img, const char *path)
     return img->sysroot && (strncmp(path, "/lib/", 5) == 0 ||
            strncmp(path, "/lib64/", 7) == 0 || strncmp(path, "/usr/lib/", 9) == 0 ||
            strncmp(path, "/usr/lib64/", 11) == 0 || strncmp(path, "/usr/libexec/", 13) == 0 || strncmp(path, "/etc/ld.", 8) == 0 ||
-           strncmp(path, "/etc/ld-musl-", 13) == 0);
+           strncmp(path, "/etc/ld-musl-", 13) == 0 ||
+           strncmp(path, "/etc/apt/", 9) == 0 || strncmp(path, "/usr/share/dpkg/", 16) == 0 ||
+           strncmp(path, "/var/lib/dpkg/", 14) == 0);
 }
 
 static int open_guest_path(oah_image *img, int dirfd, const char *path, int host_flags, u64 mode)
@@ -790,6 +842,58 @@ static void forget_directory(int fd)
     }
 }
 
+static s64 guest_close_range(u32 first, u32 last, u32 flags)
+{
+    if (last < first || (flags & ~6u)) {
+        return -EINVAL;
+    }
+    /* The guest has one thread and fork already gives children separate tables. */
+    errno = 0;
+    const int needed = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, NULL, 0);
+    if (needed <= 0) {
+        return errno ? linux_error(errno) : 0;
+    }
+    if (needed > INT_MAX - 1024) {
+        return -ENOMEM;
+    }
+    int capacity = needed + 1024;
+    struct proc_fdinfo *fds = malloc((size_t)capacity);
+    if (!fds) {
+        return -ENOMEM;
+    }
+    errno = 0;
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, capacity);
+    if (bytes <= 0) {
+        int error = errno;
+        free(fds);
+        return error ? linux_error(error) : 0;
+    }
+    for (size_t i = 0; i < (size_t)bytes / sizeof(*fds); i++) {
+        int fd = fds[i].proc_fd;
+        if ((u32)fd < first || (u32)fd > last || fd == vfork_release_fd) {
+            continue;
+        }
+        bool internal = false;
+        for (guest_dir *dir = directories; dir; dir = dir->next) {
+            if (dirfd(dir->stream) == fd) {
+                internal = true;
+                break;
+            }
+        }
+        if (internal) {
+            continue;
+        }
+        if (flags & 4) {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        } else {
+            forget_directory(fd);
+            close(fd);
+        }
+    }
+    free(fds);
+    return 0;
+}
+
 static s64 guest_getdents(oah_image *img, int fd, u64 address, u64 size)
 {
     u8 *output = oah_guest_access(img, address, size, PROT_WRITE);
@@ -871,6 +975,199 @@ static s64 guest_fd_pair(oah_image *img, u64 address, u64 flags, int socket_type
     return 0;
 }
 
+static int socket_flags(int fd, u64 flags)
+{
+    int status = fcntl(fd, F_GETFL);
+    int enabled = 1;
+    if (status < 0 ||
+        fcntl(fd, F_SETFL, (status & ~O_NONBLOCK) | (flags & 0x800 ? O_NONBLOCK : 0)) < 0 ||
+        fcntl(fd, F_SETFD, flags & 0x80000 ? FD_CLOEXEC : 0) < 0) {
+        return -1;
+    }
+    /* Keep a broken connection from terminating the native launcher. */
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+}
+
+static s64 guest_socket(u64 family, u64 type_flags, u64 protocol)
+{
+    if (type_flags & ~0x8080full) {
+        return -EINVAL;
+    }
+    if (family != 2 && family != 10) {
+        return -LINUX_EAFNOSUPPORT;
+    }
+    int type = type_flags & 0xf;
+    if (type != 1 && type != 2) {
+        return -LINUX_ESOCKTNOSUPPORT;
+    }
+    if (protocol != 0 && protocol != 6 && protocol != 17) {
+        return -LINUX_EPROTONOSUPPORT;
+    }
+    int fd = socket(family == 2 ? AF_INET : AF_INET6,
+                    type == 1 ? SOCK_STREAM : SOCK_DGRAM, (int)protocol);
+    if (fd < 0) {
+        return linux_error(errno);
+    }
+    if (socket_flags(fd, type_flags) < 0) {
+        int error = errno;
+        close(fd);
+        return linux_error(error);
+    }
+    return fd;
+}
+
+static s64 guest_socket_address(oah_image *img, int fd, u64 address, u64 size, bool binding)
+{
+    if (size < 2 || size > sizeof(struct sockaddr_storage)) {
+        return -EINVAL;
+    }
+    const u8 *input = oah_guest_access(img, address, size, PROT_READ);
+    if (!input) {
+        return -EFAULT;
+    }
+    u16 family;
+    memcpy(&family, input, sizeof(family));
+    struct sockaddr_storage host = {0};
+    socklen_t length = family == 2 ? sizeof(struct sockaddr_in) :
+                       family == 10 ? sizeof(struct sockaddr_in6) : 0;
+    if (!length) {
+        return -LINUX_EAFNOSUPPORT;
+    }
+    if (size < length) {
+        return -EINVAL;
+    }
+    memcpy(&host, input, length);
+    host.ss_len = length;
+    host.ss_family = family == 2 ? AF_INET : AF_INET6;
+    return host_result(binding ? bind(fd, (const struct sockaddr *)&host, length) :
+                                 connect(fd, (const struct sockaddr *)&host, length));
+}
+
+static s64 guest_socket_name(oah_image *img, int fd, u64 address, u64 size_address,
+                             u64 flags, u64 nr)
+{
+    bool accepting = nr == 43 || nr == 288;
+    if (flags & ~0x80800ull) {
+        return -EINVAL;
+    }
+    u32 size = 0;
+    void *length_output = NULL, *output = NULL;
+    if (!accepting || address) {
+        length_output = oah_guest_access(img, size_address, sizeof(size), PROT_READ | PROT_WRITE);
+        if (!length_output) {
+            return -EFAULT;
+        }
+        memcpy(&size, length_output, sizeof(size));
+        if ((s32)size < 0) {
+            return -EINVAL;
+        }
+        size = size < sizeof(struct sockaddr_storage) ? size : sizeof(struct sockaddr_storage);
+        output = size ? oah_guest_access(img, address, size, PROT_WRITE) : NULL;
+        if (size && !output) {
+            return -EFAULT;
+        }
+    }
+    struct sockaddr_storage host = {0};
+    struct sockaddr *name = (struct sockaddr *)&host;
+    socklen_t length = sizeof(host);
+    int result = accepting ? accept(fd, length_output ? name : NULL, length_output ? &length : NULL)
+                 : nr == 51 ? getsockname(fd, name, &length) : getpeername(fd, name, &length);
+    if (result < 0) {
+        return linux_error(errno);
+    }
+    if (accepting && socket_flags(result, flags) < 0) {
+        int error = errno;
+        close(result);
+        return linux_error(error);
+    }
+    if (length_output) {
+        u16 family = host.ss_family == AF_INET ? 2 : host.ss_family == AF_INET6 ? 10 : 0;
+        if (!family) {
+            if (accepting) {
+                close(result);
+            }
+            return -LINUX_EAFNOSUPPORT;
+        }
+        memcpy(&host, &family, sizeof(family));
+        if (size) {
+            memcpy(output, &host, size < length ? size : length);
+        }
+        u32 guest_length = length;
+        memcpy(length_output, &guest_length, sizeof(guest_length));
+    }
+    return result;
+}
+
+static int guest_socket_option(u64 level, u64 option, int *host_level)
+{
+    if (level == 1) {
+        *host_level = SOL_SOCKET;
+        switch (option) {
+        case 2: return SO_REUSEADDR;
+        case 3: return SO_TYPE;
+        case 4: return SO_ERROR;
+        case 6: return SO_BROADCAST;
+        case 9: return SO_KEEPALIVE;
+        default: return -1;
+        }
+    }
+    if (level == 6 && option == 1) {
+        *host_level = IPPROTO_TCP;
+        return TCP_NODELAY;
+    }
+    return -1;
+}
+
+static s64 guest_socket_options(oah_image *img, int fd, u64 level, u64 option,
+                                u64 address, u64 length, bool setting)
+{
+    int host_level;
+    int host_option = guest_socket_option(level, option, &host_level);
+    if (host_option < 0) {
+        return -92; /* ENOPROTOOPT */
+    }
+    int value;
+    if (setting) {
+        const void *input = oah_guest_access(img, address, sizeof(value), PROT_READ);
+        if (length < sizeof(value)) {
+            return -EINVAL;
+        }
+        if (!input) {
+            return -EFAULT;
+        }
+        memcpy(&value, input, sizeof(value));
+        return host_result(setsockopt(fd, host_level, host_option, &value, sizeof(value)));
+    }
+    void *size_address = oah_guest_access(img, length, 4, PROT_READ | PROT_WRITE);
+    u32 size;
+    if (!size_address) {
+        return -EFAULT;
+    }
+    memcpy(&size, size_address, sizeof(size));
+    if ((s32)size < 0) {
+        return -EINVAL;
+    }
+    if (size > sizeof(value)) {
+        size = sizeof(value);
+    }
+    void *output = size ? oah_guest_access(img, address, size, PROT_WRITE) : NULL;
+    if (size && !output) {
+        return -EFAULT;
+    }
+    socklen_t actual = sizeof(value);
+    if (getsockopt(fd, host_level, host_option, &value, &actual) < 0) {
+        return linux_error(errno);
+    }
+    if (host_level == SOL_SOCKET && host_option == SO_ERROR && value) {
+        value = (int)-linux_error(value);
+    }
+    if (size) {
+        memcpy(output, &value, size);
+    }
+    memcpy(size_address, &size, sizeof(size));
+    return 0;
+}
+
 /* The vectors are host-owned. Their strings stay in the guest image
  * until execve copies them into the new process. */
 static s64 guest_exec_vector(oah_image *img, u64 address, char **vector,
@@ -912,39 +1209,12 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
     if (!path || !img->launcher || !*path) {
         return !path ? -EFAULT : !*path ? -ENOENT : -LINUX_ENOSYS;
     }
-    int fd = -1;
-    if (path[0] == '/' && img->sysroot) {
-        fd = oah_sysroot_open(img->sysroot, path, O_RDONLY | O_CLOEXEC | O_NONBLOCK, 0);
-        if (fd < 0 && errno != ENOENT && errno != ENOTDIR) {
-            return linux_error(errno);
-        }
-    }
-    if (fd < 0) {
-        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    }
-    if (fd < 0) {
+    oah_darwin_program program;
+    if (!oah_darwin_resolve_program(&program, img->sysroot, path, true)) {
         return linux_error(errno);
     }
-    struct stat st;
-    Elf64_Ehdr header;
-    char target[PATH_MAX];
-    s64 result = 0;
-    if (fstat(fd, &st) < 0 || fcntl(fd, F_GETPATH, target) < 0) {
-        result = linux_error(errno);
-    } else if (!S_ISREG(st.st_mode) || access(target, X_OK) < 0) {
-        result = -EACCES;
-    } else if (pread(fd, &header, sizeof(header), 0) != sizeof(header) ||
-               memcmp(header.e_ident, ELFMAG, SELFMAG) ||
-               header.e_ident[EI_CLASS] != ELFCLASS64 ||
-               header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_machine != EM_X86_64) {
-        result = -ENOEXEC;
-    }
-    close(fd);
-    if (result) {
-        return result;
-    }
 
-    enum { MAX_VECTOR = 4096, LAUNCH_ARGS = 10 };
+    enum { MAX_VECTOR = 4096, LAUNCH_ARGS = 12 + OAH_SCRIPT_PREFIX };
     char **args = calloc(2 * MAX_VECTOR + LAUNCH_ARGS, sizeof(*args));
     if (!args) {
         return -ENOMEM;
@@ -958,14 +1228,21 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
         args[count++] = "--sysroot";
         args[count++] = (char *)img->sysroot;
     }
+    char instruction_limit[24];
+    if (img->instruction_limit) {
+        snprintf(instruction_limit, sizeof(instruction_limit), "%llu",
+                 (unsigned long long)img->instruction_limit);
+        args[count++] = "--max-insns";
+        args[count++] = instruction_limit;
+    }
     args[count++] = "--guest-exec";
-    args[count++] = target;
+    args[count++] = program.executable;
     char env_count_text[16];
     args[count++] = env_count_text;
     args[count++] = "--";
 
     /* Pass guest variables as payload so the host loader never reads them. */
-    result = guest_exec_vector(img, env_arg, args + count, MAX_VECTOR, &bytes, false);
+    s64 result = guest_exec_vector(img, env_arg, args + count, MAX_VECTOR, &bytes, false);
     if (!result) {
         size_t env_count = 0;
         while (args[count + env_count]) {
@@ -974,7 +1251,13 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
         snprintf(env_count_text, sizeof(env_count_text), "%zu", env_count);
         count += env_count;
         args[count++] = "";
-        result = guest_exec_vector(img, argv_arg, args + count, MAX_VECTOR, &bytes, true);
+        char *prefix[OAH_SCRIPT_PREFIX];
+        size_t prefix_count = oah_darwin_program_prefix(&program, prefix);
+        size_t start = count + (prefix_count ? prefix_count - 1 : 0);
+        result = guest_exec_vector(img, argv_arg, args + start, MAX_VECTOR, &bytes, true);
+        if (!result && prefix_count) {
+            memcpy(args + count, prefix, prefix_count * sizeof(*args));
+        }
     }
     if (!result) {
         char *const host_env[] = {NULL};
@@ -1119,6 +1402,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case OAH_X86_NR_OPENAT:
         result = guest_open(img, (int)a0, a1, a2, a3);
         break;
+    case 436: result = guest_close_range((u32)a0, (u32)a1, (u32)a2); break;
     case OAH_X86_NR_CLOSE:
         forget_directory((int)a0);
         result = host_result(close((int)a0));
@@ -1199,11 +1483,42 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 32: /* dup */
         result = host_result(dup((int)a0));
         break;
-    case 33: /* dup2 */
-        result = host_result(dup2((int)a0, (int)a1));
-        if (result >= 0 && a0 != a1) {
-            forget_directory((int)a1);
+    case 33: case 292: { /* dup2, dup3 */
+        int source = (int)a0, target = (int)a1;
+        if (nr == 292 && (source == target || (a2 & ~0x80000ull))) {
+            result = -EINVAL;
+            break;
         }
+        result = host_result(dup2(source, target));
+        if (result >= 0 && source != target) {
+            forget_directory(target);
+            if (nr == 292 && a2 && fcntl(target, F_SETFD, FD_CLOEXEC) < 0) {
+                result = linux_error(errno);
+                close(target);
+            }
+        }
+        break;
+    }
+    case 41: result = guest_socket(a0, a1, a2); break;
+    case 42: case 49: /* connect, bind */
+        result = guest_socket_address(img, (int)a0, a1, a2, nr == 49);
+        break;
+    case 43: case 51: case 52: case 288: /* accept, getsockname, getpeername, accept4 */
+        result = guest_socket_name(img, (int)a0, a1, a2, nr == 288 ? a3 : 0, nr);
+        break;
+    case 44: case 45: { /* connected sendto, recvfrom */
+        bool receiving = nr == 45;
+        u64 allowed = 0x40 | (receiving ? 0x2 : 0x4000);
+        int flags = (a3 & 0x40 ? MSG_DONTWAIT : 0) | (a3 & 0x2 ? MSG_PEEK : 0);
+        void *bytes = oah_guest_access(img, a1, a2, receiving ? PROT_WRITE : PROT_READ);
+        result = a4 || a5 || (a3 & ~allowed) ? -LINUX_EOPNOTSUPP :
+                 a2 && !bytes ? -EFAULT :
+                 host_result(receiving ? recv((int)a0, bytes, a2, flags) : send((int)a0, bytes, a2, flags));
+        break;
+    }
+    case 50: result = host_result(listen((int)a0, (int)a1)); break;
+    case 54: case 55: /* setsockopt, getsockopt */
+        result = guest_socket_options(img, (int)a0, a1, a2, a3, a4, nr == 54);
         break;
     case 48: /* shutdown */
         result = a1 > 2 ? -EINVAL : host_result(shutdown((int)a0, (int)a1));
@@ -1237,8 +1552,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             memcpy(oah_guest_access(img, a3, 4, PROT_WRITE), &tid, sizeof(tid));
         }
         break;
-    case 57: /* fork */
-        result = guest_fork();
+    case 57: case 58: /* fork, vfork */
+        result = nr == 58 ? guest_vfork() : guest_fork();
         break;
     case 59: result = guest_exec(img, a0, a1, a2); break;
     case 61: { /* wait4 */
@@ -1249,7 +1564,16 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             break;
         }
         int options = (a2 & 1 ? WNOHANG : 0) | (a2 & 2 ? WUNTRACED : 0);
-        result = host_result(waitpid((pid_t)a0, &status, options));
+        const u64 sigchld = 1ull << 16;
+        do {
+            result = host_result(waitpid((pid_t)a0, &status, options));
+            /* Darwin catches SIGCHLD to wake guest sigsuspend. A default or
+             * ignored guest SIGCHLD must not interrupt this blocking wait. */
+            if (result != -EINTR || !host_child_pending || host_alarm_pending ||
+                (g->signal_actions[16].handler > 1 && !(g->signal_mask & sigchld))) {
+                break;
+            }
+        } while (true);
         if (result > 0) {
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
                 forget_child((pid_t)result);

@@ -8,12 +8,19 @@ reconstruct/bin/
 
 # Compiled files
 *.o
+reconstruct/src/*.d
 librosetta.a
 
 # Intermediate Markdown files except README.md
 *.md
 !README.md
 !reconstruct/**/*.md
+!legacy/docs/**/*.md
+!research/**/*.md
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
 
 # Debug
 *.dSYM

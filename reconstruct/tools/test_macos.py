@@ -88,6 +88,19 @@ def main():
                            [*timeout, "2", "/usr/bin/true"], (0, b"", b""))
                     verify(runner, directory, "glibc timeout terminates its child",
                            [*timeout, "0.05", "/usr/bin/sleep", "2"], (124, b"", b""))
+                shell = root / "bin/sh"
+                if shell.is_file():
+                    if hashlib.sha256(shell.read_bytes()).hexdigest() != "f5adb8bf0100ed0f8c7782ca5f92814e9229525a4b4e0d401cf3bea09ac960a6":
+                        raise ValueError("fixture does not match the pinned Debian shell")
+                    script = Path(directory) / "check-script"
+                    script.write_text("#!/bin/sh -e\nprintf '%s\\n' \"$1\"\n")
+                    script.chmod(0o755)
+                    setup = ["--sysroot", str(root)]
+                    verify(runner, directory, "direct shebang launch",
+                           [*setup, str(script), "direct"], (0, b"direct\n", b""))
+                    verify(runner, directory, "guest exec of a shebang script",
+                           [*setup, str(shell), "-c", "exec ./check-script child"],
+                           (0, b"child\n", b""))
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         parser.exit(1, f"{error}\n")
 

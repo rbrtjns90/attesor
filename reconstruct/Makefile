@@ -1,5 +1,5 @@
 # Reconstruction from RosettaLinux decompilation
-# Isolated from the sibling guessed rewrite in the repo root.
+# The earlier rewrite is archived in ../legacy/translator.
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -O2 -g
@@ -153,7 +153,7 @@ test-qemu: oah-aarch64 tests/test_arm_native-aarch64 tests/hello.x86_64
 	    echo "  FAIL qemu hello output"; cat tests/hello.qemu.got; exit 1; }
 
 inventory:
-	python3 tools/extract_decomp_map.py ../rosetta_decomp.c -o inventory
+	python3 tools/extract_decomp_map.py ../research/decompilation/rosetta_decomp.c -o inventory
 
 inventory-binary:
 	@test -f bin/rosetta || { echo "drop the ELF at reconstruct/bin/rosetta"; exit 1; }
