@@ -60,7 +60,7 @@ reconstruct/
 
 On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. `--interpret` runs those fragments in the ARM interpreter instead. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
 
-The current milestone covers single-process static and musl-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, general signal handling, broader glibc startup, and full x86/SIMD coverage remain future work. This runner is intended for trusted test executables.
+The runner supports the tested single-process static, musl-linked, and Debian glibc-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, general signal handling, broader glibc workloads, and complete x86 floating-point and SIMD coverage remain future work. This runner is intended for trusted test executables.
 
 ## Build and verify
 
@@ -188,6 +188,20 @@ make -C reconstruct test-linux-dynamic ALPINE_SYSROOT=/absolute/path/to/alpine-r
 ```
 
 The test needs `qemu-x86_64` and `x86_64-linux-gnu-gcc`. `QEMU_X86_64` and `CC_X86_64` override them. With `--sysroot`, absolute guest loader and standard library/config paths are resolved within the supplied root by Linux `openat2`. Ordinary program file arguments are handled in the host working directory. The sysroot provides guest runtime files and does not isolate the process.
+
+### Debian glibc compatibility
+
+Use an extracted x86-64 Debian Bookworm slim root from image digest `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc`. Keep the root’s library symlinks intact. The test verifies the hashes of the Debian executables, loader, and libc before running them.
+
+```bash
+make -C reconstruct test-linux-glibc DEBIAN_SYSROOT=/absolute/path/to/debian-root
+./reconstruct/oah --sysroot /absolute/path/to/debian-root \
+    /absolute/path/to/debian-root/usr/bin/printf 'hello %s\n' glibc
+```
+
+The test needs QEMU user-mode and an x86-64 GNU compiler with glibc development headers and startup objects. It compares stock Debian `true`, `false`, `echo`, `cat`, `wc`, and `printf` with QEMU, including integer and floating-point formatting. It then builds a libc guest that exercises allocation, stdio, and a library loaded at runtime with `dlopen` and `dlsym`.
+
+CPUID exposes the x86-64 baseline startup profile so glibc can select its baseline routines. Individual instructions still require decoder support. The runtime still lacks guest signal delivery, thread creation, rseq, robust futex registration, and comprehensive x87 arithmetic and exception handling.
 
 ## What we will not do
 

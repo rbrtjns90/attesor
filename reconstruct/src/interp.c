@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 
 static u64 mask_for(u8 opsize)
 {
@@ -91,8 +92,9 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
 {
     u8 op = in->vector_opcode;
     unsigned width = (op == 0x6e || op == 0x7e) ? in->opsize
-                   : (op == 0x7a || op == 0xd6) ? 8 : 16;
-    bool store = op == 0x11 || op == 0x29 || op == 0x7f || op == 0x7e || op == 0xd6;
+                   : ((op >= 0x12 && op <= 0x17) || op == 0x7a || op == 0xd6) ? 8 : 16;
+    bool store = op == 0x11 || op == 0x29 || op == 0x7f || op == 0x7e || op == 0xd6 ||
+                 op == 0x13 || op == 0x17;
     u8 *xmm = g->xmm[in->src];
     u8 *other = g->xmm[in->dst];
     if (in->memory) {
@@ -135,9 +137,64 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         memset(xmm + 8, 0, 8);
         break;
+    case 0x12:
+        if (in->memory || other != xmm) {
+            memcpy(xmm, other + (in->memory ? 0 : 8), 8);
+        } else {
+            memmove(xmm, xmm + 8, 8);
+        }
+        break;
+    case 0x13:
+    case 0x17:
+        memcpy(other, xmm + (op == 0x17 ? 8 : 0), 8);
+        break;
+    case 0x16:
     case 0x6c:
         memcpy(xmm + 8, other, 8);
         break;
+    case 0x60:
+    case 0x61:
+    case 0x62:
+    case 0x68:
+    case 0x69:
+    case 0x6a:
+    case 0x6d: {
+        unsigned lane = op == 0x6d ? 8 : 1u << (op & 3);
+        unsigned start = op >= 0x68 ? 8 : 0;
+        u8 values[16];
+        for (unsigned offset = 0; offset < 8; offset += lane) {
+            memcpy(values + 2 * offset, xmm + start + offset, lane);
+            memcpy(values + 2 * offset + lane, other + start + offset, lane);
+        }
+        memcpy(xmm, values, sizeof(values));
+        break;
+    }
+    case 0xc6: {
+        u8 values[16];
+        memcpy(values, xmm + (in->imm & 1) * 8, 8);
+        memcpy(values + 8, other + ((in->imm >> 1) & 1) * 8, 8);
+        memcpy(xmm, values, sizeof(values));
+        break;
+    }
+    case 0x70: {
+        u8 values[16];
+        for (unsigned lane = 0; lane < 4; lane++) {
+            memcpy(values + lane * 4, other + ((in->imm >> (lane * 2)) & 3) * 4, 4);
+        }
+        memcpy(xmm, values, sizeof(values));
+        break;
+    }
+    case 0x73: {
+        unsigned count = in->imm < 16 ? (unsigned)in->imm : 16;
+        u8 values[16] = {0};
+        if (in->cc == 7) {
+            memcpy(values + count, other, 16 - count);
+        } else {
+            memcpy(values, other + count, 16 - count);
+        }
+        memcpy(other, values, sizeof(values));
+        break;
+    }
     case 0x74:
     case 0x75:
     case 0x76: {
@@ -147,6 +204,13 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         break;
     }
+    case 0xf8:
+    case 0xda:
+        for (unsigned i = 0; i < 16; i++) {
+            xmm[i] = op == 0xf8 ? (u8)(xmm[i] - other[i])
+                   : xmm[i] < other[i] ? xmm[i] : other[i];
+        }
+        break;
     case 0x57:
     case 0xef:
     case 0xdb:
@@ -307,6 +371,17 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     } else if (op == OAH_SC_BT) {
         unsigned bit = reg & (width * 8 - 1);
         g->rflags = (g->rflags & ~OAH_RFLAGS_CF) | ((rm >> bit) & 1);
+    } else if (op == OAH_SC_CMPXCHG8B) {
+        u64 expected = ((u64)(u32)g->gpr[OAH_X86_RDX] << 32) | (u32)g->gpr[OAH_X86_RAX];
+        if (expected == rm) {
+            g->rflags |= OAH_RFLAGS_ZF;
+            result = ((u64)(u32)g->gpr[OAH_X86_RCX] << 32) | (u32)g->gpr[OAH_X86_RBX];
+        } else {
+            g->rflags &= ~OAH_RFLAGS_ZF;
+            write_gpr(g, OAH_X86_RAX, 4, rm);
+            write_gpr(g, OAH_X86_RDX, 4, rm >> 32);
+            write = false;
+        }
     } else if (op == OAH_SC_CMPXCHG) {
         /* The runtime dispatches one guest thread, including LOCK forms. */
         u64 expected = read_reg(g, OAH_X86_RAX, width, true);
@@ -359,6 +434,46 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         g->rflags &= ~(OAH_RFLAGS_CF | OAH_RFLAGS_OF);
         if (product != signed_operand(result, width)) {
             g->rflags |= OAH_RFLAGS_CF | OAH_RFLAGS_OF;
+        }
+    } else if (op == OAH_SC_SHLD || op == OAH_SC_SHRD) {
+        unsigned bits = width * 8;
+        unsigned count = (in->immediate ? in->imm : g->gpr[OAH_X86_RCX]) &
+                         (width == 8 ? 63 : 31);
+        if (!count || count > bits) {
+            g->rip = next;
+            return true;
+        }
+        bool left = op == OAH_SC_SHLD;
+        result = count == bits ? reg : left ? (lhs << count) | (reg >> (bits - count))
+                                            : (lhs >> count) | (reg << (bits - count));
+        result &= mask;
+        g->rflags = oah_logic_rflags(g->rflags, result, width);
+        if ((lhs >> (left ? bits - count : count - 1)) & 1) {
+            g->rflags |= OAH_RFLAGS_CF;
+        }
+        if (count == 1 && ((lhs ^ result) >> (bits - 1))) {
+            g->rflags |= OAH_RFLAGS_OF;
+        }
+    } else if (op == OAH_SC_ROL || op == OAH_SC_ROR) {
+        unsigned bits = width * 8;
+        unsigned masked = rhs & (width == 8 ? 63 : 31);
+        unsigned count = masked % bits;
+        if (!masked) {
+            g->rip = next;
+            return true;
+        }
+        result = lhs;
+        if (count) {
+            result = op == OAH_SC_ROL ? (lhs << count) | (lhs >> (bits - count))
+                                      : (lhs >> count) | (lhs << (bits - count));
+            result &= mask;
+        }
+        u64 carry = op == OAH_SC_ROL ? result & 1 : result >> (bits - 1);
+        g->rflags = (g->rflags & ~OAH_RFLAGS_CF) | carry;
+        if (masked == 1) {
+            u64 top = result >> (bits - 1);
+            u64 other = op == OAH_SC_ROL ? carry : (result >> (bits - 2)) & 1;
+            g->rflags = (g->rflags & ~OAH_RFLAGS_OF) | ((top ^ other) ? OAH_RFLAGS_OF : 0);
         }
     } else if (op == OAH_SC_SHL || op == OAH_SC_SHR || op == OAH_SC_SAR) {
         unsigned bits = width * 8;
@@ -425,6 +540,166 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     }
     g->rip = next;
     return true;
+}
+
+static u64 x87_compare_flags(const u8 *lhs, const u8 *rhs)
+{
+    u64 a, b;
+    u16 ae, be;
+    memcpy(&a, lhs, 8);
+    memcpy(&b, rhs, 8);
+    memcpy(&ae, lhs + 8, 2);
+    memcpy(&be, rhs + 8, 2);
+    bool a_negative = (ae & 0x8000) != 0;
+    bool b_negative = (be & 0x8000) != 0;
+    ae &= 0x7fff;
+    be &= 0x7fff;
+    const u64 integer_bit = 1ull << 63;
+    if ((ae == 0x7fff && a != integer_bit) || (be == 0x7fff && b != integer_bit) ||
+        (ae && !(a & integer_bit)) || (be && !(b & integer_bit))) {
+        return OAH_RFLAGS_CF | OAH_RFLAGS_ZF | OAH_RFLAGS_PF;
+    }
+    if (ae == 0 && (a & integer_bit)) {
+        ae = 1;
+    }
+    if (be == 0 && (b & integer_bit)) {
+        be = 1;
+    }
+    if ((ae == 0 && be == 0 && a == 0 && b == 0) ||
+        (a_negative == b_negative && ae == be && a == b)) {
+        return OAH_RFLAGS_ZF;
+    }
+    bool less = a_negative != b_negative ? a_negative
+              : a_negative ? ae > be || (ae == be && a > b)
+              : ae < be || (ae == be && a < b);
+    return less ? OAH_RFLAGS_CF : 0;
+}
+
+static bool run_x87_data(oah_guest *g, oah_image *img, const oah_insn *in, u64 next)
+{
+    /* FXSAVE holds logical ST slots, while its abridged tag bits use
+     * physical register indices. Keep both in sync when TOP changes. */
+    u8 *state = g->legacy_fx;
+    u8 *st = state + 32;
+    unsigned top = (state[3] >> 3) & 7;
+    u8 value[16] = {0};
+    bool push = false, pop = false;
+    u8 code = in->x87_modrm;
+    unsigned reg = code & 7;
+
+    if (in->op == OAH_OP_X87_COMPARE) {
+        unsigned tags = (1u << top) | (1u << ((top + reg) & 7));
+        if ((state[4] & tags) != tags) {
+            return false;
+        }
+        u64 comparison = x87_compare_flags(st, st + 16 * reg);
+        g->rflags &= ~(OAH_RFLAGS_CF | OAH_RFLAGS_ZF | OAH_RFLAGS_PF |
+                       OAH_RFLAGS_OF | OAH_RFLAGS_SF | OAH_RFLAGS_AF);
+        g->rflags |= comparison;
+        pop = in->rm_dest;
+    } else if (in->memory) {
+        u64 address = effective_address(g, &in->address, next);
+        address += in->address.segment == 0x64 ? g->fs_base
+                 : in->address.segment == 0x65 ? g->gs_base : 0;
+        void *slot = oah_guest_access(img, address, 10, in->rm_dest ? PROT_WRITE : PROT_READ);
+        if (!slot) {
+            return false;
+        }
+        if (in->rm_dest) {
+            if (!(state[4] & (1u << top))) {
+                return false;
+            }
+            memcpy(slot, st, 10);
+            pop = true;
+        } else {
+            memcpy(value, slot, 10);
+            push = true;
+        }
+    } else if (code == 0xe8 || code == 0xee) {
+        if (code == 0xe8) {
+            value[7] = 0x80;
+            value[8] = 0xff;
+            value[9] = 0x3f;
+        }
+        push = true;
+    } else if (code <= 0xc7) {
+        if (!(state[4] & (1u << ((top + reg) & 7)))) {
+            return false;
+        }
+        memcpy(value, st + 16 * reg, 16);
+        push = true;
+    } else {
+        if (!(state[4] & (1u << top))) {
+            return false;
+        }
+        if (code == 0xe0) {
+            st[9] ^= 0x80;
+        } else if (code == 0xe1) {
+            st[9] &= 0x7f;
+        } else if (code >= 0xd8) {
+            if (reg) {
+                memcpy(st + 16 * reg, st, 16);
+            }
+            state[4] |= 1u << ((top + reg) & 7);
+            pop = true;
+        } else if (reg) {
+            if (!(state[4] & (1u << ((top + reg) & 7)))) {
+                return false;
+            }
+            memcpy(value, st, 16);
+            memcpy(st, st + 16 * reg, 16);
+            memcpy(st + 16 * reg, value, 16);
+        }
+    }
+    if (push) {
+        top = (top + 7) & 7;
+        if (state[4] & (1u << top)) {
+            return false;
+        }
+        memmove(st + 16, st, 7 * 16);
+        memcpy(st, value, 16);
+        state[4] |= 1u << top;
+    } else if (pop) {
+        state[4] &= ~(1u << top);
+        top = (top + 1) & 7;
+        memmove(st, st + 16, 7 * 16);
+        memset(st + 7 * 16, 0, 16);
+    }
+    state[3] = (u8)((state[3] & ~0x38) | (top << 3));
+    g->rip = next;
+    return true;
+}
+
+static void guest_cpuid(oah_guest *g)
+{
+    u32 leaf = (u32)g->gpr[OAH_X86_RAX];
+    u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
+    switch (leaf) {
+    case 0:
+        eax = 1;
+        ebx = 0x756e6547u; /* GenuineIntel byte order */
+        edx = 0x49656e69u;
+        ecx = 0x6c65746eu;
+        break;
+    case 1:
+        eax = 0x000006f0u;
+        /* Expose the glibc x86-64 baseline startup profile. The decoder
+         * still reports individual instructions it cannot execute.
+         * EDX: FPU, TSC, CX8, CMOV, MMX, FXSR, SSE and SSE2. */
+        edx = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) |
+              (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);
+        break;
+    case 0x80000000u:
+        eax = 0x80000001u;
+        break;
+    case 0x80000001u:
+        edx = (1u << 29) | (1u << 11); /* Long mode and SYSCALL. */
+        break;
+    }
+    g->gpr[OAH_X86_RAX] = eax;
+    g->gpr[OAH_X86_RBX] = ebx;
+    g->gpr[OAH_X86_RCX] = ecx;
+    g->gpr[OAH_X86_RDX] = edx;
 }
 
 oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
@@ -522,6 +797,18 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
             }
             g->rip = next + (u64)(s64)insn.disp;
             break;
+        case OAH_OP_LEAVE: {
+            u64 frame = g->gpr[OAH_X86_RBP];
+            const void *slot = oah_guest_access(img, frame, 8, PROT_READ);
+            if (!slot) {
+                r.status = OAH_INTERP_FAULT;
+                return r;
+            }
+            memcpy(&g->gpr[OAH_X86_RBP], slot, 8);
+            g->gpr[OAH_X86_RSP] = frame + 8;
+            g->rip = next;
+            break;
+        }
         case OAH_OP_RET: {
             const void *slot = oah_guest_access(img, g->gpr[OAH_X86_RSP], 8, PROT_READ);
             if (!slot) {
@@ -549,6 +836,76 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
                 r.status = OAH_INTERP_FAULT;
                 return r;
             }
+            break;
+        case OAH_OP_X87_MOVE:
+        case OAH_OP_X87_COMPARE:
+            if (!run_x87_data(g, img, &insn, next)) {
+                r.status = OAH_INTERP_FAULT;
+                return r;
+            }
+            break;
+        case OAH_OP_FXSTATE: {
+            u64 address = effective_address(g, &insn.address, next);
+            address += insn.address.segment == 0x64 ? g->fs_base
+                     : insn.address.segment == 0x65 ? g->gs_base : 0;
+            u64 width = insn.opsize ? insn.opsize : 512;
+            u8 *area = (!insn.opsize && (address & 15)) ? NULL : oah_guest_access(
+                img, address, width, insn.rm_dest ? PROT_WRITE : PROT_READ);
+            if (!area) {
+                r.status = OAH_INTERP_FAULT;
+                return r;
+            }
+            if (insn.opsize == 2) {
+                if (insn.rm_dest) {
+                    memcpy(area, g->legacy_fx, 2);
+                } else {
+                    memcpy(g->legacy_fx, area, 2);
+                }
+            } else if (insn.opsize) {
+                u32 value;
+                if (insn.rm_dest) {
+                    memcpy(area, g->legacy_fx + 24, sizeof(value));
+                } else {
+                    memcpy(&value, area, sizeof(value));
+                    if (value & ~0xffffu) {
+                        r.status = OAH_INTERP_FAULT;
+                        return r;
+                    }
+                    memcpy(g->legacy_fx + 24, &value, sizeof(value));
+                }
+            } else if (insn.rm_dest) {
+                memcpy(area, g->legacy_fx, sizeof(g->legacy_fx));
+                memcpy(area + 160, g->xmm, sizeof(g->xmm));
+                memset(area + 416, 0, 48);
+            } else {
+                u32 mxcsr;
+                memcpy(&mxcsr, area + 24, sizeof(mxcsr));
+                if (mxcsr & ~0xffffu) {
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+                memcpy(g->legacy_fx, area, 28);
+                memcpy(g->legacy_fx + 32, area + 32, sizeof(g->legacy_fx) - 32);
+                memcpy(g->xmm, area + 160, sizeof(g->xmm));
+            }
+            g->rip = next;
+            break;
+        }
+        case OAH_OP_RDTSC: {
+            struct timespec time;
+            if (clock_gettime(CLOCK_MONOTONIC_RAW, &time) != 0) {
+                r.status = OAH_INTERP_FAULT;
+                return r;
+            }
+            u64 ticks = (u64)time.tv_sec * 1000000000ull + (u64)time.tv_nsec;
+            g->gpr[OAH_X86_RAX] = (u32)ticks;
+            g->gpr[OAH_X86_RDX] = ticks >> 32;
+            g->rip = next;
+            break;
+        }
+        case OAH_OP_CPUID:
+            guest_cpuid(g);
+            g->rip = next;
             break;
         case OAH_OP_SYSCALL:
             g->rip = next;

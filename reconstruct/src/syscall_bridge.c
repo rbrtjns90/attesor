@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <string.h>
@@ -188,15 +189,15 @@ static u64 guest_file_mmap(oah_image *img, u64 addr, u64 len, u32 prot,
                            bool fixed, int fd, u64 offset)
 {
     long page = sysconf(_SC_PAGESIZE);
-    struct stat st;
+    struct stat st = {0};
     unsigned index = img->nseg;
     if ((offset & (page - 1)) || offset > INT64_MAX) {
         return (u64)(s64)-EINVAL;
     }
-    if (fstat(fd, &st) != 0) {
+    if (fd >= 0 && fstat(fd, &st) != 0) {
         return set_errno_ret(-1);
     }
-    if (!S_ISREG(st.st_mode)) {
+    if (fd >= 0 && !S_ISREG(st.st_mode)) {
         return (u64)(s64)-ENODEV;
     }
     if (fixed) {
@@ -274,11 +275,18 @@ static u64 guest_mmap(oah_image *img, u64 addr, u64 len, u64 prot, u64 flags, u6
         return (u64)(s64)-EINVAL;
     }
     len = (len + page - 1) & ~(page - 1);
+    flags &= ~0x800ull; /* Linux MAP_DENYWRITE is ignored. */
     if (flags == 0x02 || flags == 0x12) {
+        if ((int)fd < 0) {
+            return (u64)(s64)-EBADF;
+        }
         return guest_file_mmap(img, addr, len, (u32)prot, flags == 0x12, (int)fd, off);
     }
     if ((flags != 0x22 && flags != 0x32) || (int)fd != -1 || off != 0) {
         return (u64)(s64)-EINVAL;
+    }
+    if (flags == 0x32 && addr != img->load_end) {
+        return guest_file_mmap(img, addr, len, (u32)prot, true, -1, 0);
     }
     if (flags == 0x32) {
         /* musl reserves a guard page at the start of its own brk arena. */
@@ -381,6 +389,65 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case OAH_X86_NR_BRK:
         g->gpr[OAH_X86_RAX] = guest_brk(img, a0);
         return OAH_SYS_CONTINUE;
+    case 17: { /* pread64 */
+        void *buffer = oah_guest_access(img, a1, a2, PROT_WRITE);
+        g->gpr[OAH_X86_RAX] = a2 && !buffer ? (u64)(s64)-EFAULT
+                            : set_errno_ret(pread((int)a0, buffer, a2, (off_t)a3));
+        return OAH_SYS_CONTINUE;
+    }
+    case 21: { /* access */
+        const char *path = guest_path(img, a0);
+        if (!path) {
+            g->gpr[OAH_X86_RAX] = (u64)(s64)-EFAULT;
+            return OAH_SYS_CONTINUE;
+        }
+        int fd = open_guest_path(img, AT_FDCWD, path, O_PATH | O_CLOEXEC, 0);
+        g->gpr[OAH_X86_RAX] = fd < 0 ? set_errno_ret(-1)
+                            : set_errno_ret(syscall(SYS_faccessat2, fd, "", (int)a1, AT_EMPTY_PATH));
+        if (fd >= 0) {
+            close(fd);
+        }
+        return OAH_SYS_CONTINUE;
+    }
+    case 221: { /* fadvise64 */
+        int error = posix_fadvise((int)a0, (off_t)a1, (off_t)a2, (int)a3);
+        g->gpr[OAH_X86_RAX] = (u64)(s64)-error;
+        return OAH_SYS_CONTINUE;
+    }
+    case 262: { /* newfstatat */
+        const char *path = guest_path(img, a1);
+        if (!path || (a3 & ~(u64)(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT))) {
+            g->gpr[OAH_X86_RAX] = path ? (u64)(s64)-EINVAL : (u64)(s64)-EFAULT;
+            return OAH_SYS_CONTINUE;
+        }
+        if (!*path && (a3 & AT_EMPTY_PATH) && (int)a0 != AT_FDCWD) {
+            g->gpr[OAH_X86_RAX] = (u64)guest_fstat(img, (int)a0, a2);
+            return OAH_SYS_CONTINUE;
+        }
+        int flags = O_PATH | O_CLOEXEC | ((a3 & AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0);
+        int fd = open_guest_path(img, (int)a0, !*path && (a3 & AT_EMPTY_PATH) ? "." : path, flags, 0);
+        g->gpr[OAH_X86_RAX] = fd < 0 ? set_errno_ret(-1) : (u64)guest_fstat(img, fd, a2);
+        if (fd >= 0) {
+            close(fd);
+        }
+        return OAH_SYS_CONTINUE;
+    }
+    case 302: { /* prlimit64, query of the current guest process */
+        struct rlimit limit;
+        u64 *output = a3 ? oah_guest_access(img, a3, 16, PROT_WRITE) : NULL;
+        if (a0 || a2 || (a3 && !output)) {
+            g->gpr[OAH_X86_RAX] = (u64)(s64)(a0 || a2 ? -EPERM : -EFAULT);
+        } else if (getrlimit((int)a1, &limit) != 0) {
+            g->gpr[OAH_X86_RAX] = set_errno_ret(-1);
+        } else {
+            u64 values[2] = {limit.rlim_cur, limit.rlim_max};
+            if (output) {
+                memcpy(output, values, sizeof(values));
+            }
+            g->gpr[OAH_X86_RAX] = 0;
+        }
+        return OAH_SYS_CONTINUE;
+    }
     case 5: /* fstat */
         g->gpr[OAH_X86_RAX] = (u64)guest_fstat(img, (int)a0, a1);
         return OAH_SYS_CONTINUE;
@@ -501,6 +568,10 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         host_nr = oah_x86_syscall_to_host((u32)nr);
         errno = 0;
         rc = syscall((long)host_nr, un);
+        if (rc == 0) {
+            memset(un->machine, 0, sizeof(un->machine));
+            memcpy(un->machine, "x86_64", sizeof("x86_64"));
+        }
         g->gpr[OAH_X86_RAX] = set_errno_ret(rc);
         return OAH_SYS_CONTINUE;
     }

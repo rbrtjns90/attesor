@@ -28,7 +28,13 @@ typedef enum {
     OAH_OP_JCC_REL,
     OAH_OP_SCALAR,
     OAH_OP_STRING,
-    OAH_OP_VECTOR
+    OAH_OP_VECTOR,
+    OAH_OP_RDTSC,
+    OAH_OP_CPUID,
+    OAH_OP_LEAVE,
+    OAH_OP_FXSTATE,
+    OAH_OP_X87_MOVE,
+    OAH_OP_X87_COMPARE
 } oah_op;
 
 typedef enum {
@@ -36,7 +42,7 @@ typedef enum {
     OAH_SC_ADD, OAH_SC_OR, OAH_SC_ADC, OAH_SC_SBB, OAH_SC_AND,
     OAH_SC_SUB, OAH_SC_XOR, OAH_SC_CMP, OAH_SC_TEST,
     OAH_SC_JMP, OAH_SC_CALL, OAH_SC_CMOV, OAH_SC_SETCC,
-    OAH_SC_SHL, OAH_SC_SHR, OAH_SC_SAR, OAH_SC_IMUL, OAH_SC_NEG, OAH_SC_NOT, OAH_SC_BSF, OAH_SC_BSR, OAH_SC_INC, OAH_SC_DEC, OAH_SC_XCHG, OAH_SC_DIV, OAH_SC_BT, OAH_SC_MUL, OAH_SC_CMPXCHG, OAH_SC_XADD, OAH_SC_PUSH
+    OAH_SC_SHL, OAH_SC_SHR, OAH_SC_SAR, OAH_SC_ROL, OAH_SC_ROR, OAH_SC_SHLD, OAH_SC_SHRD, OAH_SC_IMUL, OAH_SC_NEG, OAH_SC_NOT, OAH_SC_BSF, OAH_SC_BSR, OAH_SC_INC, OAH_SC_DEC, OAH_SC_XCHG, OAH_SC_DIV, OAH_SC_BT, OAH_SC_MUL, OAH_SC_CMPXCHG, OAH_SC_CMPXCHG8B, OAH_SC_XADD, OAH_SC_PUSH
 } oah_scalar_op;
 
 typedef struct {
@@ -70,6 +76,7 @@ typedef struct {
     bool repeat;
     bool string_move;
     u8 vector_opcode;
+    u8 x87_modrm;
     bool aligned;
 } oah_insn;
 
