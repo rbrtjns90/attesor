@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -25,7 +27,9 @@
 enum {
     LINUX_EAGAIN = 11, LINUX_EDEADLK = 35, LINUX_ENAMETOOLONG = 36,
     LINUX_ENOSYS = 38, LINUX_ENOTEMPTY = 39, LINUX_ELOOP = 40,
-    LINUX_EOVERFLOW = 75, LINUX_EOPNOTSUPP = 95, LINUX_ETIMEDOUT = 110
+    LINUX_EOVERFLOW = 75, LINUX_ENOTSOCK = 88, LINUX_EPROTOTYPE = 91,
+    LINUX_EPROTONOSUPPORT = 93, LINUX_ESOCKTNOSUPPORT = 94, LINUX_EOPNOTSUPP = 95,
+    LINUX_EAFNOSUPPORT = 97, LINUX_ENOTCONN = 107, LINUX_ETIMEDOUT = 110
 };
 
 static s64 linux_error(int error)
@@ -40,6 +44,12 @@ static s64 linux_error(int error)
     case EOVERFLOW: return -LINUX_EOVERFLOW;
     case ENOTSUP:
     case EOPNOTSUPP: return -LINUX_EOPNOTSUPP;
+    case ENOTSOCK: return -LINUX_ENOTSOCK;
+    case EPROTOTYPE: return -LINUX_EPROTOTYPE;
+    case EPROTONOSUPPORT: return -LINUX_EPROTONOSUPPORT;
+    case ESOCKTNOSUPPORT: return -LINUX_ESOCKTNOSUPPORT;
+    case EAFNOSUPPORT: return -LINUX_EAFNOSUPPORT;
+    case ENOTCONN: return -LINUX_ENOTCONN;
     case ETIMEDOUT: return -LINUX_ETIMEDOUT;
     default:
         /* The POSIX errors through ERANGE share numbers except those above. */
@@ -668,7 +678,7 @@ static s64 memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool unmap
     return -EINVAL;
 }
 
-static s64 guest_writev(oah_image *img, int fd, u64 address, u64 count)
+static s64 guest_vector_io(oah_image *img, int fd, u64 address, u64 count, bool reading)
 {
     struct guest_iovec { u64 address, size; } entry;
     struct iovec vectors[1024];
@@ -681,13 +691,81 @@ static s64 guest_writev(oah_image *img, int fd, u64 address, u64 count)
     }
     for (u64 i = 0; i < count; i++) {
         memcpy(&entry, input + i * sizeof(entry), sizeof(entry));
-        vectors[i].iov_base = oah_guest_access(img, entry.address, entry.size, PROT_READ);
+        if (entry.size > SSIZE_MAX) {
+            return -EINVAL;
+        }
+        vectors[i].iov_base = oah_guest_access(img, entry.address, entry.size,
+                                              reading ? PROT_WRITE : PROT_READ);
         vectors[i].iov_len = entry.size;
         if (entry.size && !vectors[i].iov_base) {
             return -EFAULT;
         }
     }
-    return host_result(writev(fd, vectors, (int)count));
+    return host_result(reading ? readv(fd, vectors, (int)count) :
+                                 writev(fd, vectors, (int)count));
+}
+
+typedef struct {
+    s32 fd;
+    u16 events, revents;
+} linux_pollfd;
+
+_Static_assert(sizeof(linux_pollfd) == 8, "Linux x86-64 pollfd layout");
+
+static s64 guest_poll(oah_image *img, u64 address, u64 count, int timeout)
+{
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0) {
+        return linux_error(errno);
+    }
+    if (count > limit.rlim_cur || count > UINT32_MAX) {
+        return -EINVAL;
+    }
+    u8 *guest = oah_guest_access(img, address, count * sizeof(linux_pollfd),
+                                PROT_READ | PROT_WRITE);
+    if (count && !guest) {
+        return -EFAULT;
+    }
+    struct pollfd *fds = count ? calloc(count, sizeof(*fds)) : NULL;
+    if (count && !fds) {
+        return -ENOMEM;
+    }
+    enum { LINUX_POLLWRNORM = 0x100, LINUX_POLLWRBAND = 0x200 };
+    const unsigned shared_events = POLLIN | POLLPRI | POLLOUT | POLLRDNORM | POLLRDBAND;
+    const unsigned always_reported = POLLERR | POLLHUP | POLLNVAL;
+    for (u64 i = 0; i < count; i++) {
+        linux_pollfd entry;
+        memcpy(&entry, guest + i * sizeof(entry), sizeof(entry));
+        /* Darwin shares the base bits. Its POLLWRNORM aliases POLLOUT. */
+        fds[i].fd = entry.fd;
+        fds[i].events = entry.events & shared_events;
+        if (entry.events & LINUX_POLLWRNORM) {
+            fds[i].events |= POLLOUT;
+        }
+        if (entry.events & LINUX_POLLWRBAND) {
+            fds[i].events |= POLLWRBAND;
+        }
+    }
+    s64 result = host_result(poll(fds, (nfds_t)count, timeout < 0 ? -1 : timeout));
+    if (result >= 0) {
+        result = 0;
+        for (u64 i = 0; i < count; i++) {
+            linux_pollfd entry;
+            u8 *slot = guest + i * sizeof(entry);
+            memcpy(&entry, slot, sizeof(entry));
+            entry.revents = fds[i].revents & (always_reported | (entry.events & shared_events));
+            if ((entry.events & LINUX_POLLWRNORM) && (fds[i].revents & POLLOUT)) {
+                entry.revents |= LINUX_POLLWRNORM;
+            }
+            if ((entry.events & LINUX_POLLWRBAND) && (fds[i].revents & POLLWRBAND)) {
+                entry.revents |= LINUX_POLLWRBAND;
+            }
+            result += entry.revents != 0;
+            memcpy(slot + offsetof(linux_pollfd, revents), &entry.revents, sizeof(entry.revents));
+        }
+    }
+    free(fds);
+    return result;
 }
 
 typedef struct guest_dir {
@@ -767,7 +845,7 @@ static s64 guest_getdents(oah_image *img, int fd, u64 address, u64 size)
     }
 }
 
-static s64 guest_pipe(oah_image *img, u64 address, u64 flags)
+static s64 guest_fd_pair(oah_image *img, u64 address, u64 flags, int socket_type)
 {
     if (flags & ~(0x800ull | 0x80000ull)) {
         return -EINVAL;
@@ -777,7 +855,7 @@ static s64 guest_pipe(oah_image *img, u64 address, u64 flags)
         return -EFAULT;
     }
     int fds[2];
-    if (pipe(fds) < 0) {
+    if ((socket_type ? socketpair(AF_UNIX, socket_type, 0, fds) : pipe(fds)) < 0) {
         return linux_error(errno);
     }
     for (unsigned i = 0; i < 2; i++) {
@@ -1069,15 +1147,30 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case OAH_X86_NR_BRK:
         result = (s64)guest_brk(img, a0);
         break;
-    case 16: { /* ioctl, terminal geometry */
+    case 7: /* poll */
+        result = guest_poll(img, a0, a1, (s32)a2);
+        break;
+    case 16: { /* ioctl */
+        if (a1 == 0x541b) { /* FIONREAD */
+            int count;
+            void *output = oah_guest_access(img, a2, sizeof(count), PROT_WRITE);
+            result = output ? host_result(ioctl((int)a0, FIONREAD, &count)) : -EFAULT;
+            if (!result) {
+                memcpy(output, &count, sizeof(count));
+            }
+            break;
+        }
         struct winsize *size = oah_guest_access(img, a2, sizeof(*size), PROT_WRITE);
         result = a1 != 0x5413 ? -ENOTTY : !size ? -EFAULT
                             : host_result(ioctl((int)a0, TIOCGWINSZ, size));
         break;
     }
-    case 17: { /* pread64 */
-        void *buffer = oah_guest_access(img, a1, a2, PROT_WRITE);
-        result = a2 && !buffer ? -EFAULT : host_result(pread((int)a0, buffer, a2, (off_t)a3));
+    case 17: case 18: { /* pread64, pwrite64 */
+        bool reading = nr == 17;
+        void *buffer = oah_guest_access(img, a1, a2, reading ? PROT_WRITE : PROT_READ);
+        result = a2 && !buffer ? -EFAULT :
+                 host_result(reading ? pread((int)a0, buffer, a2, (off_t)a3) :
+                                       pwrite((int)a0, buffer, a2, (off_t)a3));
         break;
     }
     case 21: { /* access */
@@ -1097,11 +1190,11 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         break;
     }
-    case 20: /* writev */
-        result = guest_writev(img, (int)a0, a1, a2);
+    case 19: case 20: /* readv, writev */
+        result = guest_vector_io(img, (int)a0, a1, a2, nr == 19);
         break;
     case 22: case 293: /* pipe, pipe2 */
-        result = guest_pipe(img, a0, nr == 293 ? a1 : 0);
+        result = guest_fd_pair(img, a0, nr == 293 ? a1 : 0, 0);
         break;
     case 32: /* dup */
         result = host_result(dup((int)a0));
@@ -1112,6 +1205,23 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             forget_directory((int)a1);
         }
         break;
+    case 48: /* shutdown */
+        result = a1 > 2 ? -EINVAL : host_result(shutdown((int)a0, (int)a1));
+        break;
+    case 53: { /* socketpair */
+        u64 type = a1 & 0xf;
+        if (a0 != 1) {
+            result = -LINUX_EAFNOSUPPORT;
+        } else if (a2) {
+            result = -LINUX_EPROTONOSUPPORT;
+        } else if (type != 1 && type != 2) {
+            result = -LINUX_ESOCKTNOSUPPORT;
+        } else {
+            result = guest_fd_pair(img, a3, a1 & ~0xfull,
+                                   type == 1 ? SOCK_STREAM : SOCK_DGRAM);
+        }
+        break;
+    }
     case 56: /* process clone as used by glibc fork */
         if ((a0 & ~0x1200000ull) != 17 || a1 || a2 || a4) {
             result = -LINUX_ENOSYS;
