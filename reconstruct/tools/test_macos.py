@@ -10,6 +10,10 @@ from test_linux_glibc import HASHES
 from test_linux_static import check_fixture, run
 
 SAMPLE = b"line one\nline two\n"
+TIMEOUT_HASHES = {
+    "usr/bin/timeout": "5ef0eaaaa4220593add7716aad74da927ca3bb10605e964330de64fecc3ef15e",
+    "usr/bin/sleep": "4add4bb89d8ca0e3b1bd861130ddd7ae0fd9617a8055de0a38c8d2ca1ac95723",
+}
 
 
 def verify(runner, directory, title, command, expected, stdin=b""):
@@ -75,6 +79,15 @@ def main():
                     verify(runner, directory, f"glibc {name} {argv}",
                            ["--sysroot", str(root), str(root / "usr/bin" / name), *argv],
                            expected, stdin)
+                if all((root / path).is_file() for path in TIMEOUT_HASHES):
+                    for path, expected in TIMEOUT_HASHES.items():
+                        if hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
+                            raise ValueError(f"fixture does not match the pinned Debian image: {path}")
+                    timeout = ["--sysroot", str(root), str(root / "usr/bin/timeout")]
+                    verify(runner, directory, "glibc timeout child exits normally",
+                           [*timeout, "2", "/usr/bin/true"], (0, b"", b""))
+                    verify(runner, directory, "glibc timeout terminates its child",
+                           [*timeout, "0.05", "/usr/bin/sleep", "2"], (124, b"", b""))
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         parser.exit(1, f"{error}\n")
 

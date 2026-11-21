@@ -39,8 +39,13 @@ typedef enum {
     OAH_SYS_FATAL    = 2
 } oah_sys_status;
 
-/* Signal syscalls are local to the single guest and never forward kills to Linux. */
+/* Signal frames, masks, and self-directed signals use the guest Linux ABI. */
 oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img);
+#if defined(__APPLE__)
+oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img);
+u64 oah_darwin_pending_signals(void);
+s64 oah_darwin_wait_signal(void);
+#endif
 
 /*
  * Perform guest SYSCALL. Args: rax=nr, rdi,rsi,rdx,r10,r8,r9.

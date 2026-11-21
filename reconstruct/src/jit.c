@@ -23,6 +23,14 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
     memset(&st, 0, sizeof(st));
 
     while (r.insns < budget) {
+#if defined(__APPLE__)
+        oah_sys_status signal_status = oah_guest_signal_poll(g, img);
+        if (signal_status != OAH_SYS_CONTINUE) {
+            r.status = signal_status == OAH_SYS_EXIT ? OAH_INTERP_EXIT : OAH_INTERP_FAULT;
+            r.exit_code = (int)(g->gpr[OAH_X86_RDI] & 0xff);
+            return r;
+        }
+#endif
         oah_asm_buf buf;
         u64 next = g->rip;
 

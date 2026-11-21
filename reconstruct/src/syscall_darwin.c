@@ -5,9 +5,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -50,6 +52,259 @@ static s64 host_result(s64 result)
     return result == -1 ? linux_error(errno) : result;
 }
 
+static volatile sig_atomic_t host_alarm_pending;
+static volatile sig_atomic_t host_child_pending;
+static bool signal_handlers_installed;
+static bool posix_timer_created;
+
+typedef struct guest_child {
+    pid_t pid;
+    struct guest_child *next;
+} guest_child;
+
+static guest_child *children;
+
+static void record_signal(int signal)
+{
+    if (signal == SIGALRM) {
+        host_alarm_pending = 1;
+    } else if (signal == SIGCHLD) {
+        host_child_pending = 1;
+    }
+}
+
+static void bridged_signal_set(sigset_t *set)
+{
+    sigemptyset(set);
+    sigaddset(set, SIGALRM);
+    sigaddset(set, SIGCHLD);
+}
+
+static int install_signal_handlers(void)
+{
+    if (!signal_handlers_installed) {
+        struct sigaction action = {.sa_handler = record_signal};
+        bridged_signal_set(&action.sa_mask);
+        if (sigaction(SIGALRM, &action, NULL) < 0 ||
+            sigaction(SIGCHLD, &action, NULL) < 0) {
+            return -1;
+        }
+        signal_handlers_installed = true;
+    }
+    return 0;
+}
+
+u64 oah_darwin_pending_signals(void)
+{
+    if (!host_alarm_pending && !host_child_pending) {
+        return 0;
+    }
+    sigset_t blocked, previous;
+    bridged_signal_set(&blocked);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) < 0) {
+        return 0;
+    }
+    u64 pending = (host_alarm_pending ? 1ull << 13 : 0) |
+                  (host_child_pending ? 1ull << 16 : 0);
+    host_alarm_pending = host_child_pending = 0;
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return pending;
+}
+
+s64 oah_darwin_wait_signal(void)
+{
+    sigset_t blocked, previous;
+    bridged_signal_set(&blocked);
+    if (install_signal_handlers() < 0 ||
+        sigprocmask(SIG_BLOCK, &blocked, &previous) < 0) {
+        return linux_error(errno);
+    }
+    if (!host_alarm_pending && !host_child_pending) {
+        sigset_t waiting = previous;
+        sigdelset(&waiting, SIGALRM);
+        sigdelset(&waiting, SIGCHLD);
+        sigsuspend(&waiting);
+    }
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return 0;
+}
+
+static guest_child **child_link(pid_t pid)
+{
+    guest_child **link = &children;
+    while (*link && (*link)->pid != pid) {
+        link = &(*link)->next;
+    }
+    return link;
+}
+
+static void forget_child(pid_t pid)
+{
+    guest_child **link = child_link(pid);
+    if (*link) {
+        guest_child *entry = *link;
+        *link = entry->next;
+        free(entry);
+    }
+}
+
+static s64 guest_fork(void)
+{
+    if (install_signal_handlers() < 0) {
+        return linux_error(errno);
+    }
+    guest_child *entry = malloc(sizeof(*entry));
+    if (!entry) {
+        return -ENOMEM;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        int error = errno;
+        free(entry);
+        return linux_error(error);
+    }
+    if (!pid) {
+        free(entry);
+        while (children) {
+            forget_child(children->pid);
+        }
+        host_alarm_pending = host_child_pending = 0;
+        posix_timer_created = false;
+    } else {
+        *entry = (guest_child){pid, children};
+        children = entry;
+    }
+    return pid;
+}
+
+static s64 guest_kill_children(oah_guest *g, pid_t target, u64 number)
+{
+    int signal;
+    switch (number) {
+    case 0: signal = 0; break;
+    case 1: signal = SIGHUP; break;
+    case 2: signal = SIGINT; break;
+    case 3: signal = SIGQUIT; break;
+    case 9: signal = SIGKILL; break;
+    case 15: signal = SIGTERM; break;
+    case 18: signal = SIGCONT; break;
+    default: return number > 64 ? -EINVAL : -LINUX_EOPNOTSUPP;
+    }
+    if (target > 0) {
+        return *child_link(target) ? host_result(kill(target, signal)) : -ESRCH;
+    }
+    pid_t group = target == 0 ? getpgrp() : target == -1 ? 0 : (pid_t)-(s64)target;
+    s64 result = -ESRCH;
+    if (group && group == getpgrp()) {
+        if (number) {
+            g->pending_signals |= 1ull << (number - 1);
+        }
+        result = 0;
+    }
+    for (guest_child *entry = children; entry; entry = entry->next) {
+        if (!group || getpgid(entry->pid) == group) {
+            if (kill(entry->pid, signal) == 0) {
+                result = 0;
+            } else if (result) {
+                result = linux_error(errno);
+            }
+        }
+    }
+    return result;
+}
+
+typedef struct {
+    s64 sec, nsec;
+} linux_timespec;
+
+typedef struct {
+    linux_timespec interval, value;
+} linux_itimerspec;
+
+static bool timer_timeval(linux_timespec input, struct timeval *out)
+{
+    if (input.sec < 0 || input.nsec < 0 || input.nsec >= 1000000000L) {
+        return false;
+    }
+    s64 usec = (input.nsec + 999) / 1000;
+    if (usec == 1000000 && input.sec == INT64_MAX) {
+        return false;
+    }
+    out->tv_sec = input.sec + usec / 1000000;
+    out->tv_usec = (suseconds_t)(usec % 1000000);
+    return true;
+}
+
+static s64 guest_timer_create(oah_image *img, u64 clock, u64 event, u64 id)
+{
+    void *output = oah_guest_access(img, id, sizeof(s32), PROT_WRITE);
+    if (!output) {
+        return -EFAULT;
+    }
+    if (event) {
+        s32 header[4];
+        const void *input = oah_guest_access(img, event, sizeof(header), PROT_READ);
+        if (!input) {
+            return -EFAULT;
+        }
+        memcpy(header, input, sizeof(header));
+        if (header[2] != 14 || header[3] != 0) {
+            return -LINUX_EOPNOTSUPP;
+        }
+    }
+    if (clock > 1) {
+        return -LINUX_EOPNOTSUPP;
+    }
+    if (posix_timer_created) {
+        return -LINUX_EAGAIN;
+    }
+    if (install_signal_handlers() < 0) {
+        return linux_error(errno);
+    }
+    const s32 timer_id = 0;
+    memcpy(output, &timer_id, sizeof(timer_id));
+    posix_timer_created = true;
+    return 0;
+}
+
+static linux_itimerspec linux_timer_value(const struct itimerval *timer)
+{
+    return (linux_itimerspec){
+        {timer->it_interval.tv_sec, (s64)timer->it_interval.tv_usec * 1000},
+        {timer->it_value.tv_sec, (s64)timer->it_value.tv_usec * 1000}
+    };
+}
+
+static s64 guest_timer_set(oah_image *img, u64 id, u64 flags, u64 value, u64 old)
+{
+    if (id || !posix_timer_created) {
+        return -EINVAL;
+    }
+    if (flags) {
+        return -LINUX_EOPNOTSUPP;
+    }
+    linux_itimerspec request;
+    const void *input = oah_guest_access(img, value, sizeof(request), PROT_READ);
+    void *output = old ? oah_guest_access(img, old, sizeof(request), PROT_WRITE) : NULL;
+    if (!input || (old && !output)) {
+        return -EFAULT;
+    }
+    memcpy(&request, input, sizeof(request));
+    struct itimerval timer, previous;
+    if (!timer_timeval(request.value, &timer.it_value) ||
+        !timer_timeval(request.interval, &timer.it_interval)) {
+        return -EINVAL;
+    }
+    if (setitimer(ITIMER_REAL, &timer, &previous) < 0) {
+        return linux_error(errno);
+    }
+    if (output) {
+        linux_itimerspec old_timer = linux_timer_value(&previous);
+        memcpy(output, &old_timer, sizeof(old_timer));
+    }
+    return 0;
+}
+
 static const char *guest_path(oah_image *img, u64 addr)
 {
     u64 available = 4096;
@@ -61,7 +316,7 @@ static bool sysroot_path(const oah_image *img, const char *path)
 {
     return img->sysroot && (strncmp(path, "/lib/", 5) == 0 ||
            strncmp(path, "/lib64/", 7) == 0 || strncmp(path, "/usr/lib/", 9) == 0 ||
-           strncmp(path, "/usr/lib64/", 11) == 0 || strncmp(path, "/etc/ld.", 8) == 0 ||
+           strncmp(path, "/usr/lib64/", 11) == 0 || strncmp(path, "/usr/libexec/", 13) == 0 || strncmp(path, "/etc/ld.", 8) == 0 ||
            strncmp(path, "/etc/ld-musl-", 13) == 0);
 }
 
@@ -645,7 +900,16 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
     }
     if (!result) {
         char *const host_env[] = {NULL};
-        result = host_result(execve(img->launcher, args, host_env));
+        struct itimerval timer;
+        const struct itimerval stopped = {0};
+        if (posix_timer_created && setitimer(ITIMER_REAL, &stopped, &timer) < 0) {
+            result = linux_error(errno);
+        } else {
+            result = host_result(execve(img->launcher, args, host_env));
+            if (posix_timer_created) {
+                setitimer(ITIMER_REAL, &timer, NULL);
+            }
+        }
     }
     free(args);
     return result;
@@ -654,6 +918,93 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
 static int darwin_dirfd(u64 guest_fd)
 {
     return (int)guest_fd == -100 ? AT_FDCWD : (int)guest_fd;
+}
+
+static s64 guest_allocate(int fd, u64 mode, u64 offset, u64 length)
+{
+    if ((s64)offset < 0 || (s64)length <= 0 || offset > INT64_MAX - length) {
+        return -EINVAL;
+    }
+    if (mode || offset) {
+        return -LINUX_EOPNOTSUPP;
+    }
+    struct stat file;
+    if (fstat(fd, &file) < 0) {
+        return linux_error(errno);
+    }
+    /* Darwin preallocates beyond the physical EOF. An empty file lets
+     * this cover the requested range without assuming how holes map. */
+    if (!S_ISREG(file.st_mode) || file.st_size || file.st_blocks) {
+        return -LINUX_EOPNOTSUPP;
+    }
+    fstore_t storage = {
+        .fst_flags = F_ALLOCATEALL,
+        .fst_posmode = F_PEOFPOSMODE,
+        .fst_length = (off_t)length
+    };
+    if (fcntl(fd, F_PREALLOCATE, &storage) < 0) {
+        return linux_error(errno);
+    }
+    return host_result(ftruncate(fd, (off_t)length));
+}
+
+static bool guest_clock(u64 id, clockid_t *host)
+{
+    switch (id) {
+    case 0: *host = CLOCK_REALTIME; return true;
+    case 1: *host = CLOCK_MONOTONIC; return true;
+    case 2: *host = CLOCK_PROCESS_CPUTIME_ID; return true;
+    case 3: *host = CLOCK_THREAD_CPUTIME_ID; return true;
+    case 4: *host = CLOCK_MONOTONIC_RAW; return true;
+    default: return false;
+    }
+}
+
+static s64 guest_sleep(oah_image *img, u64 id, u64 flags, u64 request, u64 remain)
+{
+    /* Linux permits absolute sleeps against the realtime and monotonic clocks. */
+    clockid_t clock;
+    if (id > 1 || !guest_clock(id, &clock) || (flags & ~1ull)) {
+        return -EINVAL;
+    }
+    struct timespec interval;
+    const void *input = oah_guest_access(img, request, sizeof(interval), PROT_READ);
+    if (!input) {
+        return -EFAULT;
+    }
+    memcpy(&interval, input, sizeof(interval));
+    if (interval.tv_sec < 0 || interval.tv_nsec < 0 || interval.tv_nsec >= 1000000000L) {
+        return -EINVAL;
+    }
+    if (flags) {
+        struct timespec now;
+        if (clock_gettime(clock, &now) < 0) {
+            return linux_error(errno);
+        }
+        if (now.tv_sec > interval.tv_sec ||
+            (now.tv_sec == interval.tv_sec && now.tv_nsec >= interval.tv_nsec)) {
+            return 0;
+        }
+        interval.tv_sec -= now.tv_sec;
+        interval.tv_nsec -= now.tv_nsec;
+        if (interval.tv_nsec < 0) {
+            interval.tv_sec--;
+            interval.tv_nsec += 1000000000L;
+        }
+    }
+    struct timespec remaining;
+    if (nanosleep(&interval, &remaining) == 0) {
+        return 0;
+    }
+    int error = errno;
+    if (error == EINTR && remain && !flags) {
+        void *output = oah_guest_access(img, remain, sizeof(remaining), PROT_WRITE);
+        if (!output) {
+            return -EFAULT;
+        }
+        memcpy(output, &remaining, sizeof(remaining));
+    }
+    return linux_error(error);
 }
 
 oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
@@ -670,7 +1021,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case OAH_X86_NR_EXIT:
     case OAH_X86_NR_EXIT_GROUP:
         return OAH_SYS_EXIT;
-    case 13: case 14: case 15: case 62: case 127: case 131: case 200: case 234:
+    case 13: case 14: case 15: case 127: case 130: case 131: case 200: case 234:
         return oah_guest_signal_syscall(g, img);
     case OAH_X86_NR_READ:
     case OAH_X86_NR_WRITE: {
@@ -770,14 +1121,14 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             result = -EFAULT;
             break;
         }
-        result = host_result(fork());
+        result = guest_fork();
         if (!result && (a0 & 0x1000000)) {
             u32 tid = getpid();
             memcpy(oah_guest_access(img, a3, 4, PROT_WRITE), &tid, sizeof(tid));
         }
         break;
     case 57: /* fork */
-        result = host_result(fork());
+        result = guest_fork();
         break;
     case 59: result = guest_exec(img, a0, a1, a2); break;
     case 61: { /* wait4 */
@@ -789,11 +1140,83 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         int options = (a2 & 1 ? WNOHANG : 0) | (a2 & 2 ? WUNTRACED : 0);
         result = host_result(waitpid((pid_t)a0, &status, options));
-        if (result > 0 && output) {
-            memcpy(output, &status, sizeof(status));
+        if (result > 0) {
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                forget_child((pid_t)result);
+            }
+            if (output) {
+                memcpy(output, &status, sizeof(status));
+            }
         }
         break;
     }
+    case 62: /* kill */
+        if ((pid_t)a0 == getpid()) {
+            return oah_guest_signal_syscall(g, img);
+        }
+        result = guest_kill_children(g, (pid_t)a0, a1);
+        break;
+    case 109: { /* setpgid, scoped to the guest process and its children */
+        pid_t pid = (pid_t)a0, group = (pid_t)a1;
+        result = pid && pid != getpid() && !*child_link(pid) ? -ESRCH :
+                 host_result(setpgid(pid, group));
+        break;
+    }
+    case 222: result = guest_timer_create(img, a0, a1, a2); break;
+    case 223: result = guest_timer_set(img, a0, a1, a2, a3); break;
+    case 224: { /* timer_gettime */
+        void *output = oah_guest_access(img, a1, sizeof(linux_itimerspec), PROT_WRITE);
+        struct itimerval timer;
+        result = a0 || !posix_timer_created ? -EINVAL :
+                 !output ? -EFAULT : host_result(getitimer(ITIMER_REAL, &timer));
+        if (!result) {
+            linux_itimerspec value = linux_timer_value(&timer);
+            memcpy(output, &value, sizeof(value));
+        }
+        break;
+    }
+    case 226: { /* timer_delete */
+        const struct itimerval stopped = {0};
+        result = a0 || !posix_timer_created ? -EINVAL :
+                 host_result(setitimer(ITIMER_REAL, &stopped, NULL));
+        if (!result) {
+            posix_timer_created = false;
+        }
+        break;
+    }
+    case 35: /* nanosleep */
+        result = guest_sleep(img, 1, 0, a0, a1);
+        break;
+    case 73: { /* flock */
+        unsigned kind = a1 & ~4ull;
+        int operation = kind == 1 ? LOCK_SH : kind == 2 ? LOCK_EX : LOCK_UN;
+        result = (a1 & ~15ull) || (kind != 1 && kind != 2 && kind != 8) ? -EINVAL :
+                 host_result(flock((int)a0, operation | (a1 & 4 ? LOCK_NB : 0)));
+        break;
+    }
+    case 74: case 75: /* fsync, fdatasync */
+        result = host_result(fsync((int)a0));
+        break;
+    case 228: case 229: { /* clock_gettime, clock_getres */
+        clockid_t clock;
+        struct timespec value;
+        void *output = a1 ? oah_guest_access(img, a1, sizeof(value), PROT_WRITE) : NULL;
+        if (!guest_clock(a0, &clock)) {
+            result = -EINVAL;
+        } else if (!output && (a1 || nr == 228)) {
+            result = -EFAULT;
+        } else {
+            result = host_result(nr == 228 ? clock_gettime(clock, &value) : clock_getres(clock, &value));
+            if (!result && output) {
+                memcpy(output, &value, sizeof(value));
+            }
+        }
+        break;
+    }
+    case 285: result = guest_allocate((int)a0, a1, a2, a3); break;
+    case 230: /* clock_nanosleep */
+        result = guest_sleep(img, a0, a1, a2, a3);
+        break;
     case 79: { /* getcwd */
         char *buffer = oah_guest_access(img, a0, a1, PROT_WRITE);
         result = !a1 ? -EINVAL : !buffer ? -EFAULT :

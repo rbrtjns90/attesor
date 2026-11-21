@@ -113,7 +113,7 @@ static bool default_stop(unsigned signum)
 }
 
 static bool install_frame(oah_guest *g, oah_image *img, unsigned signum,
-                          const oah_guest_signal_action *action)
+                          const oah_guest_signal_action *action, u64 return_mask)
 {
     u64 stack = g->gpr[OAH_X86_RSP];
     bool already_on_alt = on_signal_stack(g, stack);
@@ -144,12 +144,12 @@ static bool install_frame(oah_guest *g, oah_image *img, unsigned signum,
     frame.restorer = action->restorer;
     frame.context.flags = 6; /* UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS */
     frame.context.stack = current_signal_stack(g);
-    frame.context.mask = g->signal_mask;
+    frame.context.mask = return_mask;
     frame.context.machine.ip = g->rip;
     frame.context.machine.flags = g->rflags;
     frame.context.machine.cs = 0x33;
     frame.context.machine.ss = 0x2b;
-    frame.context.machine.oldmask = g->signal_mask;
+    frame.context.machine.oldmask = return_mask;
     frame.context.machine.fpstate = fp_address;
     for (unsigned i = 0; i < 16; i++) {
         frame.context.machine.general[i] = g->gpr[frame_gprs[i]];
@@ -179,7 +179,7 @@ static bool install_frame(oah_guest *g, oah_image *img, unsigned signum,
     return true;
 }
 
-static oah_sys_status deliver_ready(oah_guest *g, oah_image *img)
+static oah_sys_status deliver_ready(oah_guest *g, oah_image *img, u64 return_mask)
 {
     u64 ready = g->pending_signals & ~g->signal_mask;
     while (ready) {
@@ -199,7 +199,7 @@ static oah_sys_status deliver_ready(oah_guest *g, oah_image *img)
             g->gpr[OAH_X86_RDI] = 128 + signum;
             return OAH_SYS_EXIT;
         }
-        if (!install_frame(g, img, signum, action)) {
+        if (!install_frame(g, img, signum, action, return_mask)) {
             return OAH_SYS_FATAL;
         }
         g->thread_signals &= ~bit;
@@ -210,6 +210,44 @@ static oah_sys_status deliver_ready(oah_guest *g, oah_image *img)
     }
     return OAH_SYS_CONTINUE;
 }
+
+#if defined(__APPLE__)
+oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img)
+{
+    g->pending_signals |= oah_darwin_pending_signals();
+    if (!(g->pending_signals & ~g->signal_mask)) {
+        return OAH_SYS_CONTINUE;
+    }
+    return deliver_ready(g, img, g->signal_mask);
+}
+
+static oah_sys_status signal_suspend(oah_guest *g, oah_image *img, u64 address, u64 size)
+{
+    const void *input = size == 8 ? oah_guest_access(img, address, size, PROT_READ) : NULL;
+    if (!input) {
+        g->gpr[OAH_X86_RAX] = size == 8 ? -EFAULT : -EINVAL;
+        return OAH_SYS_CONTINUE;
+    }
+    u64 saved = g->signal_mask, temporary;
+    memcpy(&temporary, input, sizeof(temporary));
+    g->signal_mask = blockable(temporary);
+    for (;;) {
+        g->pending_signals |= oah_darwin_pending_signals();
+        g->gpr[OAH_X86_RAX] = -EINTR;
+        u64 stack = g->gpr[OAH_X86_RSP];
+        oah_sys_status status = deliver_ready(g, img, saved);
+        if (status != OAH_SYS_CONTINUE || g->gpr[OAH_X86_RSP] != stack) {
+            return status;
+        }
+        s64 error = oah_darwin_wait_signal();
+        if (error < 0) {
+            g->signal_mask = saved;
+            g->gpr[OAH_X86_RAX] = (u64)error;
+            return OAH_SYS_CONTINUE;
+        }
+    }
+}
+#endif
 
 static oah_sys_status restore_frame(oah_guest *g, oah_image *img)
 {
@@ -265,7 +303,7 @@ static oah_sys_status restore_frame(oah_guest *g, oah_image *img)
     g->signal_stack_base = stack->flags == X86_SS_DISABLE ? 0 : stack->pointer;
     g->signal_stack_size = stack->flags == X86_SS_DISABLE ? 0 : stack->size;
     g->signal_mask = blockable(frame.context.mask);
-    return deliver_ready(g, img);
+    return deliver_ready(g, img, g->signal_mask);
 }
 
 static s64 signal_action(oah_guest *g, oah_image *img, u64 signum,
@@ -416,6 +454,10 @@ oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img)
         }
         break;
     }
+#if defined(__APPLE__)
+    case 130:
+        return signal_suspend(g, img, a0, a1);
+#endif
     case 131:
         result = signal_altstack(g, img, a0, a1);
         break;
@@ -431,5 +473,5 @@ oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img)
         break;
     }
     g->gpr[OAH_X86_RAX] = (u64)result;
-    return result == 0 ? deliver_ready(g, img) : OAH_SYS_CONTINUE;
+    return result == 0 ? deliver_ready(g, img, g->signal_mask) : OAH_SYS_CONTINUE;
 }
