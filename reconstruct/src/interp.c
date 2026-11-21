@@ -220,7 +220,7 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     bool move = op == OAH_SC_MOV || op == OAH_SC_MOVSX || op == OAH_SC_MOVZX ||
                 op == OAH_SC_CMOV || op == OAH_SC_SETCC;
     bool write = op != OAH_SC_CMP && op != OAH_SC_TEST && op != OAH_SC_DIV &&
-                 op != OAH_SC_BT && op != OAH_SC_MUL && !indirect;
+                 op != OAH_SC_BT && op != OAH_SC_MUL && op != OAH_SC_PUSH && !indirect;
     u8 rm_width = in->src_width ? in->src_width : width;
     u64 rm = 0, address = 0, result;
     void *slot = NULL;
@@ -250,6 +250,14 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
     } else {
         rm = read_reg(g, in->dst, rm_width, in->rex_present);
+    }
+
+    if (op == OAH_SC_PUSH) {
+        if (!push64(g, img, rm)) {
+            return false;
+        }
+        g->rip = next;
+        return true;
     }
 
     if (indirect) {
@@ -299,6 +307,14 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     } else if (op == OAH_SC_BT) {
         unsigned bit = reg & (width * 8 - 1);
         g->rflags = (g->rflags & ~OAH_RFLAGS_CF) | ((rm >> bit) & 1);
+    } else if (op == OAH_SC_CMPXCHG) {
+        /* The runtime dispatches one guest thread, including LOCK forms. */
+        u64 expected = read_reg(g, OAH_X86_RAX, width, true);
+        g->rflags = oah_cmp_rflags(g->rflags, expected, rm, width);
+        if (expected != rm) {
+            write_gpr(g, OAH_X86_RAX, width, rm);
+            write = false;
+        }
     } else if (op == OAH_SC_XCHG) {
         store_reg(g, in->src, width, in->rex_present, rm);
     } else if (op == OAH_SC_MOVSX) {
@@ -375,11 +391,14 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         u64 carry = (op == OAH_SC_ADC || op == OAH_SC_SBB) &&
                     (g->rflags & OAH_RFLAGS_CF);
         bool subtract = op == OAH_SC_SUB || op == OAH_SC_SBB || op == OAH_SC_CMP;
-        bool arithmetic = subtract || op == OAH_SC_ADD || op == OAH_SC_ADC;
+        bool arithmetic = subtract || op == OAH_SC_ADD || op == OAH_SC_ADC || op == OAH_SC_XADD;
         if (arithmetic) {
             __uint128_t full = subtract ? (__uint128_t)lhs - rhs - carry
                                         : (__uint128_t)lhs + rhs + carry;
             result = (u64)full & mask;
+            if (op == OAH_SC_XADD) {
+                store_reg(g, in->src, width, in->rex_present, lhs);
+            }
             g->rflags = oah_logic_rflags(g->rflags, result, width);
             if (full > mask) {
                 g->rflags |= OAH_RFLAGS_CF;

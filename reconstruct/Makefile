@@ -51,7 +51,7 @@ QEMU_AARCH64   ?= qemu-aarch64-static
 # Keep oah's load address far from a typical ET_EXEC guest at 0x400000.
 AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 
-.PHONY: all test test-branch-guest test-linux-static test-qemu clean inventory inventory-binary oah oah-aarch64
+.PHONY: all test test-branch-guest test-linux-static test-linux-dynamic test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
 
@@ -101,6 +101,11 @@ test-branch-guest: oah tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64
 test-linux-static: oah
 	@test -n "$(BUSYBOX_STATIC)" || { echo "Set BUSYBOX_STATIC to the pinned BusyBox ELF"; exit 1; }
 	python3 tools/test_linux_static.py --runner ./oah --busybox "$(BUSYBOX_STATIC)" --qemu "$(QEMU_X86_64)"
+
+test-linux-dynamic: oah
+	@test -n "$(ALPINE_SYSROOT)" || { echo "Set ALPINE_SYSROOT to the pinned Alpine x86-64 root"; exit 1; }
+	python3 tools/test_linux_static.py --runner ./oah --busybox "$(ALPINE_SYSROOT)/bin/busybox" \
+	    --sysroot "$(ALPINE_SYSROOT)" --qemu "$(QEMU_X86_64)" --cc "$(CC_X86_64)"
 
 test-qemu: oah-aarch64 tests/test_arm_native-aarch64 tests/hello.x86_64
 	@command -v $(CC_AARCH64) >/dev/null || { echo "need $(CC_AARCH64)"; exit 1; }

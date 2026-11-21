@@ -13,7 +13,7 @@
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s [--interpret] <x86_64-elf> [args...]\n", argv0);
+    fprintf(stderr, "usage: %s [--interpret] [--sysroot DIR] <x86_64-elf> [args...]\n", argv0);
 }
 
 static u64 setup_stack(oah_image *img, int argc, char **argv, char **envp)
@@ -57,7 +57,7 @@ static u64 setup_stack(oah_image *img, int argc, char **argv, char **envp)
     strings += sizeof(random);
     const u64 aux[] = {
         AT_PHDR, img->phdr, AT_PHENT, img->phentsize, AT_PHNUM, img->phnum,
-        AT_PAGESZ, (u64)sysconf(_SC_PAGESIZE), AT_ENTRY, img->entry,
+        AT_PAGESZ, (u64)sysconf(_SC_PAGESIZE), AT_ENTRY, img->entry, AT_BASE, img->interp_base,
         AT_UID, getuid(), AT_EUID, geteuid(), AT_GID, getgid(), AT_EGID, getegid(),
         AT_SECURE, 0, AT_RANDOM, random_addr, AT_EXECFN, (u64)(uintptr_t)strings,
         AT_NULL, 0
@@ -92,17 +92,34 @@ int main(int argc, char **argv, char **envp)
     oah_interp_result run;
     u64 rsp;
 
-    bool interpret = argc > 1 && strcmp(argv[1], "--interpret") == 0;
-    int guest_arg = interpret ? 2 : 1;
+    bool interpret = false;
+    const char *sysroot = NULL;
+    int guest_arg = 1;
+    while (guest_arg < argc) {
+        const char *option = argv[guest_arg];
+        if (strcmp(option, "--interpret") == 0) {
+            interpret = true;
+            guest_arg++;
+        } else if (strcmp(option, "--sysroot") == 0 && guest_arg + 1 < argc) {
+            sysroot = argv[guest_arg + 1];
+            guest_arg += 2;
+        } else if (strcmp(option, "--") == 0) {
+            guest_arg++;
+            break;
+        } else {
+            break;
+        }
+    }
 
     if (argc <= guest_arg) {
         usage(argv[0]);
         return 2;
     }
 
-    if (!oah_map_elf(&img, argv[guest_arg])) {
+    if (!oah_map_elf_sysroot(&img, argv[guest_arg], sysroot)) {
         fprintf(stderr, "oah: cannot load %s (%s)\n", argv[guest_arg],
-                errno == ENOTSUP ? "dynamic ELF is unsupported" : "invalid or unavailable static x86-64 ELF");
+                errno == ENOTSUP ? "dynamic ELF requires --sysroot"
+                : errno ? strerror(errno) : "invalid x86-64 ELF");
         return 127;
     }
 
@@ -113,7 +130,7 @@ int main(int argc, char **argv, char **envp)
         return 127;
     }
 
-    oah_guest_init(&guest, img.entry, rsp);
+    oah_guest_init(&guest, img.interp_entry ? img.interp_entry : img.entry, rsp);
     run = interpret ? oah_jit_run(&guest, &img, OAH_INTERP_MAX_INSNS)
                     : oah_jit_run_native(&guest, &img, OAH_INTERP_MAX_INSNS);
 
@@ -124,7 +141,13 @@ int main(int argc, char **argv, char **envp)
     fprintf(stderr, "oah: guest stopped (%d) after %llu insns rip=%llx",
             (int)run.status, (unsigned long long)run.insns,
             (unsigned long long)guest.rip);
-    if (run.status == OAH_INTERP_DECODE) {
+    if (img.interp_mapping &&
+        guest.rip - (u64)(uintptr_t)img.interp_mapping < img.interp_mapping_size) {
+        fprintf(stderr, " interp+%llx", (unsigned long long)(guest.rip - img.interp_base));
+    } else if (guest.rip - (u64)(uintptr_t)img.load_mapping < img.load_mapping_size) {
+        fprintf(stderr, " image+%llx", (unsigned long long)(guest.rip - (u64)(uintptr_t)img.load_mapping));
+    }
+    if (run.status == OAH_INTERP_DECODE || run.status == OAH_INTERP_FAULT) {
         u64 available = 15;
         const u8 *bytes = oah_guest_span(&img, guest.rip, &available);
         if (bytes) {

@@ -78,7 +78,7 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
     u8 ext = 0;
     if (opcode == 0x0f) {
         ext = take(d);
-        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xbc && ext != 0xbd &&
+        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xb0 && ext != 0xb1 && ext != 0xc0 && ext != 0xc1 && ext != 0xbc && ext != 0xbd &&
             (ext < 0x40 || ext > 0x4f) && (ext < 0x90 || ext > 0x9f)) {
             return false;
         }
@@ -132,6 +132,10 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
                      : out->opsize == 2 ? oah_decoder_read_int(d, 1)
                      : (u64)(s64)(s32)oah_decoder_read_int(d, 2);
         }
+    } else if (ext == 0xb0 || ext == 0xb1 || ext == 0xc0 || ext == 0xc1) {
+        out->scalar = ext < 0xc0 ? OAH_SC_CMPXCHG : OAH_SC_XADD;
+        out->opsize = ext & 1 ? width : 1;
+        out->rm_dest = true;
     } else if (ext == 0xa3) {
         if (out->memory) {
             return false;
@@ -190,8 +194,8 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
         out->scalar = group == 0 ? OAH_SC_INC : OAH_SC_DEC;
         out->rm_dest = true;
         out->opsize = opcode == 0xfe ? 1 : width;
-    } else if (opcode == 0xff && (group == 2 || group == 4)) {
-        out->scalar = group == 2 ? OAH_SC_CALL : OAH_SC_JMP;
+    } else if (opcode == 0xff && (group == 2 || group == 4 || group == 6)) {
+        out->scalar = group == 2 ? OAH_SC_CALL : group == 4 ? OAH_SC_JMP : OAH_SC_PUSH;
         out->opsize = 8;
     } else {
         return false;
@@ -258,10 +262,6 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         return false;
     }
 
-    if (lock) {
-        return false;
-    }
-
     if (op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab) {
         if (address32 || segment || repeat_not_equal) {
             return false;
@@ -280,7 +280,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                            op == 0x85 || op == 0x89 || op == 0x8b)) ||
                   ((op == 0x81 || op == 0x83) && (following & 0xf8) == 0xf8);
     oah_decoder scalar_decoder = d;
-    if ((!simple || (operand_override && opsize != 8)) &&
+    if ((lock || !simple || (operand_override && opsize != 8)) &&
         op != 0x0f && decode_scalar(&scalar_decoder, out, op, rex,
                                     operand_override && opsize != 8 ? 2 : opsize,
                                     address32, segment)) {
@@ -298,7 +298,8 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     /* F3 0F 1E FA endbr64 — F3 already consumed as prefix. */
     if (op == 0x0f) {
         u8 ext = peek(&d);
-        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 || ext == 0xbc || ext == 0xbd ||
+        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 || ext == 0xb0 || ext == 0xb1 ||
+            ext == 0xc0 || ext == 0xc1 || ext == 0xbc || ext == 0xbd ||
             (ext >= 0x40 && ext <= 0x4f) || (ext >= 0x90 && ext <= 0x9f)) {
             if (!decode_scalar(&d, out, op, rex, operand_override && opsize != 8 ? 2 : opsize,
                                address32, segment)) {
@@ -519,6 +520,14 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     return false;
 
 done:
+    if (lock && (out->op != OAH_OP_SCALAR || !out->memory ||
+        !((out->scalar >= OAH_SC_ADD && out->scalar <= OAH_SC_XOR) ||
+          out->scalar == OAH_SC_NEG || out->scalar == OAH_SC_NOT ||
+          out->scalar == OAH_SC_INC || out->scalar == OAH_SC_DEC ||
+          out->scalar == OAH_SC_XCHG || out->scalar == OAH_SC_CMPXCHG ||
+          out->scalar == OAH_SC_XADD))) {
+        return false;
+    }
     if (d.error) {
         return false;
     }

@@ -54,13 +54,13 @@ reconstruct/
 | 6 | New ELF `oah`: map x86_64 guest, **x86→ARM translate**, runtime syscall shuffle | First runnable equivalent |
 | 7 | Native RX jump + **qemu-user** (`oah-aarch64`) | Prove the emitted ARM is real, not only a C interpreter |
 
-`oah` loads a static x86-64 Linux ELF and executes it on Linux. Fixed-address guests retain their linked addresses. Static PIE guests are slid as one image and handle their own relocations. Startup supplies an aligned stack with arguments, environment, and auxiliary vector entries.
+`oah` loads an x86-64 Linux ELF and executes it on Linux. Fixed-address guests retain their linked addresses. Static PIE guests are slid as one image and handle their own relocations. Startup supplies an aligned stack with arguments, environment, and auxiliary vector entries.
 
 ### Execution paths
 
 On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. `--interpret` runs those fragments in the ARM interpreter instead. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
 
-The current milestone covers single-process static Linux tools. Dynamic loading, threads, general signal handling, and broad x86/SIMD coverage remain future work. Guest memory syscalls currently support a dedicated brk arena, anonymous private mappings, the musl heap guard page, and whole-region changes. This runner is intended for trusted test executables.
+The current milestone covers single-process static and musl-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, general signal handling, broader glibc startup, and full x86/SIMD coverage remain future work. This runner is intended for trusted test executables.
 
 ## Build and verify
 
@@ -176,6 +176,18 @@ make -C reconstruct test-linux-static BUSYBOX_STATIC=/absolute/path/to/busybox.s
 ```
 
 The test uses `qemu-x86_64` as its reference (`QEMU_X86_64` overrides the executable). It compares stdout, stderr, and exit status for `true`, `false`, `echo`, `cat`, and `wc -c`, including stdin, files, and a missing file. It runs both attesor backends. The normal `make test` target remains offline.
+
+### Dynamically linked Alpine tools
+
+Use `bin/busybox` and `lib/ld-musl-x86_64.so.1` from the official Alpine 3.22.7 x86-64 image. The differential test pins both files by SHA-256. It repeats the BusyBox cases and builds an additional guest whose imported function comes from a separate x86-64 shared object.
+
+```bash
+make -C reconstruct test-linux-dynamic ALPINE_SYSROOT=/absolute/path/to/alpine-root
+./reconstruct/oah --sysroot /absolute/path/to/alpine-root \
+    /absolute/path/to/alpine-root/bin/busybox echo hello
+```
+
+The test needs `qemu-x86_64` and `x86_64-linux-gnu-gcc`. `QEMU_X86_64` and `CC_X86_64` override them. With `--sysroot`, absolute guest loader and standard library/config paths are resolved within the supplied root by Linux `openat2`. Ordinary program file arguments are handled in the host working directory. The sysroot provides guest runtime files and does not isolate the process.
 
 ## What we will not do
 

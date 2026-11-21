@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -47,12 +48,62 @@ static u64 set_errno_ret(s64 rc)
     return (u64)rc;
 }
 
+/* Linux x86-64 kernel struct stat, independent of the host libc layout. */
+typedef struct {
+    u64 dev, ino, nlink;
+    u32 mode, uid, gid, pad;
+    u64 rdev;
+    s64 size, blksize, blocks;
+    s64 atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+    s64 reserved[3];
+} x86_stat;
+
+_Static_assert(sizeof(x86_stat) == 144, "x86-64 Linux stat layout");
+
+static s64 guest_fstat(const oah_image *img, int fd, u64 address)
+{
+    void *output = oah_guest_access(img, address, sizeof(x86_stat), PROT_WRITE);
+    struct stat st;
+    if (!output) {
+        return -EFAULT;
+    }
+    if (fstat(fd, &st) != 0) {
+        return -errno;
+    }
+    x86_stat converted = {
+        .dev = st.st_dev, .ino = st.st_ino, .nlink = st.st_nlink, .mode = st.st_mode,
+        .uid = st.st_uid, .gid = st.st_gid, .rdev = st.st_rdev, .size = st.st_size,
+        .blksize = st.st_blksize, .blocks = st.st_blocks,
+        .atime_sec = st.st_atim.tv_sec, .atime_nsec = st.st_atim.tv_nsec,
+        .mtime_sec = st.st_mtim.tv_sec, .mtime_nsec = st.st_mtim.tv_nsec,
+        .ctime_sec = st.st_ctim.tv_sec, .ctime_nsec = st.st_ctim.tv_nsec
+    };
+    memcpy(output, &converted, sizeof(converted));
+    return 0;
+}
+
 static const char *guest_path(const oah_image *img, u64 addr)
 {
     u64 count = 4096;
     const u8 *bytes = oah_guest_span(img, addr, &count);
     return bytes && oah_guest_access(img, addr, count, PROT_READ) &&
            memchr(bytes, 0, count) ? (const char *)bytes : NULL;
+}
+
+static int open_guest_path(const oah_image *img, int dirfd, const char *path,
+                           int flags, u32 mode)
+{
+    if (img->sysroot && (strncmp(path, "/lib/", 5) == 0 ||
+        strncmp(path, "/lib64/", 7) == 0 || strncmp(path, "/usr/lib/", 9) == 0 ||
+        strncmp(path, "/usr/lib64/", 11) == 0 || strncmp(path, "/etc/ld.", 8) == 0 ||
+        strncmp(path, "/etc/ld-musl-", 13) == 0)) {
+        if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC))) {
+            errno = EROFS;
+            return -1;
+        }
+        return oah_sysroot_open(img->sysroot, path, flags, mode);
+    }
+    return openat(dirfd, path, flags, mode);
 }
 
 static u64 guest_brk(oah_image *img, u64 addr)
@@ -109,14 +160,126 @@ static u64 guest_brk(oah_image *img, u64 addr)
     return addr;
 }
 
+static void split_mapping(oah_image *img, unsigned i, u64 addr, u64 len, u32 prot)
+{
+    oah_load_seg *seg = &img->segs[i];
+    oah_load_seg original = *seg;
+    u64 left = addr - seg->gva;
+    u64 right = seg->size - left - len;
+    u8 *host = seg->host + left;
+    unsigned extra = (left != 0) + (right != 0);
+    memmove(seg + 1 + extra, seg + 1, (img->nseg - i - 1) * sizeof(*seg));
+    if (left) {
+        *seg = original;
+        seg->size = left;
+        seg++;
+    }
+    *seg++ = (oah_load_seg){addr, len, host, prot, original.file_mapping};
+    if (right) {
+        *seg = (oah_load_seg){addr + len, right, host + len, original.prot, original.file_mapping};
+    }
+    img->nseg += extra;
+    if (i < img->load_segments) {
+        img->load_segments += extra;
+    }
+}
+
+static u64 guest_file_mmap(oah_image *img, u64 addr, u64 len, u32 prot,
+                           bool fixed, int fd, u64 offset)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    struct stat st;
+    unsigned index = img->nseg;
+    if ((offset & (page - 1)) || offset > INT64_MAX) {
+        return (u64)(s64)-EINVAL;
+    }
+    if (fstat(fd, &st) != 0) {
+        return set_errno_ret(-1);
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return (u64)(s64)-ENODEV;
+    }
+    if (fixed) {
+        if (addr & (page - 1)) {
+            return (u64)(s64)-EINVAL;
+        }
+        for (unsigned i = img->load_segments; i < img->nseg; i++) {
+            const oah_load_seg *seg = &img->segs[i];
+            if (seg->file_mapping && addr >= seg->gva && addr - seg->gva < seg->size &&
+                len <= seg->size - (addr - seg->gva)) {
+                unsigned extra = (addr != seg->gva) + (len != seg->size - (addr - seg->gva));
+                if (extra > OAH_MAX_LOAD_SEGS - img->nseg) {
+                    return (u64)(s64)-ENOMEM;
+                }
+                index = i;
+                break;
+            }
+        }
+        if (index == img->nseg) {
+            return (u64)(s64)-EINVAL;
+        }
+    } else if (img->nseg == OAH_MAX_LOAD_SEGS) {
+        return (u64)(s64)-ENOMEM;
+    }
+
+    u8 *staged = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (staged == MAP_FAILED) {
+        return set_errno_ret(-1);
+    }
+    u64 bytes = offset < (u64)st.st_size ? (u64)st.st_size - offset : 0;
+    if (bytes > len) {
+        bytes = len;
+    }
+    for (u64 pos = 0; pos < bytes;) {
+        ssize_t count = pread(fd, staged + pos, bytes - pos, (off_t)(offset + pos));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            int error = errno;
+            munmap(staged, len);
+            return (u64)(s64)-error;
+        }
+        if (!count) {
+            break;
+        }
+        pos += (u64)count;
+    }
+    if (mprotect(staged, len, (int)prot & ~PROT_EXEC) != 0) {
+        int error = errno;
+        munmap(staged, len);
+        return (u64)(s64)-error;
+    }
+    if (fixed) {
+        if (mremap(staged, len, len, MREMAP_MAYMOVE | MREMAP_FIXED,
+                   (void *)(uintptr_t)addr) == MAP_FAILED) {
+            int error = errno;
+            munmap(staged, len);
+            return (u64)(s64)-error;
+        }
+        split_mapping(img, index, addr, len, prot);
+        return addr;
+    }
+    img->segs[img->nseg++] = (oah_load_seg){
+        .gva = (u64)(uintptr_t)staged, .size = len, .host = staged,
+        .prot = prot, .file_mapping = true
+    };
+    return (u64)(uintptr_t)staged;
+}
+
 static u64 guest_mmap(oah_image *img, u64 addr, u64 len, u64 prot, u64 flags, u64 fd, u64 off)
 {
     u64 page = (u64)sysconf(_SC_PAGESIZE);
-    if (!len || len > (1ull << 30) || (prot & ~7ull) ||
-        (flags != 0x22 && flags != 0x32) || fd != UINT64_MAX || off != 0) {
+    if (!len || len > (1ull << 30) || (prot & ~7ull)) {
         return (u64)(s64)-EINVAL;
     }
     len = (len + page - 1) & ~(page - 1);
+    if (flags == 0x02 || flags == 0x12) {
+        return guest_file_mmap(img, addr, len, (u32)prot, flags == 0x12, (int)fd, off);
+    }
+    if ((flags != 0x22 && flags != 0x32) || (int)fd != -1 || off != 0) {
+        return (u64)(s64)-EINVAL;
+    }
     if (flags == 0x32) {
         /* musl reserves a guard page at the start of its own brk arena. */
         if (addr != img->load_end || len != page || prot || img->heap_guard ||
@@ -162,11 +325,15 @@ static s64 guest_memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool
     unsigned first = unmap ? img->load_segments : 0;
     for (unsigned i = first; i < img->nseg; i++) {
         oah_load_seg *seg = &img->segs[i];
-        if (seg->gva != addr || seg->size != len) {
+        if (addr < seg->gva || addr - seg->gva >= seg->size ||
+            len > seg->size - (addr - seg->gva) || (addr & (page - 1))) {
             continue;
         }
+        u64 left = addr - seg->gva;
+        u64 right = seg->size - left - len;
         if (unmap) {
-            if (img->heap_mapping && addr - img->load_end < img->heap_capacity) {
+            if (left || right ||
+                (img->heap_mapping && addr - img->load_end < img->heap_capacity)) {
                 return -EINVAL;
             }
             if (munmap(seg->host, len) != 0) {
@@ -174,10 +341,16 @@ static s64 guest_memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool
             }
             *seg = img->segs[--img->nseg];
         } else {
-            if (mprotect(seg->host, len, (int)prot & ~PROT_EXEC) != 0) {
+            /* Preserve the original range and its ownership on either side. */
+            unsigned extra = (left != 0) + (right != 0);
+            if (extra > OAH_MAX_LOAD_SEGS - img->nseg) {
+                return -ENOMEM;
+            }
+            u8 *host = seg->host + left;
+            if (mprotect(host, len, (int)prot & ~PROT_EXEC) != 0) {
                 return -errno;
             }
-            seg->prot = (u32)prot;
+            split_mapping(img, i, addr, len, (u32)prot);
         }
         return 0;
     }
@@ -207,6 +380,14 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
 
     case OAH_X86_NR_BRK:
         g->gpr[OAH_X86_RAX] = guest_brk(img, a0);
+        return OAH_SYS_CONTINUE;
+    case 5: /* fstat */
+        g->gpr[OAH_X86_RAX] = (u64)guest_fstat(img, (int)a0, a1);
+        return OAH_SYS_CONTINUE;
+    case 72: /* fcntl, descriptor flags */
+        g->gpr[OAH_X86_RAX] = a1 == F_GETFD || a1 == F_SETFD
+                            ? set_errno_ret(fcntl((int)a0, (int)a1, (int)a2))
+                            : (u64)(s64)-EINVAL;
         return OAH_SYS_CONTINUE;
     case 9: /* mmap */
         g->gpr[OAH_X86_RAX] = img ? guest_mmap(img, a0, a1, a2, a3, a4, a5) : (u64)(s64)-EINVAL;
@@ -238,7 +419,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
 #if defined(__aarch64__)
         flags = oah_translate_open_flags(flags);
 #endif
-        g->gpr[OAH_X86_RAX] = path ? set_errno_ret(open(path, (int)flags, (mode_t)a2))
+        g->gpr[OAH_X86_RAX] = path ? set_errno_ret(open_guest_path(img, AT_FDCWD, path, (int)flags, (u32)a2))
                                   : (u64)(s64)-EFAULT;
         return OAH_SYS_CONTINUE;
     }
@@ -343,7 +524,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             flags = oah_translate_open_flags(flags);
 #endif
             errno = 0;
-            rc = syscall((long)host_nr, (long)a0, path, (long)flags, (long)a3);
+            rc = open_guest_path(img, (int)a0, path, (int)flags, (u32)a3);
         } else if (nr == OAH_X86_NR_GETRANDOM) {
             void *buf = oah_guest_access(img, a0, a1, PROT_WRITE);
             if (a1 != 0 && !buf) {

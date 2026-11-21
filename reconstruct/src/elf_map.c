@@ -3,6 +3,9 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <linux/openat2.h>
+#include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -27,6 +30,9 @@ void oah_unmap_elf(oah_image *img)
               img->segs[i].gva - (u64)(uintptr_t)img->heap_mapping < img->heap_capacity)) {
             munmap(img->segs[i].host, (size_t)img->segs[i].size);
         }
+    }
+    if (img->interp_mapping) {
+        munmap(img->interp_mapping, (size_t)img->interp_mapping_size);
     }
     if (img->load_mapping) {
         munmap(img->load_mapping, (size_t)img->load_mapping_size);
@@ -88,7 +94,25 @@ void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
     return NULL;
 }
 
-bool oah_map_elf(oah_image *img, const char *path)
+int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
+{
+    int root = open(sysroot, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (root < 0) {
+        return -1;
+    }
+    struct open_how options = {
+        .flags = (u64)flags,
+        .mode = (flags & O_CREAT) ? mode : 0,
+        .resolve = RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS
+    };
+    int fd = (int)syscall(SYS_openat2, root, path, &options, sizeof(options));
+    int error = errno;
+    close(root);
+    errno = error;
+    return fd;
+}
+
+static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)
 {
     Elf64_Ehdr eh;
     Elf64_Phdr ph[128];
@@ -100,15 +124,19 @@ bool oah_map_elf(oah_image *img, const char *path)
     u8 *pages = NULL;
     bool success = false;
 
+    int open_error = fd < 0 ? errno : 0;
     errno = 0;
     memset(img, 0, sizeof(*img));
-    img->fd = -1;
-    if (host_page <= 0 || (host_page & (host_page - 1))) {
+    img->fd = fd;
+    if (fd < 0) {
+        errno = open_error;
         return false;
     }
+    if (host_page <= 0 || (host_page & (host_page - 1))) {
+        goto done;
+    }
     mask = (u64)host_page - 1;
-    img->fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (img->fd < 0 || fstat(img->fd, &st) != 0 ||
+    if (fstat(img->fd, &st) != 0 ||
         pread(img->fd, &eh, sizeof(eh), 0) != sizeof(eh)) {
         goto done;
     }
@@ -128,8 +156,20 @@ bool oah_map_elf(oah_image *img, const char *path)
     for (unsigned i = 0; i < eh.e_phnum; i++) {
         const Elf64_Phdr *seg = &ph[i];
         if (seg->p_type == PT_INTERP) {
-            errno = ENOTSUP;
-            goto done;
+            if (!interp) {
+                errno = ENOTSUP;
+                goto done;
+            }
+            if (*interp || seg->p_filesz < 2 || seg->p_filesz > PATH_MAX ||
+                seg->p_offset > (u64)st.st_size ||
+                seg->p_filesz > (u64)st.st_size - seg->p_offset ||
+                pread(fd, interp, seg->p_filesz, (off_t)seg->p_offset) !=
+                    (ssize_t)seg->p_filesz ||
+                interp[0] != '/' || memchr(interp, 0, seg->p_filesz) !=
+                    interp + seg->p_filesz - 1) {
+                errno = ENOEXEC;
+                goto done;
+            }
         }
         if (seg->p_type != PT_LOAD) {
             continue;
@@ -180,13 +220,18 @@ bool oah_map_elf(oah_image *img, const char *path)
     }
 #endif
     u64 span = high - low;
+    u64 heap_reserve = interp && *interp ? (64u << 20) : 0;
     u8 *map = mmap(eh.e_type == ET_EXEC ? (void *)(uintptr_t)low : NULL,
-                   span, PROT_NONE, flags, -1, 0);
+                   span + heap_reserve, PROT_NONE, flags, -1, 0);
     if (map == MAP_FAILED) {
         goto done;
     }
     img->load_mapping = map;
     img->load_mapping_size = span;
+    if (heap_reserve) {
+        img->heap_mapping = map + span;
+        img->heap_capacity = heap_reserve;
+    }
     if (eh.e_type == ET_EXEC && (u64)(uintptr_t)map != low) {
         goto done;
     }
@@ -243,6 +288,9 @@ bool oah_map_elf(oah_image *img, const char *path)
     img->brk = img->load_end;
     success = oah_guest_access(img, img->entry, 1, PROT_EXEC) != NULL;
     if (success) {
+        if (bias) {
+            *bias = (u64)(uintptr_t)map - low;
+        }
         close(img->fd);
         img->fd = -1;
     }
@@ -255,4 +303,45 @@ done:
         errno = error;
     }
     return success;
+}
+
+bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot)
+{
+    char interp_path[PATH_MAX] = {0};
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (!map_elf_fd(img, fd, sysroot ? interp_path : NULL, NULL)) {
+        return false;
+    }
+    img->sysroot = sysroot;
+    if (!*interp_path) {
+        return true;
+    }
+
+    oah_image interpreter;
+    fd = oah_sysroot_open(sysroot, interp_path, O_RDONLY | O_CLOEXEC, 0);
+    if (!map_elf_fd(&interpreter, fd, NULL, &img->interp_base)) {
+        int error = errno;
+        oah_unmap_elf(img);
+        errno = error ? error : ENOEXEC;
+        return false;
+    }
+    if (interpreter.nseg > OAH_MAX_LOAD_SEGS - img->nseg) {
+        oah_unmap_elf(&interpreter);
+        oah_unmap_elf(img);
+        errno = ENOMEM;
+        return false;
+    }
+    memcpy(img->segs + img->nseg, interpreter.segs,
+           interpreter.nseg * sizeof(interpreter.segs[0]));
+    img->nseg += interpreter.nseg;
+    img->load_segments = img->nseg;
+    img->interp_mapping = interpreter.load_mapping;
+    img->interp_mapping_size = interpreter.load_mapping_size;
+    img->interp_entry = interpreter.entry;
+    return true;
+}
+
+bool oah_map_elf(oah_image *img, const char *path)
+{
+    return oah_map_elf_sysroot(img, path, NULL);
 }

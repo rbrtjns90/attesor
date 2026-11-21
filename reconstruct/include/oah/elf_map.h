@@ -14,6 +14,7 @@ typedef struct {
     u64 size;    /* bytes, page-rounded */
     u8 *host;    /* host pointer; identity when MAP_FIXED at gva */
     u32 prot;    /* PROT_* */
+    bool file_mapping; /* guest MAP_PRIVATE reservation, replaceable by the loader */
 } oah_load_seg;
 
 typedef struct {
@@ -28,6 +29,11 @@ typedef struct {
     int fd;
     u8 *load_mapping;
     u64 load_mapping_size;
+    u8 *interp_mapping;
+    u64 interp_mapping_size;
+    u64 interp_entry;
+    u64 interp_base;
+    const char *sysroot;
     unsigned load_segments;
     u8 *heap_mapping;
     u64 heap_capacity;
@@ -37,6 +43,8 @@ typedef struct {
 /* Load a little-endian x86-64 static ELF and populate its guest mappings.
  * ET_EXEC keeps its linked address; ET_DYN is slid as a single span. */
 bool oah_map_elf(oah_image *img, const char *path);
+bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot);
+int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode);
 void oah_unmap_elf(oah_image *img);
 
 /* Return up to *len contiguous guest bytes and update *len to their count. */
