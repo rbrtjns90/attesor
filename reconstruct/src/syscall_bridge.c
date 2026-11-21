@@ -275,7 +275,7 @@ static u64 guest_mmap(oah_image *img, u64 addr, u64 len, u64 prot, u64 flags, u6
         return (u64)(s64)-EINVAL;
     }
     len = (len + page - 1) & ~(page - 1);
-    flags &= ~0x800ull; /* Linux MAP_DENYWRITE is ignored. */
+    flags &= ~(0x800ull | 0x20000ull); /* Linux ignores MAP_DENYWRITE and MAP_STACK. */
     if (flags == 0x02 || flags == 0x12) {
         if ((int)fd < 0) {
             return (u64)(s64)-EBADF;
@@ -382,6 +382,19 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     g->gpr[OAH_X86_R11] = g->rflags;
 
     switch (nr) {
+    case 13:  /* rt_sigaction */
+    case 14:  /* rt_sigprocmask */
+    case 15:  /* rt_sigreturn */
+    case 62:  /* kill */
+    case 127: /* rt_sigpending */
+    case 131: /* sigaltstack */
+    case 200: /* tkill */
+    case 234: /* tgkill */
+        return oah_guest_signal_syscall(g, img);
+    case 39:  /* getpid */
+    case 186: /* gettid, one guest thread */
+        g->gpr[OAH_X86_RAX] = getpid();
+        return OAH_SYS_CONTINUE;
     case OAH_X86_NR_EXIT:
     case OAH_X86_NR_EXIT_GROUP:
         return OAH_SYS_EXIT;

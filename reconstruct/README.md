@@ -60,7 +60,7 @@ reconstruct/
 
 On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. `--interpret` runs those fragments in the ARM interpreter instead. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
 
-The runner supports the tested single-process static, musl-linked, and Debian glibc-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, general signal handling, broader glibc workloads, and complete x86 floating-point and SIMD coverage remain future work. This runner is intended for trusted test executables.
+The runner supports the tested single-process static, musl-linked, and Debian glibc-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, asynchronous host signal delivery, broader glibc workloads, and complete x86 floating-point and SIMD coverage remain future work. This runner is intended for trusted test executables.
 
 ## Build and verify
 
@@ -201,7 +201,7 @@ make -C reconstruct test-linux-glibc DEBIAN_SYSROOT=/absolute/path/to/debian-roo
 
 The test needs QEMU user-mode and an x86-64 GNU compiler with glibc development headers and startup objects. It compares stock Debian `true`, `false`, `echo`, `cat`, `wc`, and `printf` with QEMU, including integer and floating-point formatting. It then builds a libc guest that exercises allocation, stdio, and a library loaded at runtime with `dlopen` and `dlsym`.
 
-CPUID exposes the x86-64 baseline startup profile so glibc can select its baseline routines. Individual instructions still require decoder support. The runtime still lacks guest signal delivery, thread creation, rseq, robust futex registration, and comprehensive x87 arithmetic and exception handling.
+CPUID exposes the x86-64 baseline startup profile so glibc can select its baseline routines. Individual instructions still require decoder support. The glibc suite also exercises ordinary signals sent within the guest process. The runner maintains guest dispositions, masks, and pending signals, and builds Linux x86-64 signal frames on the normal or alternate stack. Handler return restores guest registers and the saved mask. Sending signals to other processes, realtime queues, and job control are outside this slice. Thread creation, rseq, robust futex registration, and comprehensive x87 arithmetic and exception handling remain open.
 
 ## What we will not do
 

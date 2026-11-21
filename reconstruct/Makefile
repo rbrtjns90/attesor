@@ -22,6 +22,7 @@ SRC = \
     src/decode_insn.c \
     src/interp.c \
     src/syscall_bridge.c \
+    src/guest_signal.c \
     src/runtime_syscall.c \
     src/translate.c \
     src/arm_exec.c \

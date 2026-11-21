@@ -78,7 +78,7 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
     u8 ext = 0;
     if (opcode == 0x0f) {
         ext = take(d);
-        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xa4 && ext != 0xa5 && ext != 0xac && ext != 0xad && ext != 0xb0 && ext != 0xb1 && ext != 0xc0 && ext != 0xc1 && ext != 0xc7 && ext != 0xbc && ext != 0xbd &&
+        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xba && ext != 0xa4 && ext != 0xa5 && ext != 0xac && ext != 0xad && ext != 0xb0 && ext != 0xb1 && ext != 0xc0 && ext != 0xc1 && ext != 0xc7 && ext != 0xbc && ext != 0xbd &&
             (ext < 0x40 || ext > 0x4f) && (ext < 0x90 || ext > 0x9f)) {
             return false;
         }
@@ -150,11 +150,19 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
         out->scalar = OAH_SC_CMPXCHG8B;
         out->opsize = 8;
         out->rm_dest = true;
-    } else if (ext == 0xa3) {
-        if (out->memory) {
+    } else if (ext == 0xa3 || ext == 0xba) {
+        if (out->memory || (ext == 0xba && group < 4)) {
             return false;
         }
-        out->scalar = OAH_SC_BT;
+        static const oah_scalar_op bit_ops[] = {
+            OAH_SC_BT, OAH_SC_BTS, OAH_SC_BTR, OAH_SC_BTC
+        };
+        out->scalar = ext == 0xba ? bit_ops[group - 4] : OAH_SC_BT;
+        if (ext == 0xba) {
+            out->rm_dest = true;
+            out->immediate = true;
+            out->imm = take(d);
+        }
     } else if (ext == 0xbc || ext == 0xbd) {
         out->scalar = ext == 0xbc ? OAH_SC_BSF : OAH_SC_BSR;
     } else if (opcode == 0x84 || opcode == 0x85) {
@@ -341,7 +349,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     /* F3 0F 1E FA endbr64 — F3 already consumed as prefix. */
     if (op == 0x0f) {
         u8 ext = peek(&d);
-        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 ||
+        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 || ext == 0xba ||
             ext == 0xa4 || ext == 0xa5 || ext == 0xac || ext == 0xad || ext == 0xb0 || ext == 0xb1 ||
             ext == 0xc0 || ext == 0xc1 || ext == 0xc7 || ext == 0xbc || ext == 0xbd ||
             (ext >= 0x40 && ext <= 0x4f) || (ext >= 0x90 && ext <= 0x9f)) {

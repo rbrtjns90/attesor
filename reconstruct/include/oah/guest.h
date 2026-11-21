@@ -7,6 +7,15 @@
 extern "C" {
 #endif
 
+#define OAH_GUEST_SIGNAL_COUNT 64
+
+typedef struct {
+    u64 handler;
+    u64 flags;
+    u64 restorer;
+    u64 mask;
+} oah_guest_signal_action;
+
 /*
  * Guest x86_64 integer state. GPR order matches Linux user_regs_struct
  * (RAX..R15) recovered from FUN_800000040650.
@@ -23,6 +32,12 @@ typedef struct {
     u64 rflags;
     u64 fs_base;
     u64 gs_base;
+    oah_guest_signal_action signal_actions[OAH_GUEST_SIGNAL_COUNT];
+    u64 signal_mask;
+    u64 pending_signals;
+    u64 thread_signals;
+    u64 signal_stack_base;
+    u64 signal_stack_size;
 } oah_guest;
 
 /* Linux userspace default: bit 1 reserved-1, bit 9 IF. */

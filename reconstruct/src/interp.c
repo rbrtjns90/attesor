@@ -368,9 +368,12 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             write_gpr(g, OAH_X86_RAX, width, quotient);
             write_gpr(g, OAH_X86_RDX, width, remainder);
         }
-    } else if (op == OAH_SC_BT) {
-        unsigned bit = reg & (width * 8 - 1);
+    } else if (op == OAH_SC_BT || op == OAH_SC_BTS || op == OAH_SC_BTR || op == OAH_SC_BTC) {
+        unsigned bit = (in->immediate ? in->imm : reg) & (width * 8 - 1);
+        u64 bit_mask = 1ull << bit;
         g->rflags = (g->rflags & ~OAH_RFLAGS_CF) | ((rm >> bit) & 1);
+        result = op == OAH_SC_BTS ? rm | bit_mask
+               : op == OAH_SC_BTR ? rm & ~bit_mask : rm ^ bit_mask;
     } else if (op == OAH_SC_CMPXCHG8B) {
         u64 expected = ((u64)(u32)g->gpr[OAH_X86_RDX] << 32) | (u32)g->gpr[OAH_X86_RAX];
         if (expected == rm) {

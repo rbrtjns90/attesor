@@ -100,6 +100,12 @@ def main():
             built_root, guest = build_libc_guest(directory, root, shlex.split(args.cc))
             failures += compare(runner, args.qemu, built_root, guest, directory, [], b"", 0,
                                 b"attesor:10\n")
+            signals = directory / "glibc_signals"
+            source = Path(__file__).resolve().parents[1] / "tests" / "glibc_signals.c"
+            subprocess.run([*shlex.split(args.cc), "-O2", "-fPIE", "-pie",
+                            str(source), "-o", str(signals)], check=True, timeout=30)
+            failures += compare(runner, args.qemu, built_root, signals, directory, [], b"", 0,
+                                b"signals: ok\n")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     return bool(failures)
