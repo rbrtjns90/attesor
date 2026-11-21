@@ -6,7 +6,11 @@
 #include <string.h>
 
 static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
-                                  int native)
+                                  int native
+#if defined(__APPLE__) && defined(__aarch64__)
+                                  , oah_arm_native_buffer *arena
+#endif
+                                  )
 {
     oah_interp_result r, one;
     oah_arm_state st;
@@ -45,7 +49,11 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
             continue;
         }
         if (native) {
+#if defined(__APPLE__) && defined(__aarch64__)
+            one = oah_arm_exec_native_buffered(arena, &st, buf.data, buf.size);
+#else
             one = oah_arm_exec_native(&st, buf.data, buf.size);
+#endif
         } else {
             one = oah_arm_exec(&st, buf.data, buf.size, img, budget - r.insns);
         }
@@ -74,12 +82,21 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
 
 oah_interp_result oah_jit_run(oah_guest *g, oah_image *img, u64 max_insns)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return jit_loop(g, img, max_insns, 0, NULL);
+#else
     return jit_loop(g, img, max_insns, 0);
+#endif
 }
 
 oah_interp_result oah_jit_run_native(oah_guest *g, oah_image *img, u64 max_insns)
 {
-#if defined(__aarch64__)
+#if defined(__APPLE__) && defined(__aarch64__)
+    oah_arm_native_buffer arena = {0};
+    oah_interp_result result = jit_loop(g, img, max_insns, 1, &arena);
+    oah_arm_native_buffer_destroy(&arena);
+    return result;
+#elif defined(__aarch64__)
     return jit_loop(g, img, max_insns, 1);
 #else
     return jit_loop(g, img, max_insns, 0);

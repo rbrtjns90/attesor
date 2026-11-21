@@ -78,7 +78,7 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
     u8 ext = 0;
     if (opcode == 0x0f) {
         ext = take(d);
-        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xba && ext != 0xa4 && ext != 0xa5 && ext != 0xac && ext != 0xad && ext != 0xb0 && ext != 0xb1 && ext != 0xc0 && ext != 0xc1 && ext != 0xc7 && ext != 0xbc && ext != 0xbd &&
+        if (ext != 0xb6 && ext != 0xb7 && ext != 0xbe && ext != 0xbf && ext != 0xaf && ext != 0xa3 && ext != 0xab && ext != 0xb3 && ext != 0xbb && ext != 0xba && ext != 0xa4 && ext != 0xa5 && ext != 0xac && ext != 0xad && ext != 0xb0 && ext != 0xb1 && ext != 0xc0 && ext != 0xc1 && ext != 0xc7 && ext != 0xbc && ext != 0xbd &&
             (ext < 0x40 || ext > 0x4f) && (ext < 0x90 || ext > 0x9f)) {
             return false;
         }
@@ -119,11 +119,12 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
             out->imm = (u64)(s64)(s32)oah_decoder_read_int(d, 2);
         }
     } else if (opcode == 0xf6 || opcode == 0xf7) {
-        if (group != 0 && group != 2 && group != 3 && group != 4 && group != 6) {
+        if (group != 0 && group != 2 && group != 3 && group != 4 && group != 5 && group != 6 && group != 7) {
             return false;
         }
         out->scalar = group == 0 ? OAH_SC_TEST : group == 2 ? OAH_SC_NOT
-                    : group == 3 ? OAH_SC_NEG : group == 4 ? OAH_SC_MUL : OAH_SC_DIV;
+                    : group == 3 ? OAH_SC_NEG : group == 4 ? OAH_SC_MUL
+                    : group == 5 ? OAH_SC_IMUL_WIDE : group == 6 ? OAH_SC_DIV : OAH_SC_IDIV;
         out->rm_dest = true;
         out->opsize = opcode == 0xf6 ? 1 : width;
         if (group == 0) {
@@ -150,16 +151,16 @@ static bool decode_scalar(oah_decoder *d, oah_insn *out, u8 opcode, u8 rex,
         out->scalar = OAH_SC_CMPXCHG8B;
         out->opsize = 8;
         out->rm_dest = true;
-    } else if (ext == 0xa3 || ext == 0xba) {
+    } else if (ext == 0xa3 || ext == 0xab || ext == 0xb3 || ext == 0xbb || ext == 0xba) {
         if (out->memory || (ext == 0xba && group < 4)) {
             return false;
         }
         static const oah_scalar_op bit_ops[] = {
             OAH_SC_BT, OAH_SC_BTS, OAH_SC_BTR, OAH_SC_BTC
         };
-        out->scalar = ext == 0xba ? bit_ops[group - 4] : OAH_SC_BT;
+        out->scalar = ext == 0xba ? bit_ops[group - 4] : bit_ops[(ext >> 3) & 3];
+        out->rm_dest = true;
         if (ext == 0xba) {
-            out->rm_dest = true;
             out->immediate = true;
             out->imm = take(d);
         }
@@ -301,7 +302,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         out->rm_dest = op == 0xdf; /* F(U)COMIP pops ST(0). */
         goto done;
     }
-    if (op == 0xd9 || op == 0xdb || op == 0xdd) {
+    if (op >= 0xd8 && op <= 0xdf) {
         u8 modrm = take(&d);
         unsigned group = (modrm >> 3) & 7;
         decode_rm(&d, out, modrm, rex, address32, segment);
@@ -311,16 +312,25 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             out->opsize = 2;
             goto done;
         }
+        bool conditional = !out->memory && modrm <= 0xdf && (op == 0xda || op == 0xdb);
+        bool arithmetic = (group < 2 || group >= 4) &&
+                          (out->memory ? (op == 0xd8 || op == 0xdc) :
+                           (op == 0xd8 || op == 0xdc || op == 0xde));
+        bool convert = out->memory && (((op == 0xd9 || op == 0xdd || op == 0xdb) &&
+                        (group == 0 || group == 2 || group == 3)) ||
+                        (op == 0xdf && (group == 0 || group == 2 || group == 3 ||
+                                        group == 5 || group == 7)));
         bool supported = out->memory ? op == 0xdb && (group == 5 || group == 7)
                        : op == 0xd9 ? modrm <= 0xcf || modrm == 0xe0 || modrm == 0xe1 ||
                                       modrm == 0xe8 || modrm == 0xee
                        : op == 0xdd && modrm >= 0xd8 && modrm <= 0xdf;
-        if (!supported) {
+        if (!supported && !arithmetic && !convert && !conditional) {
             return false;
         }
         out->op = OAH_OP_X87_MOVE;
         out->x87_modrm = modrm;
-        out->rm_dest = out->memory && group == 7;
+        out->x87_opcode = op;
+        out->rm_dest = out->memory && (group == 7 || (convert && (group == 2 || group == 3)));
         goto done;
     }
     /* Keep the original register-only encodings available to the emitter. */
@@ -349,7 +359,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     /* F3 0F 1E FA endbr64 — F3 already consumed as prefix. */
     if (op == 0x0f) {
         u8 ext = peek(&d);
-        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 || ext == 0xba ||
+        if (ext == 0xb6 || ext == 0xb7 || ext == 0xbe || ext == 0xbf || ext == 0xaf || ext == 0xa3 || ext == 0xab || ext == 0xb3 || ext == 0xbb || ext == 0xba ||
             ext == 0xa4 || ext == 0xa5 || ext == 0xac || ext == 0xad || ext == 0xb0 || ext == 0xb1 ||
             ext == 0xc0 || ext == 0xc1 || ext == 0xc7 || ext == 0xbc || ext == 0xbd ||
             (ext >= 0x40 && ext <= 0x4f) || (ext >= 0x90 && ext <= 0x9f)) {
@@ -359,21 +369,42 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             }
             goto done;
         }
+        if (ext >= 0xc8 && ext <= 0xcf && (!operand_override || opsize == 8)) {
+            take(&d);
+            out->op = OAH_OP_SCALAR;
+            out->scalar = OAH_SC_BSWAP;
+            out->rm_dest = true;
+            out->dst = (ext & 7) | ((rex & 1) << 3);
+            out->opsize = opsize;
+            goto done;
+        }
+        bool shuffle_words = (repeat || repeat_not_equal) && !operand_override && ext == 0x70;
+        bool scalar_move = !operand_override && (repeat || repeat_not_equal) &&
+                           (ext == 0x10 || ext == 0x11);
+        bool scalar_fp = !operand_override && (repeat || repeat_not_equal) &&
+                         (ext == 0x2a || ext == 0x2c || ext == 0x58 || ext == 0x59 ||
+                          ext == 0x5a || ext == 0x5c || ext == 0x5e || ext == 0x5f);
+        bool compare_fp = !repeat && !repeat_not_equal && (ext == 0x2e || ext == 0x2f);
         bool vector_move = ((!operand_override && !repeat &&
                             (ext == 0x10 || ext == 0x11 || (ext >= 0x12 && ext <= 0x17 && ext != 0x14 && ext != 0x15) || ext == 0x28 || ext == 0x29))) ||
                            ((operand_override || repeat) && (ext == 0x6f || ext == 0x7f));
         bool vector_66 = operand_override && (ext == 0x6e || ext == 0x7e || ext == 0x6c ||
                          ext == 0x12 || ext == 0x13 || ext == 0x16 || ext == 0x17 ||
                          (ext >= 0x60 && ext <= 0x62) || (ext >= 0x68 && ext <= 0x6a) ||
-                         ext == 0xf8 || ext == 0xda || ext == 0xc6 || ext == 0x70 || ext == 0x73 || ext == 0x6d || ext == 0xef || ext == 0x74 || ext == 0x75 || ext == 0x76 ||
-                         ext == 0xd7 || ext == 0xdb || ext == 0xeb || ext == 0xd6);
-        if (!repeat_not_equal && (vector_move || vector_66 ||
-            (!operand_override && !repeat && ext == 0x57) || (repeat && ext == 0x7e))) {
+                         (ext >= 0x64 && ext <= 0x67) || (ext >= 0x74 && ext <= 0x76) ||
+                         ext == 0x54 || ext == 0x28 || ext == 0x29 || ext == 0x6d || ext == 0x70 || ext == 0x73 ||
+                         ext == 0xc4 || ext == 0xc6 || ext == 0xe7 || ext == 0xd4 || ext == 0xd6 || ext == 0xd7 || ext == 0xda ||
+                         ext == 0xde || ext == 0xfc || ext == 0xdb || ext == 0xdf || ext == 0xeb || ext == 0xef || ext == 0xf8 || ext == 0xfe);
+        if (shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
+            (!operand_override && !repeat && ext == 0x57) || (repeat && ext == 0x7e)))) {
             take(&d);
             u8 vector_modrm = take(&d);
             decode_rm(&d, out, vector_modrm, rex, address32, segment);
             if (!out->memory && (ext == 0x13 || ext == 0x17 ||
                 (operand_override && (ext == 0x12 || ext == 0x16)))) {
+                return false;
+            }
+            if (ext == 0xe7 && !out->memory) {
                 return false;
             }
             out->op = OAH_OP_VECTOR;
@@ -385,11 +416,22 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                 }
                 out->cc = group;
             }
-            if (ext == 0xc6 || ext == 0x70 || ext == 0x73) {
+            if (ext == 0xc4 || ext == 0xc6 || ext == 0x70 || ext == 0x73) {
                 out->imm = take(&d);
             }
             out->opsize = (rex & 8) ? 8 : 4;
-            out->aligned = ext == 0x28 || ext == 0x29 ||
+            if (shuffle_words) {
+                out->vector_opcode = repeat ? OAH_VECTOR_SHUFFLE_HIGH_WORDS : OAH_VECTOR_SHUFFLE_LOW_WORDS;
+            }
+            if (scalar_move) {
+                out->vector_opcode = ext == 0x10 ? OAH_VECTOR_SCALAR_LOAD : OAH_VECTOR_SCALAR_STORE;
+                out->opsize = repeat ? 4 : 8;
+            }
+            if (scalar_fp || compare_fp) {
+                out->opsize = repeat_not_equal || operand_override ? 8 : 4;
+                out->src_width = rex & 8 ? 8 : 4;
+            }
+            out->aligned = ext == 0xe7 || ext == 0x28 || ext == 0x29 ||
                            (operand_override && (ext == 0x6f || ext == 0x7f));
             goto done;
         }
@@ -403,6 +445,15 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             out->disp = (s32)oah_decoder_read_int(&d, 2);
             goto done;
         }
+        if (op2 == 0x18) { /* PREFETCH hints have no architectural effect. */
+            u8 modrm = take(&d);
+            if (modrm >= 0xc0 || (modrm & 0x38) > 0x18) {
+                return false;
+            }
+            decode_rm(&d, out, modrm, rex, address32, segment);
+            out->op = OAH_OP_NOP;
+            goto done;
+        }
         if (op2 == 0x1f) {
             u8 nop_modrm = take(&d);
             if (nop_modrm & 0x38) {
@@ -410,6 +461,11 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             }
             decode_rm(&d, out, nop_modrm, rex, address32, segment);
             out->op = OAH_OP_NOP;
+            goto done;
+        }
+        if (op2 == 0xae && peek(&d) == 0xf8 && !operand_override && !repeat && !repeat_not_equal) {
+            take(&d);
+            out->op = OAH_OP_STORE_FENCE;
             goto done;
         }
         if (op2 == 0xae && !operand_override && !repeat && !repeat_not_equal) {
@@ -494,6 +550,11 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     if (op == 0xe8) {
         out->op = OAH_OP_CALL_REL;
         out->disp = (s32)oah_decoder_read_int(&d, 2);
+        goto done;
+    }
+    if (op == 0x99) {
+        out->op = OAH_OP_SIGN_HIGH;
+        out->opsize = operand_override && opsize != 8 ? 2 : opsize;
         goto done;
     }
     if (op == 0x98) {

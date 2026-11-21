@@ -149,6 +149,8 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
         case OAH_OP_FXSTATE:
         case OAH_OP_X87_MOVE:
         case OAH_OP_X87_COMPARE:
+        case OAH_OP_STORE_FENCE:
+        case OAH_OP_SIGN_HIGH:
             if (!(flags & OAH_XLAT_DISPATCH_STATE)) {
                 return false;
             }

@@ -3,7 +3,15 @@
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -O2 -g
-CFLAGS  += -Iinclude -D_GNU_SOURCE
+CFLAGS  += -Iinclude
+HOST_OS := $(shell uname -s)
+ifeq ($(HOST_OS),Darwin)
+CFLAGS  += -D_DARWIN_C_SOURCE
+HOST_LDFLAGS =
+else
+CFLAGS  += -D_GNU_SOURCE
+HOST_LDFLAGS = -pie
+endif
 
 SRC = \
     src/register.c \
@@ -21,15 +29,23 @@ SRC = \
     src/elf_map.c \
     src/decode_insn.c \
     src/interp.c \
-    src/syscall_bridge.c \
-    src/guest_signal.c \
+    src/guest_signal.c
+
+EXEC_SRC = \
     src/runtime_syscall.c \
     src/translate.c \
     src/arm_exec.c \
     src/arm_native.c \
     src/jit.c
 
-OBJ = $(SRC:.c=.o)
+LINUX_SRC = $(SRC) $(EXEC_SRC) src/syscall_bridge.c
+
+ifeq ($(HOST_OS),Darwin)
+HOST_SRC = $(SRC) $(EXEC_SRC) src/syscall_darwin.c
+else
+HOST_SRC = $(LINUX_SRC)
+endif
+OBJ = $(HOST_SRC:.c=.o)
 
 TESTS = \
     tests/test_register \
@@ -52,28 +68,31 @@ QEMU_AARCH64   ?= qemu-aarch64-static
 # Keep oah's load address far from a typical ET_EXEC guest at 0x400000.
 AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 
-.PHONY: all test test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
+.PHONY: all test test-macos test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) -fPIE -c -o $@ $<
+	$(CC) $(CFLAGS) -fPIE -MMD -MP -c -o $@ $<
 
 tests/%: tests/%.c $(OBJ)
-	$(CC) $(CFLAGS) -fPIE -pie -o $@ $< $(OBJ)
+	$(CC) $(CFLAGS) -fPIE $(HOST_LDFLAGS) -o $@ $< $(OBJ) -lm
 
 oah: src/oah_main.o $(OBJ)
-	$(CC) $(CFLAGS) -fPIE -pie -o $@ src/oah_main.o $(OBJ)
+	$(CC) $(CFLAGS) -fPIE $(HOST_LDFLAGS) -o $@ src/oah_main.o $(OBJ) -lm
 
-oah-aarch64: src/oah_main.c $(SRC)
-	$(CC_AARCH64) $(CFLAGS) $(AARCH64_LDFLAGS) -o $@ src/oah_main.c $(SRC)
+oah-aarch64: src/oah_main.c $(LINUX_SRC)
+	$(CC_AARCH64) $(CFLAGS) -D_GNU_SOURCE $(AARCH64_LDFLAGS) -o $@ src/oah_main.c $(LINUX_SRC) -lm
 
-tests/test_arm_native-aarch64: tests/test_arm_native.c $(SRC)
-	$(CC_AARCH64) $(CFLAGS) $(AARCH64_LDFLAGS) -o $@ tests/test_arm_native.c $(SRC)
+tests/test_arm_native-aarch64: tests/test_arm_native.c $(LINUX_SRC)
+	$(CC_AARCH64) $(CFLAGS) -D_GNU_SOURCE $(AARCH64_LDFLAGS) -o $@ tests/test_arm_native.c $(LINUX_SRC)
 
 tests/hello.x86_64: tools/mk_hello_elf.py
 	python3 tools/mk_hello_elf.py $@
 
+ifeq ($(HOST_OS),Darwin)
+test: test-macos
+else
 test: $(TESTS) oah tests/hello.x86_64
 	@fail=0; \
 	for t in $(TESTS); do \
@@ -84,6 +103,16 @@ test: $(TESTS) oah tests/hello.x86_64
 	./oah tests/hello.x86_64 > tests/hello.got || fail=1; \
 	printf 'hello\n' | cmp -s - tests/hello.got || { echo "  FAIL hello output"; fail=1; }; \
 	exit $$fail
+
+endif
+
+test-macos: oah tests/hello.x86_64 tests/test_elf_map
+	@test "$(HOST_OS)" = Darwin || { echo "test-macos requires macOS"; exit 1; }
+	./tests/test_elf_map
+	python3 tools/test_macos.py --runner ./oah --hello tests/hello.x86_64 \
+	    $(if $(BUSYBOX_STATIC),--busybox "$(BUSYBOX_STATIC)") \
+	    $(if $(ALPINE_SYSROOT),--alpine-sysroot "$(ALPINE_SYSROOT)") \
+	    $(if $(DEBIAN_SYSROOT),--debian-sysroot "$(DEBIAN_SYSROOT)")
 
 tests/branch_guest.x86_64: tests/branch_guest.c
 	$(CC_X86_64) -O2 -nostdlib -static -no-pie -fno-stack-protector -fno-pie \
@@ -131,8 +160,10 @@ inventory-binary:
 	python3 tools/extract_from_binary.py bin/rosetta -o inventory/from_binary \
 	    --inc src/host_syscall_table.inc
 
+-include $(OBJ:.o=.d) src/oah_main.d
+
 clean:
-	rm -f $(OBJ) src/oah_main.o $(TESTS) oah oah-aarch64 \
+	rm -f $(OBJ) $(OBJ:.o=.d) src/oah_main.o src/oah_main.d $(TESTS) oah oah-aarch64 \
 	    tests/test_arm_native-aarch64 tests/hello.x86_64 tests/hello.got \
 	    tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64 tests/branch_guest.got \
 	    tests/hello.qemu.got

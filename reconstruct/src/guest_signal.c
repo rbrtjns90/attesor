@@ -19,7 +19,9 @@ enum {
     X86_SA_NOCLDSTOP = 1,
     X86_SA_NOCLDWAIT = 2,
     X86_SS_ONSTACK = 1,
-    X86_SS_DISABLE = 2
+    X86_SS_DISABLE = 2,
+    X86_ENOSYS = 38,
+    X86_EOPNOTSUPP = 95
 };
 
 typedef struct {
@@ -372,13 +374,13 @@ static s64 queue_self_signal(oah_guest *g, u64 number, int pid, int tid, bool th
         return 0;
     }
     if (number >= 32) {
-        return -ENOTSUP; /* Realtime signals require a queue rather than a bitset. */
+        return -X86_EOPNOTSUPP; /* Realtime signals require a queue rather than a bitset. */
     }
     unsigned signum = (unsigned)number;
     u64 bit = signal_bit(signum);
     u64 handler = g->signal_actions[signum - 1].handler;
     if (!handler && default_stop(signum)) {
-        return -ENOTSUP;
+        return -X86_EOPNOTSUPP;
     }
     if (handler == 1 || (!handler && default_ignore(signum))) {
         return 0;
@@ -425,7 +427,7 @@ oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img)
         result = queue_self_signal(g, a2, (int)a0, (int)a1, true);
         break;
     default:
-        result = -ENOSYS;
+        result = -X86_ENOSYS;
         break;
     }
     g->gpr[OAH_X86_RAX] = (u64)result;

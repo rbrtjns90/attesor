@@ -5,6 +5,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 
 #ifdef __aarch64__
 /*
@@ -17,12 +21,22 @@
 __asm__(
     ".text\n"
     ".align 2\n"
+#if defined(__APPLE__)
+    ".global _oah_arm_native_enter\n"
+    "_oah_arm_native_enter:\n"
+#else
     ".type oah_arm_native_enter, %function\n"
     ".global oah_arm_native_enter\n"
     "oah_arm_native_enter:\n"
+#endif
     "    sub sp, sp, #128\n"
     "    stp x29, x30, [sp]\n"
+#if defined(__APPLE__)
+    "    mov x29, sp\n"
+    "    str x19, [sp, #24]\n"
+#else
     "    stp x18, x19, [sp, #16]\n"
+#endif
     "    stp x20, x21, [sp, #32]\n"
     "    stp x22, x23, [sp, #48]\n"
     "    stp x24, x25, [sp, #64]\n"
@@ -50,7 +64,11 @@ __asm__(
     "    stp x12, x13, [x16, #96]\n"
     "    stp x14, x15, [x16, #112]\n"
     "    ldp x29, x30, [sp]\n"
+#if defined(__APPLE__)
+    "    ldr x19, [sp, #24]\n"
+#else
     "    ldp x18, x19, [sp, #16]\n"
+#endif
     "    ldp x20, x21, [sp, #32]\n"
     "    ldp x22, x23, [sp, #48]\n"
     "    ldp x24, x25, [sp, #64]\n"
@@ -58,10 +76,54 @@ __asm__(
     "    ldp x28, xzr, [sp, #96]\n"
     "    add sp, sp, #128\n"
     "    ret\n"
+#if !defined(__APPLE__)
     ".size oah_arm_native_enter, .-oah_arm_native_enter\n"
+#endif
 );
 
 void oah_arm_native_enter(u64 *x, const void *code);
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
+void oah_arm_native_buffer_destroy(oah_arm_native_buffer *arena)
+{
+    if (arena->code) {
+        munmap(arena->code, arena->size);
+        *arena = (oah_arm_native_buffer){0};
+    }
+}
+
+oah_interp_result oah_arm_exec_native_buffered(oah_arm_native_buffer *arena,
+                                               oah_arm_state *st, const u8 *code,
+                                               u64 code_size)
+{
+    oah_interp_result r = {.status = OAH_INTERP_FAULT};
+    if (!st || !code || !code_size || (code_size & 3u)) {
+        return r;
+    }
+    if (code_size > arena->size) {
+        size_t page = (size_t)getpagesize();
+        if (code_size > SIZE_MAX - (page - 1)) {
+            return r;
+        }
+        size_t size = ((size_t)code_size + page - 1) & ~(page - 1);
+        void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+        if (mapping == MAP_FAILED) {
+            return r;
+        }
+        oah_arm_native_buffer_destroy(arena);
+        *arena = (oah_arm_native_buffer){mapping, size};
+    }
+    pthread_jit_write_protect_np(0);
+    memcpy(arena->code, code, (size_t)code_size);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(arena->code, (size_t)code_size);
+    oah_arm_native_enter(st->x, arena->code);
+    r.status = OAH_INTERP_OK;
+    r.insns = code_size / 4;
+    return r;
+}
 #endif
 
 oah_interp_result oah_arm_exec_native(oah_arm_state *st, const u8 *code,
@@ -73,10 +135,15 @@ oah_interp_result oah_arm_exec_native(oah_arm_state *st, const u8 *code,
     r.exit_code = 0;
     r.insns = 0;
 
-#ifndef __aarch64__
+#if !defined(__aarch64__)
     (void)st;
     (void)code;
     (void)code_size;
+    return r;
+#elif defined(__APPLE__)
+    oah_arm_native_buffer arena = {0};
+    r = oah_arm_exec_native_buffered(&arena, st, code, code_size);
+    oah_arm_native_buffer_destroy(&arena);
     return r;
 #else
     size_t page;
@@ -93,7 +160,7 @@ oah_interp_result oah_arm_exec_native(oah_arm_state *st, const u8 *code,
         page = 4096;
     }
     sz = ((size_t)code_size + page - 1) & ~(page - 1);
-    p = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         r.status = OAH_INTERP_FAULT;
         return r;

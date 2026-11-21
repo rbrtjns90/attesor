@@ -58,13 +58,36 @@ reconstruct/
 
 ### Execution paths
 
-On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. `--interpret` runs those fragments in the ARM interpreter instead. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
+On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. On Linux, `--interpret` runs those fragments in the ARM interpreter. On macOS, `--interpret` executes x86-64 instructions through the checked guest interpreter. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
 
 The runner supports the tested single-process static, musl-linked, and Debian glibc-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, asynchronous host signal delivery, broader glibc workloads, and complete x86 floating-point and SIMD coverage remain future work. This runner is intended for trusted test executables.
 
 ## Build and verify
 
 Needs: `gcc`, `make`, `python3`. Optional original ELF is **not** required.
+
+### Native macOS
+
+On an Apple Silicon Mac with the Xcode command-line tools, run these from the repository root:
+
+```sh
+make
+make test-macos
+./reconstruct/oah /path/to/busybox.static echo 'hello from Linux'
+./reconstruct/oah --sysroot /path/to/debian-amd64 \
+    /path/to/debian-amd64/usr/bin/printf 'hello from glibc: %.2f\n' 1.25
+```
+
+The executable is a native ARM64 Mach-O. The Darwin backend translates the supported Linux syscall arguments and return values. It checks 4 KiB guest permissions separately from the host's larger pages. The default mode runs translated fragments through the macOS JIT backend. Add `--interpret` to run the guest entirely in the interpreter.
+
+The optional native test matrix uses the same pinned fixtures described below:
+
+```sh
+make test-macos BUSYBOX_STATIC=/path/to/busybox.static \
+    ALPINE_SYSROOT=/path/to/alpine-amd64 DEBIAN_SYSROOT=/path/to/debian-amd64
+```
+
+This command executes the fixtures directly on macOS. Dynamic guests require matching x86-64 libraries. Use a trusted sysroot and trusted executables. The Darwin implementation covers the tested syscall subset, including private library mappings. Guest threads, general host signal delivery, and broad Linux application compatibility remain open.
 
 ### 1. Interpreter path (any x86_64 or aarch64 Linux host)
 

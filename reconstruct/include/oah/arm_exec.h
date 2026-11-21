@@ -38,6 +38,18 @@ oah_interp_result oah_arm_exec(oah_arm_state *st, const u8 *code, u64 code_size,
 oah_interp_result oah_arm_exec_native(oah_arm_state *st, const u8 *code,
                                       u64 code_size);
 
+#if defined(__APPLE__) && defined(__aarch64__)
+typedef struct {
+    void *code;
+    size_t size;
+} oah_arm_native_buffer;
+
+oah_interp_result oah_arm_exec_native_buffered(oah_arm_native_buffer *arena,
+                                               oah_arm_state *st, const u8 *code,
+                                               u64 code_size);
+void oah_arm_native_buffer_destroy(oah_arm_native_buffer *arena);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -2,10 +2,12 @@
 
 #include "oah/syscall_bridge.h"
 
-#include <errno.h>
 #include <string.h>
+#if defined(__linux__)
+#include <errno.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#endif
 
 static u32 rd(u32 w) { return w & 31u; }
 static u32 rn(u32 w) { return (w >> 5) & 31u; }
@@ -16,6 +18,7 @@ static u64 *xr(oah_arm_state *st, u32 n)
     return &st->x[n];
 }
 
+#if defined(__linux__)
 static s64 set_err(long rc)
 {
     if (rc < 0) {
@@ -23,6 +26,7 @@ static s64 set_err(long rc)
     }
     return rc;
 }
+#endif
 
 oah_interp_result oah_arm_exec(oah_arm_state *st, const u8 *code, u64 code_size,
                                oah_image *img, u64 max_insns)
@@ -64,6 +68,7 @@ oah_interp_result oah_arm_exec(oah_arm_state *st, const u8 *code, u64 code_size,
             continue;
         }
         if (w == 0xd4000001u) { /* SVC #0 */
+#if defined(__linux__)
             u32 nr = (u32)st->x[8];
             u64 a0 = st->x[0], a1 = st->x[1], a2 = st->x[2];
             u64 a3 = st->x[3], a4 = st->x[4], a5 = st->x[5];
@@ -106,6 +111,10 @@ oah_interp_result oah_arm_exec(oah_arm_state *st, const u8 *code, u64 code_size,
                          (long)a3, (long)a4, (long)a5);
             st->x[0] = (u64)set_err(rc);
             continue;
+#else
+            r.status = OAH_INTERP_DECODE;
+            return r;
+#endif
         }
 
         /* MOVZ 64/32 */

@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 #define OAH_MAX_LOAD_SEGS 128
+#define OAH_X86_PAGE_SIZE 4096u
 
 typedef struct {
     u64 gva;     /* guest virtual address of mapping */
@@ -15,6 +16,10 @@ typedef struct {
     u8 *host;    /* host pointer; identity when MAP_FIXED at gva */
     u32 prot;    /* PROT_* */
     bool file_mapping; /* guest MAP_PRIVATE reservation, replaceable by the loader */
+#if defined(__APPLE__)
+    u8 *allocation; /* One host reservation can back several 4 KiB guest ranges. */
+    u64 allocation_size;
+#endif
 } oah_load_seg;
 
 typedef struct {
@@ -29,11 +34,16 @@ typedef struct {
     int fd;
     u8 *load_mapping;
     u64 load_mapping_size;
+    u64 load_gva;
     u8 *interp_mapping;
     u64 interp_mapping_size;
     u64 interp_entry;
     u64 interp_base;
     const char *sysroot;
+#if defined(__APPLE__)
+    const char *launcher;
+    bool interpret;
+#endif
     unsigned load_segments;
     u8 *heap_mapping;
     u64 heap_capacity;
