@@ -46,6 +46,10 @@ bool oah_set_nzcv(u32 *cpsr, u32 nzcv);
  */
 u32 oah_nzcv_from_rflags(u64 rflags);
 
+/* Update arithmetic status flags for 1-, 2-, 4- or 8-byte operands. */
+u64 oah_logic_rflags(u64 rflags, u64 result, u8 width);
+u64 oah_cmp_rflags(u64 rflags, u64 lhs, u64 rhs, u8 width);
+
 /*
  * derived: FUN_800000040650 param_3[0x11]
  *   DF bit10 → bit1, ~PF bit2 → bit0, RF bit16 → bit2,

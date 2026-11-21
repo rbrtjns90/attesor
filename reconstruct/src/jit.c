@@ -11,7 +11,7 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
     oah_interp_result r, one;
     oah_arm_state st;
     u64 budget = max_insns ? max_insns : OAH_INTERP_MAX_INSNS;
-    u32 flags = native ? OAH_XLAT_HOST_SVC : 0;
+    u32 flags = OAH_XLAT_DISPATCH_STATE;
 
     r.status = OAH_INTERP_OK;
     r.exit_code = 0;
@@ -31,6 +31,18 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
             oah_asm_buf_destroy(&buf);
             r.status = OAH_INTERP_DECODE;
             return r;
+        }
+        if (buf.size == 0) {
+            /* Execute one instruction that needs dispatcher-managed guest state. */
+            oah_asm_buf_destroy(&buf);
+            one = oah_interp_run(g, img, 1);
+            r.insns += one.insns;
+            if (one.status != OAH_INTERP_LIMIT) {
+                r.status = one.status;
+                r.exit_code = one.exit_code;
+                return r;
+            }
+            continue;
         }
         if (native) {
             one = oah_arm_exec_native(&st, buf.data, buf.size);

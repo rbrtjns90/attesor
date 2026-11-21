@@ -18,10 +18,38 @@ typedef enum {
     OAH_OP_MOV_RR,      /* rST = rSRC */
     OAH_OP_LEA_RIP,     /* rST = rip_after + disp32 */
     OAH_OP_PUSH,
+    OAH_OP_PUSH_IMM,
     OAH_OP_POP,
     OAH_OP_JMP_REL,
-    OAH_OP_CALL_REL
+    OAH_OP_CALL_REL,
+    OAH_OP_CMP_RR,
+    OAH_OP_CMP_IMM,
+    OAH_OP_TEST_RR,
+    OAH_OP_JCC_REL,
+    OAH_OP_SCALAR,
+    OAH_OP_STRING,
+    OAH_OP_VECTOR
 } oah_op;
+
+typedef enum {
+    OAH_SC_MOV, OAH_SC_LEA, OAH_SC_MOVSX, OAH_SC_MOVZX,
+    OAH_SC_ADD, OAH_SC_OR, OAH_SC_ADC, OAH_SC_SBB, OAH_SC_AND,
+    OAH_SC_SUB, OAH_SC_XOR, OAH_SC_CMP, OAH_SC_TEST,
+    OAH_SC_JMP, OAH_SC_CALL, OAH_SC_CMOV, OAH_SC_SETCC,
+    OAH_SC_SHL, OAH_SC_SHR, OAH_SC_SAR, OAH_SC_IMUL, OAH_SC_NEG, OAH_SC_NOT, OAH_SC_BSF, OAH_SC_BSR, OAH_SC_INC, OAH_SC_DEC, OAH_SC_XCHG, OAH_SC_DIV, OAH_SC_BT, OAH_SC_MUL
+} oah_scalar_op;
+
+typedef struct {
+    u8 base;
+    u8 index;
+    u8 scale;
+    u8 segment;
+    bool rip_relative;
+    bool address32;
+    s32 disp;
+} oah_address;
+
+#define OAH_NO_GPR 16
 
 typedef struct {
     oah_op op;
@@ -29,8 +57,20 @@ typedef struct {
     u8  opsize; /* 1, 2, 4, or 8 */
     u8  dst;    /* gpr 0..15 */
     u8  src;
+    u8  cc;     /* x86 condition for Jcc */
     u64 imm;
     s32 disp;
+    oah_scalar_op scalar;
+    oah_address address;
+    bool memory;
+    bool rm_dest;
+    bool immediate;
+    bool rex_present;
+    u8 src_width;
+    bool repeat;
+    bool string_move;
+    u8 vector_opcode;
+    bool aligned;
 } oah_insn;
 
 /*

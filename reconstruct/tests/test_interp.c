@@ -16,7 +16,7 @@ static void image_identity(oah_image *img, u8 *buf, size_t n)
     img->segs[0].gva = (u64)(uintptr_t)buf;
     img->segs[0].size = n;
     img->segs[0].host = buf;
-    img->segs[0].prot = 3;
+    img->segs[0].prot = 7;
     img->entry = (u64)(uintptr_t)buf;
     img->load_end = img->entry + n;
     img->brk = img->load_end;

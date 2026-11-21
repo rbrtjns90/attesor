@@ -34,3 +34,43 @@ void oah_host_flags_from_rflags(oah_host_flags *out, u64 rflags)
     out->aux_flags = oah_pack_aux_flags(rflags);
     out->trap_flag = (u8)((rflags >> 8) & 1);
 }
+
+/* width is the operand size in bytes (1, 2, 4, or 8). */
+u64 oah_logic_rflags(u64 rflags, u64 result, u8 width)
+{
+    u64 sign = 1ull << (width * 8 - 1);
+    result &= sign | (sign - 1);
+    /* AF is architecturally undefined after a logical operation. */
+    rflags &= ~(OAH_RFLAGS_CF | OAH_RFLAGS_OF | OAH_RFLAGS_AF |
+                OAH_RFLAGS_ZF | OAH_RFLAGS_SF | OAH_RFLAGS_PF);
+    if (!result) {
+        rflags |= OAH_RFLAGS_ZF;
+    }
+    if (result & sign) {
+        rflags |= OAH_RFLAGS_SF;
+    }
+    if (!__builtin_parity((unsigned)(u8)result)) {
+        rflags |= OAH_RFLAGS_PF;
+    }
+    return rflags;
+}
+
+u64 oah_cmp_rflags(u64 rflags, u64 lhs, u64 rhs, u8 width)
+{
+    u64 sign = 1ull << (width * 8 - 1);
+    u64 mask = sign | (sign - 1);
+    lhs &= mask;
+    rhs &= mask;
+    u64 result = lhs - rhs;
+    rflags = oah_logic_rflags(rflags, result, width);
+    if (lhs < rhs) {
+        rflags |= OAH_RFLAGS_CF;
+    }
+    if ((lhs ^ rhs) & (lhs ^ result) & sign) {
+        rflags |= OAH_RFLAGS_OF;
+    }
+    if ((lhs ^ rhs ^ result) & 0x10) {
+        rflags |= OAH_RFLAGS_AF;
+    }
+    return rflags;
+}

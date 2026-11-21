@@ -11,39 +11,28 @@
 
 static u32 prot_from_ph(u32 flags)
 {
-    u32 p = 0;
-    if (flags & PF_R) {
-        p |= PROT_READ;
-    }
-    if (flags & PF_W) {
-        p |= PROT_WRITE;
-    }
-    if (flags & PF_X) {
-        p |= PROT_READ; /* keep readable for the interpreter */
-    }
-    return p ? p : PROT_READ;
-}
-
-static u64 page_down(u64 x)
-{
-    return x & ~0xfffULL;
-}
-
-static u64 page_up(u64 x)
-{
-    return (x + 0xfffULL) & ~0xfffULL;
+    return ((flags & PF_R) ? PROT_READ : 0) |
+           ((flags & PF_W) ? PROT_WRITE : 0) |
+           ((flags & PF_X) ? PROT_EXEC | PROT_READ : 0);
 }
 
 void oah_unmap_elf(oah_image *img)
 {
-    unsigned i;
     if (!img) {
         return;
     }
-    for (i = 0; i < img->nseg; i++) {
-        if (img->segs[i].host && img->segs[i].size) {
+    for (unsigned i = img->load_segments; i < img->nseg; i++) {
+        if (img->segs[i].host && img->segs[i].size &&
+            !(img->heap_mapping && img->segs[i].gva >= (u64)(uintptr_t)img->heap_mapping &&
+              img->segs[i].gva - (u64)(uintptr_t)img->heap_mapping < img->heap_capacity)) {
             munmap(img->segs[i].host, (size_t)img->segs[i].size);
         }
+    }
+    if (img->load_mapping) {
+        munmap(img->load_mapping, (size_t)img->load_mapping_size);
+    }
+    if (img->heap_mapping) {
+        munmap(img->heap_mapping, (size_t)img->heap_capacity);
     }
     if (img->fd >= 0) {
         close(img->fd);
@@ -71,149 +60,199 @@ void *oah_guest_to_host(const oah_image *img, u64 gva, u64 len)
     return 0;
 }
 
+const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len)
+{
+    for (unsigned i = 0; i < img->nseg; i++) {
+        const oah_load_seg *seg = &img->segs[i];
+        if ((seg->prot & PROT_READ) && gva >= seg->gva && gva - seg->gva < seg->size) {
+            u64 offset = gva - seg->gva;
+            u64 remaining = seg->size - offset;
+            if (*len > remaining) {
+                *len = remaining;
+            }
+            return seg->host + offset;
+        }
+    }
+    return NULL;
+}
+
+void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
+{
+    for (unsigned i = 0; img && i < img->nseg; i++) {
+        const oah_load_seg *seg = &img->segs[i];
+        if (len && gva >= seg->gva && gva - seg->gva < seg->size &&
+            len <= seg->size - (gva - seg->gva) && (seg->prot & prot) == prot) {
+            return seg->host + (gva - seg->gva);
+        }
+    }
+    return NULL;
+}
+
 bool oah_map_elf(oah_image *img, const char *path)
 {
     Elf64_Ehdr eh;
-    Elf64_Phdr *ph = 0;
-    ssize_t nread;
-    unsigned i;
-    int first_load = 1;
-    u64 eh_ph_bytes;
-    int map_flags = MAP_PRIVATE | MAP_FIXED;
+    Elf64_Phdr ph[128];
+    struct stat st;
+    long host_page = sysconf(_SC_PAGESIZE);
+    u64 mask, ph_bytes, low = UINT64_MAX, high = 0, phdr = 0;
+    bool has_headers = false;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    u8 *pages = NULL;
+    bool success = false;
 
-#ifdef MAP_FIXED_NOREPLACE
-    map_flags = MAP_PRIVATE | MAP_FIXED_NOREPLACE;
-#endif
-
+    errno = 0;
     memset(img, 0, sizeof(*img));
     img->fd = -1;
-
-    img->fd = open(path, O_RDONLY);
-    if (img->fd < 0) {
+    if (host_page <= 0 || (host_page & (host_page - 1))) {
         return false;
     }
-
-    nread = pread(img->fd, &eh, sizeof(eh), 0);
-    if (nread != (ssize_t)sizeof(eh)) {
-        goto fail;
+    mask = (u64)host_page - 1;
+    img->fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (img->fd < 0 || fstat(img->fd, &st) != 0 ||
+        pread(img->fd, &eh, sizeof(eh), 0) != sizeof(eh)) {
+        goto done;
     }
     if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_ident[EI_DATA] != ELFDATA2LSB ||
-        eh.e_machine != EM_X86_64 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh.e_machine != EM_X86_64 || eh.e_version != EV_CURRENT ||
         (eh.e_type != ET_EXEC && eh.e_type != ET_DYN) ||
-        eh.e_phentsize != sizeof(Elf64_Phdr) ||
-        eh.e_phnum == 0 || eh.e_phnum > 128) {
-        goto fail;
+        eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum == 0 ||
+        eh.e_phnum > sizeof(ph) / sizeof(ph[0])) {
+        goto done;
     }
-
-    eh_ph_bytes = (u64)eh.e_phoff + (u64)eh.e_phnum * sizeof(Elf64_Phdr);
-    ph = (Elf64_Phdr *)malloc((size_t)eh.e_phnum * sizeof(Elf64_Phdr));
-    if (!ph) {
-        goto fail;
+    ph_bytes = (u64)eh.e_phnum * sizeof(ph[0]);
+    if (eh.e_phoff > (u64)st.st_size || ph_bytes > (u64)st.st_size - eh.e_phoff ||
+        pread(img->fd, ph, ph_bytes, (off_t)eh.e_phoff) != (ssize_t)ph_bytes) {
+        goto done;
     }
-    nread = pread(img->fd, ph, (size_t)eh.e_phnum * sizeof(Elf64_Phdr),
-                  (off_t)eh.e_phoff);
-    if (nread != (ssize_t)((size_t)eh.e_phnum * sizeof(Elf64_Phdr))) {
-        goto fail;
-    }
-
-    img->entry = eh.e_entry;
-    img->phnum = eh.e_phnum;
-    img->phentsize = eh.e_phentsize;
-
-    for (i = 0; i < eh.e_phnum; i++) {
-        u64 vaddr, off, filesz, memsz, map_va, map_off, map_len, align_diff;
-        u32 prot;
-        void *p;
-        oah_load_seg *s;
-
-        if (ph[i].p_type != PT_LOAD) {
+    for (unsigned i = 0; i < eh.e_phnum; i++) {
+        const Elf64_Phdr *seg = &ph[i];
+        if (seg->p_type == PT_INTERP) {
+            errno = ENOTSUP;
+            goto done;
+        }
+        if (seg->p_type != PT_LOAD) {
             continue;
         }
-        if (img->nseg >= OAH_MAX_LOAD_SEGS) {
-            goto fail;
+        if (seg->p_memsz < seg->p_filesz || seg->p_offset > (u64)st.st_size ||
+            seg->p_filesz > (u64)st.st_size - seg->p_offset ||
+            seg->p_vaddr > UINT64_MAX - mask ||
+            seg->p_memsz > UINT64_MAX - mask - seg->p_vaddr ||
+            (seg->p_align > 1 && ((seg->p_align & (seg->p_align - 1)) ||
+             ((seg->p_vaddr ^ seg->p_offset) & (seg->p_align - 1)) ||
+             (eh.e_type == ET_DYN && seg->p_align > (u64)host_page)))) {
+            goto done;
         }
-
-        vaddr = ph[i].p_vaddr;
-        off = ph[i].p_offset;
-        filesz = ph[i].p_filesz;
-        memsz = ph[i].p_memsz;
-        if (memsz < filesz) {
-            goto fail;
+        if (!seg->p_memsz) {
+            continue;
         }
-
-        if (first_load) {
-            /* ElfMapper.cpp:399 "first load segment not at file offset 0" */
-            if (off != 0) {
-                goto fail;
-            }
-            /* ElfMapper.cpp:401 spans ELF + program headers */
-            if (filesz < eh_ph_bytes) {
-                goto fail;
-            }
-            img->phdr = vaddr + eh.e_phoff;
-            first_load = 0;
-        }
-
-        align_diff = vaddr & 0xfff;
-        if ((off & 0xfff) != align_diff) {
-            goto fail;
-        }
-        map_va = page_down(vaddr);
-        map_off = page_down(off);
-        map_len = page_up((vaddr + memsz) - map_va);
-        prot = prot_from_ph(ph[i].p_flags);
-        /* Interpreter needs to read instructions; force READ. */
-        prot |= PROT_READ;
-
-        p = mmap((void *)(uintptr_t)map_va, (size_t)map_len, prot, map_flags,
-                 img->fd, (off_t)map_off);
-        if (p == MAP_FAILED) {
-            goto fail;
-        }
-        if ((u64)(uintptr_t)p != map_va) {
-            munmap(p, (size_t)map_len);
-            goto fail;
-        }
-
-        /* Zero BSS tail inside the mapping. Need PROT_WRITE temporarily. */
-        if (memsz > filesz) {
-            u64 bss_gva = vaddr + filesz;
-            u64 bss_len = memsz - filesz;
-            u8 *bss = (u8 *)(uintptr_t)bss_gva;
-            if (mprotect((void *)(uintptr_t)map_va, (size_t)map_len,
-                         prot | PROT_WRITE) != 0) {
-                munmap(p, (size_t)map_len);
-                goto fail;
-            }
-            memset(bss, 0, (size_t)bss_len);
-            if (mprotect((void *)(uintptr_t)map_va, (size_t)map_len, prot) != 0) {
-                munmap(p, (size_t)map_len);
-                goto fail;
+        for (unsigned j = 0; j < i; j++) {
+            const Elf64_Phdr *prior = &ph[j];
+            if (prior->p_type == PT_LOAD && prior->p_memsz &&
+                seg->p_vaddr < prior->p_vaddr + prior->p_memsz &&
+                prior->p_vaddr < seg->p_vaddr + seg->p_memsz) {
+                goto done;
             }
         }
+        u64 start = seg->p_vaddr & ~mask;
+        u64 end = (seg->p_vaddr + seg->p_memsz + mask) & ~mask;
+        if (start < low) {
+            low = start;
+        }
+        if (end > high) {
+            high = end;
+        }
+        if (eh.e_phoff >= seg->p_offset &&
+            eh.e_phoff - seg->p_offset <= seg->p_filesz &&
+            ph_bytes <= seg->p_filesz - (eh.e_phoff - seg->p_offset)) {
+            phdr = seg->p_vaddr + (eh.e_phoff - seg->p_offset);
+            has_headers = true;
+        }
+    }
+    if (low >= high || !has_headers || eh.e_entry < low || eh.e_entry >= high ||
+        high - low > (1ull << 30)) {
+        goto done;
+    }
 
-        s = &img->segs[img->nseg++];
-        s->gva = map_va;
-        s->size = map_len;
-        s->host = (u8 *)(uintptr_t)map_va;
-        s->prot = prot;
-
-        if (vaddr + memsz > img->load_end) {
-            img->load_end = page_up(vaddr + memsz);
+#if defined(MAP_FIXED_NOREPLACE)
+    if (eh.e_type == ET_EXEC) {
+        flags |= MAP_FIXED_NOREPLACE;
+    }
+#endif
+    u64 span = high - low;
+    u8 *map = mmap(eh.e_type == ET_EXEC ? (void *)(uintptr_t)low : NULL,
+                   span, PROT_NONE, flags, -1, 0);
+    if (map == MAP_FAILED) {
+        goto done;
+    }
+    img->load_mapping = map;
+    img->load_mapping_size = span;
+    if (eh.e_type == ET_EXEC && (u64)(uintptr_t)map != low) {
+        goto done;
+    }
+    u64 page_count = span / (u64)host_page;
+    pages = calloc(page_count, 1);
+    if (!pages) {
+        goto done;
+    }
+    for (unsigned i = 0; i < eh.e_phnum; i++) {
+        const Elf64_Phdr *seg = &ph[i];
+        if (seg->p_type != PT_LOAD || !seg->p_memsz) {
+            continue;
+        }
+        u64 offset = seg->p_vaddr - low;
+        u64 start = offset & ~mask;
+        u64 end = (offset + seg->p_memsz + mask) & ~mask;
+        if (mprotect(map + start, end - start, PROT_READ | PROT_WRITE) != 0 ||
+            (seg->p_filesz &&
+             pread(img->fd, map + offset, seg->p_filesz, (off_t)seg->p_offset) !=
+                 (ssize_t)seg->p_filesz)) {
+            goto done;
+        }
+        for (u64 p = start / host_page; p < end / host_page; p++) {
+            pages[p] |= (u8)(prot_from_ph(seg->p_flags) | 0x80);
         }
     }
 
-    free(ph);
-    if (img->nseg == 0) {
-        goto fail;
+    for (u64 first = 0; first < page_count;) {
+        u64 end = first + 1;
+        while (end < page_count && pages[end] == pages[first]) {
+            end++;
+        }
+        if (pages[first]) {
+            u8 *host = map + first * host_page;
+            u64 size = (end - first) * host_page;
+            u32 prot = pages[first] & 0x7f;
+            /* Execute permission is guest metadata. The host executes translated code. */
+            if (img->nseg == OAH_MAX_LOAD_SEGS ||
+                mprotect(host, size, prot & ~PROT_EXEC) != 0) {
+                goto done;
+            }
+            img->segs[img->nseg++] = (oah_load_seg){
+                .gva = (u64)(uintptr_t)host, .size = size, .host = host, .prot = prot
+            };
+            img->load_segments = img->nseg;
+        }
+        first = end;
     }
+    img->entry = (u64)(uintptr_t)(map + (eh.e_entry - low));
+    img->phdr = (u64)(uintptr_t)(map + (phdr - low));
+    img->phnum = eh.e_phnum;
+    img->phentsize = eh.e_phentsize;
+    img->load_end = (u64)(uintptr_t)(map + span);
     img->brk = img->load_end;
-    return true;
+    success = oah_guest_access(img, img->entry, 1, PROT_EXEC) != NULL;
+    if (success) {
+        close(img->fd);
+        img->fd = -1;
+    }
 
-fail:
-    free(ph);
-    oah_unmap_elf(img);
-    return false;
+done:
+    free(pages);
+    if (!success) {
+        int error = errno;
+        oah_unmap_elf(img);
+        errno = error;
+    }
+    return success;
 }

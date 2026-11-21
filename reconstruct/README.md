@@ -54,29 +54,13 @@ reconstruct/
 | 6 | New ELF `oah`: map x86_64 guest, **x86→ARM translate**, runtime syscall shuffle | First runnable equivalent |
 | 7 | Native RX jump + **qemu-user** (`oah-aarch64`) | Prove the emitted ARM is real, not only a C interpreter |
 
-`oah` is a **new** program, not Apple’s binary. It maps an x86_64 Linux ELF (`ElfMapper`: first `PT_LOAD` at file offset 0), translates a long-mode slice to ARM64 using the recovered runtime GPR map, emits a `runtime_syscall` shuffle + `svc #0`, and runs that fragment.
+`oah` loads a static x86-64 Linux ELF and executes it on Linux. Fixed-address guests retain their linked addresses. Static PIE guests are slid as one image and handle their own relocations. Startup supplies an aligned stack with arguments, environment, and auxiliary vector entries.
 
-### What `oah` actually does
+### Execution paths
 
-1. **Map the guest** at its `p_vaddr` (`MAP_FIXED`). The nolibc fixture `tests/hello.x86_64` is `ET_EXEC` at `0x400000` (`tools/mk_hello_elf.py`): `write(1, "hello\n"); exit(0)`.
-2. **Pack GPRs** with the runtime map from `FUN_800000040650`:
-   - `X8–X15` = `RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI`
-   - `X0–X7` = `R13, R14, R12, R11, R15, R10, R9, R8`
-   Guest `RSP` therefore lives in **X12**, not host `SP`.
-3. **Translate** `mov` / `xor` / `lea [rip]` / `push` / `pop` / `jmp` / `syscall`. `call` / `ret` still fail closed (decode error) so the dispatcher cannot loop forever.
-4. **`syscall`** emits the recovered shuffle into Linux AArch64 SVC ABI (`X8` = nr, `X0–X5` = args), then `svc #0`, then restore. We do **not** copy Apple’s `runtime_syscall` bytes at `0x8000000964b8`.
-5. Each fragment ends with `RET`.
+On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping. `--interpret` runs those fragments in the ARM interpreter instead. Both paths execute instructions that need guest memory, flags, TLS, or SIMD state through the same checked x86 interpreter, and both route guest syscalls through the same Linux ABI bridge. Guest calls and returns use the guest stack. Unknown syscalls return `ENOSYS`. Set `OAH_TRACE_UNSUPPORTED=1` to print their numbers and guest addresses.
 
-Two ways to *run* that ARM:
-
-| Path | When | What happens |
-|------|------|----------------|
-| Interpreter (`src/arm_exec.c`) | `make test`, and any non-aarch64 `./oah` | C switch on MOVZ/K, ORR, EOR, ADD/SUB, LDR/STR, SVC, RET. X8 still holds the **x86** nr; `oah_x86_syscall_to_host` remaps. `exit` / `exit_group` return `OAH_INTERP_EXIT` so unit tests are not killed. |
-| Native (`src/arm_native.c`) | `./oah` built for aarch64, including **qemu-user** | mmap RW → memcpy → `mprotect` RX → `ic ivau` → trampoline loads `X0–X15` → `blr` fragment. `RET` returns to the trampoline. Before `svc`, compare/branch rewrites x86 nrs (`write` 1→64, `exit` 60→93, `exit_group` 231→94, …). A live exit SVC **does** terminate the process (correct for `hello`). |
-
-`oah-aarch64` is linked **static** at `0x2000000000` (`-Wl,-Ttext-segment=0x2000000000`) so it cannot collide with the guest at `0x400000`. A default `-static` aarch64 binary would itself load at `0x400000` and `MAP_FIXED` of the guest would fail.
-
-Glibc guests, full x86, and `call`/`ret` traces are still out of scope.
+The current milestone covers single-process static Linux tools. Dynamic loading, threads, general signal handling, and broad x86/SIMD coverage remain future work. Guest memory syscalls currently support a dedicated brk arena, anonymous private mappings, the musl heap guard page, and whole-region changes. This runner is intended for trusted test executables.
 
 ## Build and verify
 
@@ -171,7 +155,27 @@ make -C reconstruct test-qemu \
 
 ### 4. Native aarch64 host (no qemu)
 
-On Linux aarch64, host `cc` already targets ARM64, so `make -C reconstruct test` runs `tests/test_arm_native` for real (5 checks: `x8` becomes 42, `x0` is preserved). `./reconstruct/oah reconstruct/tests/hello.x86_64` uses `oah_jit_run_native` (`blr` + real `svc`). Keep the guest at `0x400000` free, or link `oah` the same way `oah-aarch64` does.
+On Linux aarch64, host `cc` already targets ARM64, so `make -C reconstruct test` runs `tests/test_arm_native` for real (5 checks: `x8` becomes 42, `x0` is preserved). `./reconstruct/oah reconstruct/tests/hello.x86_64` uses `oah_jit_run_native` with `blr` for translated fragments and the shared guest syscall bridge. The host build links as PIE to keep the guest address range available.
+
+### Compiler-built branch smoke test
+
+With `x86_64-linux-gnu-gcc` installed, run:
+
+```bash
+make -C reconstruct test-branch-guest
+```
+
+The target builds fixed-address and static PIE x86-64 ELFs from freestanding C. It checks stdout and exit status after a taken and an untaken branch, calls and returns, and Linux write and exit syscalls. On an x86-64 Linux host with GCC, set `CC_X86_64=gcc`.
+
+### Stock Alpine BusyBox compatibility
+
+Use Alpine v3.22 main’s x86-64 package [busybox-static 1.37.0-r20](https://pkgs.alpinelinux.org/package/v3.22/main/x86_64/busybox-static). Extract `bin/busybox.static` from the package and make it executable. The expected ELF SHA-256 is `a477b4c1b332bb9b5d926dbfc75e0efc9b53193708d8be83295bfbb376fa9839`.
+
+```bash
+make -C reconstruct test-linux-static BUSYBOX_STATIC=/absolute/path/to/busybox.static
+```
+
+The test uses `qemu-x86_64` as its reference (`QEMU_X86_64` overrides the executable). It compares stdout, stderr, and exit status for `true`, `false`, `echo`, `cat`, and `wc -c`, including stdin, files, and a missing file. It runs both attesor backends. The normal `make test` target remains offline.
 
 ## What we will not do
 

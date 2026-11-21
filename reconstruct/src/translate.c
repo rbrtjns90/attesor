@@ -4,6 +4,8 @@
 #include "oah/decode_insn.h"
 #include "oah/register.h"
 
+#include <sys/mman.h>
+
 static oah_gpr xn(oah_x86_gpr g)
 {
     return (oah_gpr)oah_host_xn_for_x86_gpr(g);
@@ -42,21 +44,20 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
     }
 
     while (n < 64) {
-        const u8 *pc = oah_guest_to_host(img, cur, 1);
-        const u8 *end;
+        u64 available = OAH_X86_MAX_INSN;
+        const u8 *pc = oah_guest_span(img, cur, &available);
         oah_insn in;
         u64 after;
         bool is_64;
         oah_gpr rsp;
 
-        if (!pc) {
+        if (!pc || !oah_guest_access(img, cur, 1, PROT_EXEC)) {
             if (n == 0) {
                 return false;
             }
             break;
         }
-        end = pc + OAH_X86_MAX_INSN;
-        if (!oah_decode_insn(pc, end, &in)) {
+        if (!oah_decode_insn(pc, pc + available, &in)) {
             if (n == 0) {
                 return false;
             }
@@ -76,6 +77,9 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
             }
             break;
         case OAH_OP_XOR_RR:
+            if (flags & OAH_XLAT_DISPATCH_STATE) {
+                return n == 0 || oah_emit_ret(buf);
+            }
             if (!oah_emit_eor(buf, is_64, xn((oah_x86_gpr)in.dst),
                               xn((oah_x86_gpr)in.dst), xn((oah_x86_gpr)in.src))) {
                 return false;
@@ -94,18 +98,27 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
             }
             break;
         case OAH_OP_PUSH:
+            if (flags & OAH_XLAT_DISPATCH_STATE) {
+                return n == 0 || oah_emit_ret(buf);
+            }
             if (!oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) ||
                 !oah_emit_ldr_str_uoff(buf, true, xn((oah_x86_gpr)in.dst), rsp, 0)) {
                 return false;
             }
             break;
         case OAH_OP_POP:
+            if (flags & OAH_XLAT_DISPATCH_STATE) {
+                return n == 0 || oah_emit_ret(buf);
+            }
             if (!oah_emit_ldr_str_uoff(buf, false, xn((oah_x86_gpr)in.dst), rsp, 0) ||
                 !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8)) {
                 return false;
             }
             break;
         case OAH_OP_SYSCALL:
+            if (flags & OAH_XLAT_DISPATCH_STATE) {
+                return n == 0 || oah_emit_ret(buf);
+            }
             if (host_svc) {
                 if (!oah_emit_runtime_syscall_host(buf)) {
                     return false;
@@ -120,9 +133,20 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
                 *next_rip = cur;
             }
             return oah_emit_ret(buf);
+        case OAH_OP_PUSH_IMM:
         case OAH_OP_CALL_REL:
         case OAH_OP_RET:
-            return false;
+        case OAH_OP_CMP_RR:
+        case OAH_OP_CMP_IMM:
+        case OAH_OP_TEST_RR:
+        case OAH_OP_JCC_REL:
+        case OAH_OP_SCALAR:
+        case OAH_OP_STRING:
+        case OAH_OP_VECTOR:
+            if (!(flags & OAH_XLAT_DISPATCH_STATE)) {
+                return false;
+            }
+            return n == 0 || oah_emit_ret(buf);
         default:
             return false;
         }

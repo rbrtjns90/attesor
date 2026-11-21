@@ -25,6 +25,7 @@ extern "C" {
  */
 extern const u8 oah_cc_arm_table[16];
 
+bool oah_condition_holds(u8 cc, u64 rflags);
 bool oah_translate_condition_code(oah_x86_cc cc, oah_arm_cc *out);
 
 /*

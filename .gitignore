@@ -34,6 +34,9 @@ reconstruct/tests/test_arm_native
 reconstruct/tests/test_arm_native-aarch64
 reconstruct/tests/hello.x86_64
 reconstruct/tests/hello.got
+reconstruct/tests/branch_guest.x86_64
+reconstruct/tests/branch_guest-pie.x86_64
+reconstruct/tests/branch_guest.got
 reconstruct/tests/hello.qemu.got
 reconstruct/oah
 reconstruct/oah-aarch64

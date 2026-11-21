@@ -44,23 +44,25 @@ TESTS = \
     tests/test_translate \
     tests/test_arm_native
 
+CC_X86_64      ?= x86_64-linux-gnu-gcc
 CC_AARCH64     ?= aarch64-linux-gnu-gcc
+QEMU_X86_64    ?= qemu-x86_64
 QEMU_AARCH64   ?= qemu-aarch64-static
 # Keep oah's load address far from a typical ET_EXEC guest at 0x400000.
 AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 
-.PHONY: all test test-qemu clean inventory inventory-binary oah oah-aarch64
+.PHONY: all test test-branch-guest test-linux-static test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -fPIE -c -o $@ $<
 
 tests/%: tests/%.c $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(OBJ)
+	$(CC) $(CFLAGS) -fPIE -pie -o $@ $< $(OBJ)
 
 oah: src/oah_main.o $(OBJ)
-	$(CC) $(CFLAGS) -o $@ src/oah_main.o $(OBJ)
+	$(CC) $(CFLAGS) -fPIE -pie -o $@ src/oah_main.o $(OBJ)
 
 oah-aarch64: src/oah_main.c $(SRC)
 	$(CC_AARCH64) $(CFLAGS) $(AARCH64_LDFLAGS) -o $@ src/oah_main.c $(SRC)
@@ -81,6 +83,24 @@ test: $(TESTS) oah tests/hello.x86_64
 	./oah tests/hello.x86_64 > tests/hello.got || fail=1; \
 	printf 'hello\n' | cmp -s - tests/hello.got || { echo "  FAIL hello output"; fail=1; }; \
 	exit $$fail
+
+tests/branch_guest.x86_64: tests/branch_guest.c
+	$(CC_X86_64) -O2 -nostdlib -static -no-pie -fno-stack-protector -fno-pie \
+	    -fno-if-conversion -fno-if-conversion2 -masm=att -o $@ $<
+
+tests/branch_guest-pie.x86_64: tests/branch_guest.c
+	$(CC_X86_64) -O2 -nostdlib -static-pie -fPIE -fno-stack-protector \
+	    -fno-if-conversion -fno-if-conversion2 -o $@ $<
+
+test-branch-guest: oah tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64
+	@set -e; for guest in tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64; do \
+	    status=0; ./oah $$guest > tests/branch_guest.got || status=$$?; \
+	    test "$$status" -eq 7; printf 'branch ok\nbranch no\n' | cmp - tests/branch_guest.got; \
+	done
+
+test-linux-static: oah
+	@test -n "$(BUSYBOX_STATIC)" || { echo "Set BUSYBOX_STATIC to the pinned BusyBox ELF"; exit 1; }
+	python3 tools/test_linux_static.py --runner ./oah --busybox "$(BUSYBOX_STATIC)" --qemu "$(QEMU_X86_64)"
 
 test-qemu: oah-aarch64 tests/test_arm_native-aarch64 tests/hello.x86_64
 	@command -v $(CC_AARCH64) >/dev/null || { echo "need $(CC_AARCH64)"; exit 1; }
@@ -103,4 +123,5 @@ inventory-binary:
 clean:
 	rm -f $(OBJ) src/oah_main.o $(TESTS) oah oah-aarch64 \
 	    tests/test_arm_native-aarch64 tests/hello.x86_64 tests/hello.got \
+	    tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64 tests/branch_guest.got \
 	    tests/hello.qemu.got

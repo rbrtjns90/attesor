@@ -14,8 +14,10 @@ extern "C" {
  * Translate one x86_64 block into ARM64 using the runtime GPR map
  * (FUN_800000040650) and a runtime_syscall shuffle + `svc #0`.
  *
- * The fragment always ends with RET (LR=0 means return to the dispatcher
- * when the C interpreter runs the fragment).
+ * Fragments end with RET (LR=0 returns to the C dispatcher). With
+ * OAH_XLAT_DISPATCH_STATE, translation stops before operations that need
+ * dispatcher-managed state. If one is at the entry, success appends no
+ * code and leaves next_rip there.
  *
  * flags:
  *   OAH_XLAT_HOST_SVC — rewrite x86_64 NR in X8 to the aarch64 NR before
@@ -23,6 +25,7 @@ extern "C" {
  *   oah_arm_exec still sees x86 numbers.
  */
 #define OAH_XLAT_HOST_SVC 1u
+#define OAH_XLAT_DISPATCH_STATE 2u
 
 bool oah_translate_block(oah_asm_buf *buf, oah_image *img, u64 rip, u64 *next_rip);
 bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,

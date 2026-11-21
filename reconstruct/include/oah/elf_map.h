@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define OAH_MAX_LOAD_SEGS 16
+#define OAH_MAX_LOAD_SEGS 128
 
 typedef struct {
     u64 gva;     /* guest virtual address of mapping */
@@ -26,22 +26,25 @@ typedef struct {
     u64 load_end;    /* first byte after last PT_LOAD (for brk) */
     u64 brk;
     int fd;
+    u8 *load_mapping;
+    u64 load_mapping_size;
+    unsigned load_segments;
+    u8 *heap_mapping;
+    u64 heap_capacity;
+    u64 heap_guard;
 } oah_image;
 
-/*
- * orig: ElfMapper.cpp:399 / 401 map_elf
- * decomp: FUN_8000000900a0
- *
- *   first PT_LOAD file offset == 0
- *   first PT_LOAD file size covers ELF + program headers
- *
- * Only ET_EXEC/ET_DYN, EM_X86_64, ELF64 LSB. Maps PT_LOAD at p_vaddr
- * (ET_EXEC) or at a chosen slide (ET_DYN) so guest VA == host address.
- */
+/* Load a little-endian x86-64 static ELF and populate its guest mappings.
+ * ET_EXEC keeps its linked address; ET_DYN is slid as a single span. */
 bool oah_map_elf(oah_image *img, const char *path);
 void oah_unmap_elf(oah_image *img);
 
-/* Translate a guest pointer; NULL if not in a PT_LOAD mapping. */
+/* Return up to *len contiguous guest bytes and update *len to their count. */
+/* Validate both address range and guest memory permissions. */
+void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot);
+const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len);
+
+/* Translate a guest pointer; NULL if not in a guest mapping. */
 void *oah_guest_to_host(const oah_image *img, u64 gva, u64 len);
 
 #ifdef __cplusplus

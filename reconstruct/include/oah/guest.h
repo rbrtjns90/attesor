@@ -17,6 +17,7 @@ extern "C" {
  */
 typedef struct {
     u64 gpr[OAH_X86_GPR_COUNT];
+    u8 xmm[16][16];
     u64 rip;
     u64 rflags;
     u64 fs_base;
