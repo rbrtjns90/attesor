@@ -7,7 +7,7 @@ export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 export HOME="$base/var/freeciv/home" LC_ALL=C DISPLAY=:0
 export OAH_CACHE_DIR="$base/var/cache/jit"
 export FREECIV_DATA_PATH="$root/usr/share/games/freeciv-attesor"
-export SDL_VIDEODRIVER=x11 SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=dummy
+export SDL_VIDEODRIVER=x11 SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=alsa AUDIODEV=hw:0,0
 export PATH="$root/usr/games:/usr/bin:/bin"
 mkdir -p "$OAH_CACHE_DIR" "$base/var"
 echo "translation cache: $(du -sh "$OAH_CACHE_DIR" 2>/dev/null | cut -f1 || echo empty)"
@@ -37,6 +37,6 @@ fi
 # relaxed ping timeouts so an emulated client that stalls on rendering work
 # isn't kicked as a "lagging connection" mid-game.
 exec "$base/../reconstruct/oah" --max-insns 18446744073709551615 \
-    --sysroot "$root" "$root/usr/games/freeciv-sdl2" -P none --debug v \
+    --sysroot "$root" "$root/usr/games/freeciv-sdl2" --debug v \
     -r "$base/var/freeciv/startgame" \
     -l "$base/var/freeciv/FreecivServer.log"
