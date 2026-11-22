@@ -409,9 +409,40 @@ static unsigned workers;
 static u32 next_thread_id = 0x10000000;
 static u64 next_jit_owner = 1; /* 0 = main thread (guest_init zeroes it) */
 
+/* Wall time when this host thread last acquired guest_lock — the basis
+ * for slice accounting in oah_darwin_guest_tick. Thread-local because the
+ * hold belongs to the runner, not any guest struct. */
+static __thread u64 lock_hold_ns;
+
+/* Turn-taking for guest_lock: a yielder parks on sched_cv until a
+ * different thread reports an acquisition (sched_generation bump) or a
+ * short timeout fires when no peer is runnable. Without this a yielder
+ * that merely sleeps races its own reacquire — a psynch waiter cannot
+ * wake and win the lock inside a microsecond sleep window.
+ *
+ * guest_lock_waiters counts threads blocked in pthread_mutex_lock so a
+ * holder can skip yielding entirely while every peer is asleep in a futex
+ * or blocking call — the common case for SDL's idle worker threads. */
+static pthread_mutex_t sched_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sched_cv = PTHREAD_COND_INITIALIZER;
+static unsigned sched_waiting;
+static unsigned guest_lock_waiters;
+static u64 sched_generation;
+
 void oah_darwin_guest_enter(void)
 {
+    __atomic_fetch_add(&guest_lock_waiters, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&guest_lock);
+    __atomic_fetch_sub(&guest_lock_waiters, 1, __ATOMIC_RELAXED);
+    if (sched_waiting) {
+        pthread_mutex_lock(&sched_mu);
+        sched_generation++;
+        pthread_cond_broadcast(&sched_cv);
+        pthread_mutex_unlock(&sched_mu);
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lock_hold_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
 }
 
 void oah_darwin_guest_leave(void)
@@ -424,18 +455,67 @@ bool oah_darwin_has_workers(void)
     return workers != 0;
 }
 
+/* Fair guest-lock sharing. guest_lock serializes all guest execution, so
+ * every runner periodically hands it off. The slice is wall time, not
+ * guest instructions: a JIT thread executes millions of insns per second
+ * while an interpreted worker manages thousands, so counting insns would
+ * give the fast thread tiny slices and let workers convoy the lock. A
+ * holder may keep the lock up to OAH_GUEST_SLICE_NS of contiguous wall
+ * time before handing off — but only when a peer is actually blocked
+ * acquiring it (guest_lock_waiters); workers parked in futex or blocking
+ * syscalls don't need a slice, and yielding to nobody just stalls the
+ * only runnable thread. */
+#define OAH_GUEST_SLICE_NS 4000000ull /* ~4ms contiguous hold */
+#define OAH_GUEST_CHECK_INSNS (8u << 10) /* insns between clock checks */
+
 void oah_darwin_guest_tick(oah_guest *g, u64 insns)
 {
-    if (workers && (g->quantum += (unsigned)insns) >= (64u << 10)) {
-        g->quantum = 0;
-        oah_darwin_guest_leave();
-        /* A bare unlock/relock beats a psynch waiter every time: the
-         * woken thread needs a real scheduling window to take the lock.
-         * usleep(1) yields long enough for the handoff to actually land,
-         * so a hot loop cannot starve a worker that only needs the lock. */
-        usleep(1);
-        oah_darwin_guest_enter();
+    if (!workers || (g->quantum += (unsigned)insns) < OAH_GUEST_CHECK_INSNS) {
+        return;
     }
+    g->quantum = 0;
+    if (__atomic_load_n(&guest_lock_waiters, __ATOMIC_RELAXED) == 0) {
+        lock_hold_ns = 0; /* uncontended; next waiter's arrival restarts the slice */
+        return;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    if (!lock_hold_ns) {
+        lock_hold_ns = now_ns; /* no stamp yet; grant a full slice */
+        return;
+    }
+    if (now_ns - lock_hold_ns < OAH_GUEST_SLICE_NS) {
+        return;
+    }
+    static int trace_sched = -1;
+    if (trace_sched < 0) {
+        trace_sched = getenv("OAH_TRACE_SCHED") != NULL;
+    }
+    if (trace_sched) {
+        fprintf(stderr, "sched yield tid=%u hold=%llums\n", g->tid,
+                (unsigned long long)((now_ns - lock_hold_ns) / 1000000ull));
+    }
+    /* Park until a peer reports a guest_lock acquisition so the handoff
+     * is guaranteed, not a sleep race. The timeout covers the case where
+     * the waiter gives up or gets cancelled before acquiring. */
+    pthread_mutex_lock(&sched_mu);
+    sched_waiting++;
+    u64 gen = sched_generation;
+    struct timespec deadline = {
+        .tv_sec = now.tv_sec, .tv_nsec = now.tv_nsec + 8000000L,
+    };
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    oah_darwin_guest_leave();
+    while (sched_generation == gen &&
+           pthread_cond_timedwait(&sched_cv, &sched_mu, &deadline) == 0) {
+    }
+    sched_waiting--;
+    pthread_mutex_unlock(&sched_mu);
+    oah_darwin_guest_enter();
 }
 
 static bool begin_blocking_call(void)

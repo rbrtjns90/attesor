@@ -32,8 +32,13 @@ ARCH_SET_FS = 0x1002
 # CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM
 CLONE_FLAGS = 0x10F00 | 0x40000
 
-ITERS = 8_000_000       # per-thread verify loop
-WAIT_BOUND = 64_000_000 # parent spin bound waiting for the child
+# Per-thread verify-loop iterations: a leaked FS/XMM state fails within a
+# few iterations, so this only needs to be large enough that both threads
+# trade guest_lock slices many times. The parent waits on a nanosleep
+# poll — a blocking syscall that releases guest_lock — so an interpreted
+# worker gets real time; WAIT_BOUND is in ~1ms polls.
+ITERS = 500_000
+WAIT_BOUND = 20_000 # ~20s of 1ms polls waiting for the child
 
 # Data-block offsets (r15-relative).
 TLS_P = 0
@@ -43,7 +48,8 @@ MSG_OK = 24
 MSG_FAIL = 40
 MSG_TOUT = 56
 MSG_CERR = 80
-STACK = 112
+TS = 104
+STACK = 120
 STACK_LEN = 8192
 
 OK = b"workerjit ok\n"
@@ -132,11 +138,17 @@ def emit() -> bytes:
     code.extend(b"\x4d\x85\xe4")            # test r12,r12
     code.extend(b"\x74") ; rel8("child")    # jz child
 
-    # Parent: wait for the child's done flag.
+    # Parent: poll the child's done flag with nanosleep(1ms) between
+    # checks — a blocking syscall releases guest_lock so the worker gets
+    # real time instead of contending with a JIT-speed spin.
     code.extend(b"\xba" + struct.pack("<I", WAIT_BOUND))  # mov edx,BOUND
     here("wait")
     code.extend(b"\x41\x80\x7f" + bytes([DONE]) + b"\x00")  # cmp byte [r15+DONE],0
     code.extend(b"\x75") ; rel8("ok")       # jnz ok
+    code.extend(b"\xb8" + struct.pack("<I", SYS_NANOSLEEP))
+    lea_rip(7, "ts")                        # lea rdi,[rip+ts]
+    code.extend(b"\x31\xf6")                # xor esi,esi
+    code.extend(b"\x0f\x05")                # syscall
     code.extend(b"\xff\xca")                # dec edx
     code.extend(b"\x74") ; rel8("tout")     # jz tout
     code.extend(b"\xeb") ; rel8("wait")     # jmp wait
@@ -187,7 +199,8 @@ def main() -> None:
     data += OK + b"\x00" * (MSG_FAIL - MSG_OK - len(OK))
     data += FAIL + b"\x00" * (MSG_TOUT - MSG_FAIL - len(FAIL))
     data += TOUT + b"\x00" * (MSG_CERR - MSG_TOUT - len(TOUT))
-    data += CERR + b"\x00" * (STACK - MSG_CERR - len(CERR))
+    data += CERR + b"\x00" * (TS - MSG_CERR - len(CERR))
+    data += struct.pack("<QQ", 0, 1000000)   # ts: 1ms nanosleep poll
     assert len(data) == STACK
     data += b"\x00" * STACK_LEN
 
@@ -201,6 +214,7 @@ def main() -> None:
         "msg_fail": data_off + MSG_FAIL,
         "msg_tout": data_off + MSG_TOUT,
         "msg_cerr": data_off + MSG_CERR,
+        "ts": data_off + TS,
     }
 
     code = bytearray(code)
