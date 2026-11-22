@@ -366,7 +366,12 @@ static int alsa_flush(oah_alsa *d)
             (u64)d->n_in_flight * (d->frag / d->frame) >= d->start_threshold) {
             d->started = 1;
             d->state = ALSA_ST_RUNNING;
-            AudioQueueStart(d->queue, NULL);
+            OSStatus sst = AudioQueueStart(d->queue, NULL);
+            if (alsa_dbg()) {
+                fprintf(stderr, "alsa start queued=%llu st=%d\n",
+                        (unsigned long long)d->n_in_flight * (d->frag / d->frame),
+                        (int)sst);
+            }
         }
         pthread_mutex_unlock(&d->mu);
     }
@@ -452,7 +457,10 @@ static int alsa_classify(const char *path)
         return 1;
     }
     if (strncmp(path, "/dev/snd/controlC", 17) == 0) {
-        return 2;
+        /* One virtual card: controlC0 only, like a single-card system.
+         * libasound probes controlC0..31 during device enumeration;
+         * succeeding on all of them makes it scan every phantom card. */
+        return path[17] == '0' && path[18] == '\0' ? 2 : -1;
     }
     return -1;
 }
@@ -800,6 +808,13 @@ static s64 alsa_writei(oah_image *img, oah_alsa *d, u64 arg)
     if (!x.frames) {
         goto done0;
     }
+    if (alsa_dbg()) {
+        static int wr;
+        if (++wr < 6 || wr % 100 == 0) {
+            fprintf(stderr, "alsa writei #%d frames=%llu state=%d\n",
+                    wr, (unsigned long long)x.frames, d->state);
+        }
+    }
     if (d->state < ALSA_ST_SETUP) {
         return -EIO;
     }
@@ -936,6 +951,27 @@ s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
 
     u8 *out = arg ? oah_guest_access(img, arg, 640, PROT_WRITE) : NULL;
 
+    if (alsa_dbg()) {
+        struct seen { u32 req; unsigned n; };
+        static struct seen seen[48];
+        static unsigned nseen;
+        for (unsigned i = 0; i <= nseen; i++) {
+            if (i == nseen) {
+                if (nseen < 48) {
+                    seen[nseen++] = (struct seen){(u32)req, 1};
+                    fprintf(stderr, "alsa ioctl %#x (new)\n", (unsigned)req);
+                }
+                break;
+            }
+            if (seen[i].req == (u32)req) {
+                if (++seen[i].n < 4) {
+                    fprintf(stderr, "alsa ioctl %#x\n", (unsigned)req);
+                }
+                break;
+            }
+        }
+    }
+
     switch (req) {
     case ALSA_PCM_PVERSION:
         if (!out) return -EFAULT;
@@ -969,6 +1005,17 @@ s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
         d->avail_min = v;
         memcpy(&v, sp + 32, 8);
         d->start_threshold = v;
+        /* The queue can only ever hold NBUF*period frames; a threshold
+         * beyond that can never fire and would deadlock playback. */
+        u64 cap = (u64)NBUF * d->period_frames;
+        if (d->start_threshold > cap) {
+            d->start_threshold = cap;
+        }
+        if (alsa_dbg()) {
+            fprintf(stderr, "alsa sw_params avail_min=%llu start_thr=%llu\n",
+                    (unsigned long long)d->avail_min,
+                    (unsigned long long)d->start_threshold);
+        }
         u8 *w = oah_guest_access(img, arg, 136, PROT_WRITE);
         if (w) {
             memset(w + 96, 0, 40); /* proto/reserved tail is output */
@@ -1020,16 +1067,76 @@ s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
     case ALSA_PCM_LINK:
     case ALSA_PCM_UNLINK:
         return -EINVAL;
-    case ALSA_PCM_SYNC_PTR:
-        /* alsa-lib pushes appl_ptr/avail_min bookkeeping even on
-         * non-mmap streams; our counters stay authoritative. */
+    case ALSA_PCM_SYNC_PTR: {
+        /* struct snd_pcm_sync_ptr (136B): flags@0, s(status 64B)@8,
+         * c(control 64B)@72 — mmap_status: state@0, hw_ptr@8,
+         * tstamp@16, suspended@32, audio_tstamp@40, delay@56;
+         * mmap_control: appl_ptr@0, avail_min@8. Software plugins
+         * (plug/dmix) read these to compute avail even without mmap. */
+        u8 *sp = oah_guest_access(img, arg, 136, PROT_READ | PROT_WRITE);
+        if (!sp) return -EFAULT;
+        u32 flags;
+        memcpy(&flags, sp, 4);
+        if (flags & 0x6) { /* APPL|AVAIL_MIN pushed by the guest */
+            u64 v;
+            if (flags & 0x2) { /* APPL */
+                memcpy(&v, sp + 72, 8);
+                d->written = v;
+            }
+            if (flags & 0x4) { /* AVAIL_MIN */
+                memcpy(&v, sp + 80, 8);
+                d->avail_min = v;
+            }
+        }
+        pthread_mutex_lock(&d->mu);
+        hp_set_u32(sp, 8, (u32)d->state);
+        hp_set_u64(sp, 16, d->played);
+        hp_set_u64(sp, 64, d->written - d->played);
+        hp_set_u64(sp, 72, d->written);
+        hp_set_u64(sp, 80, d->avail_min);
+        pthread_mutex_unlock(&d->mu);
         return 0;
+    }
     default:
         if (alsa_dbg()) {
             fprintf(stderr, "alsa pcm ioctl %#x unhandled\n", (unsigned)req);
         }
         return -ENOTTY;
     }
+}
+
+/* poll() readiness for an emulated fd. Real kernel PCM fds block until
+ * avail >= avail_min; reporting POLLOUT unconditionally would let the
+ * guest busy-spin on the SDL audio thread. events is the requested
+ * Linux poll mask; returns the revents mask (same bit values). */
+int oah_alsa_poll(int fd, int events)
+{
+    enum { P_POLLOUT = 0x4, P_POLLWRNORM = 0x100,
+           P_POLLERR = 0x8, P_POLLNVAL = 0x20 };
+    pthread_mutex_lock(&table_mu);
+    oah_alsa *d = alsa_for(fd);
+    if (!d) {
+        pthread_mutex_unlock(&table_mu);
+        return P_POLLNVAL;
+    }
+    if (d->is_ctl) {
+        pthread_mutex_unlock(&table_mu);
+        return events & P_POLLOUT ? P_POLLOUT : 0;
+    }
+    pthread_mutex_unlock(&table_mu);
+    if (d->state == ALSA_ST_XRUN) {
+        return P_POLLERR;
+    }
+    pthread_mutex_lock(&d->mu);
+    u64 delay = d->written - d->played;
+    u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
+    u64 need = d->avail_min;
+    pthread_mutex_unlock(&d->mu);
+    if (avail < need) {
+        return 0;
+    }
+    return (events & P_POLLOUT) ? (P_POLLOUT | P_POLLWRNORM)
+                              : (P_POLLOUT | P_POLLWRNORM);
 }
 
 /* fd write() on a pcm fd takes interleaved frames like writei. */

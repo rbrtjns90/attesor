@@ -1021,6 +1021,7 @@ int oah_alsa_open(const char *path, int flags);
 int oah_alsa_close(int fd);
 s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len);
 s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg);
+int oah_alsa_poll(int fd, int events);
 void oah_alsa_note_flags(int fd, int host_flags);
 
 static int open_guest_path(oah_image *img, int dirfd, const char *path, int host_flags, u64 mode)
@@ -2025,9 +2026,83 @@ static s64 guest_poll(oah_image *img, u64 address, u64 count, int timeout)
             fds[i].events |= POLLWRBAND;
         }
     }
-    bool released = begin_blocking_call();
-    int ready = poll(fds, (nfds_t)count, timeout < 0 ? -1 : timeout);
-    finish_blocking_call(released);
+    /* Emulated ALSA pcm fds are /dev/null underneath — host poll would
+     * report them always-ready and let the guest busy-spin. Compute
+     * their readiness from queue state instead, and bound each host
+     * poll chunk so re-checks track buffer drain. */
+    bool has_alsa = false;
+    for (u64 i = 0; i < count; i++) {
+        if (oah_alsa_owns(fds[i].fd)) {
+            has_alsa = true;
+            fds[i].fd = -1; /* poll skips it */
+        }
+    }
+    u16 *alsa_rev = NULL;
+    int ready = 0;
+    bool released = false;
+    if (has_alsa) {
+        alsa_rev = calloc(count ? count : 1, sizeof(*alsa_rev));
+        if (!alsa_rev) {
+            free(fds);
+            return -ENOMEM;
+        }
+        struct timespec deadline, now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        deadline = now;
+        if (timeout >= 0) {
+            deadline.tv_sec += timeout / 1000;
+            deadline.tv_nsec += (long)(timeout % 1000) * 1000000;
+            if (deadline.tv_nsec >= 1000000000) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000;
+            }
+        }
+        for (;;) {
+            for (u64 i = 0; i < count; i++) {
+                linux_pollfd entry;
+                memcpy(&entry, guest + i * sizeof(entry), sizeof(entry));
+                if (entry.fd >= 0 && oah_alsa_owns(entry.fd)) {
+                    alsa_rev[i] = (u16)oah_alsa_poll(entry.fd, interests[i]);
+                    if (alsa_rev[i]) {
+                        ready++;
+                    }
+                }
+            }
+            int chunk = 8; /* ms: tracks ~23ms period drain closely */
+            if (timeout >= 0) {
+                long long rem = (deadline.tv_sec - now.tv_sec) * 1000 +
+                                (deadline.tv_nsec - now.tv_nsec) / 1000000;
+                if (rem <= 0 && ready == 0) {
+                    break;
+                }
+                if (rem < chunk) {
+                    chunk = (int)rem;
+                }
+            }
+            if (ready > 0) {
+                break;
+            }
+            released = begin_blocking_call();
+            int r = poll(fds, (nfds_t)count, chunk);
+            finish_blocking_call(released);
+            if (r < 0) {
+                ready = r;
+                break;
+            }
+            ready = r;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (timeout >= 0 && ready == 0 &&
+                (now.tv_sec > deadline.tv_sec ||
+                 (now.tv_sec == deadline.tv_sec &&
+                  now.tv_nsec >= deadline.tv_nsec))) {
+                break;
+            }
+        }
+    } else {
+        released = begin_blocking_call();
+        ready = poll(fds, (nfds_t)count, timeout < 0 ? -1 : timeout);
+        finish_blocking_call(released);
+    }
     s64 result = host_result(ready);
     if (released && count && result >= 0) {
         guest = oah_guest_access(img, address, count * sizeof(linux_pollfd), PROT_WRITE);
@@ -2040,6 +2115,9 @@ static s64 guest_poll(oah_image *img, u64 address, u64 count, int timeout)
         for (u64 i = 0; i < count; i++) {
             u16 events = interests[i];
             u16 revents = fds[i].revents & (always_reported | (events & shared_events));
+            if (alsa_rev && alsa_rev[i]) {
+                revents |= alsa_rev[i];
+            }
             if ((events & LINUX_POLLWRNORM) && (fds[i].revents & POLLOUT)) {
                 revents |= LINUX_POLLWRNORM;
             }
@@ -2051,6 +2129,7 @@ static s64 guest_poll(oah_image *img, u64 address, u64 count, int timeout)
                    &revents, sizeof(revents));
         }
     }
+    free(alsa_rev);
     free(fds);
     return result;
 }
