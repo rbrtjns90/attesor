@@ -46,6 +46,18 @@ cp "$runtime/icons/Penguin.icns" \
 cp "$src/sync-programs.sh" "$runtime/sync-programs.sh"
 chmod +x "$runtime/sync-programs.sh"
 
+# --- the package manager (compiled SwiftUI app) ------------------------------
+mkdir -p "$apps/Attesor Package Manager.app/Contents/MacOS" \
+         "$apps/Attesor Package Manager.app/Contents/Resources"
+echo "assemble: compiling PackageManager.swift"
+swiftc -O -parse-as-library -o \
+    "$apps/Attesor Package Manager.app/Contents/MacOS/PackageManager" \
+    "$src/PackageManager.swift" || die "swiftc failed"
+cp "$src/apps/Attesor Package Manager.plist" \
+   "$apps/Attesor Package Manager.app/Contents/Info.plist"
+cp "$runtime/icons/Penguin.icns" \
+   "$apps/Attesor Package Manager.app/Contents/Resources/"
+
 # --- script-driven app bundles ---------------------------------------------
 for name in "Debian Calculator" "Debian Clock" "Debian Eyes" \
             "Debian X Logo" "Freeciv via Attesor"; do

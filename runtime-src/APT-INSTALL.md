@@ -1,5 +1,12 @@
 # Installing Debian packages into the Attesor sysroot
 
+The easiest entry point for non-technical users is the **Attesor Package
+Manager** app (`runtime/Apps/Attesor Package Manager.app`, built by
+`assemble.sh` from `PackageManager.swift`). It shows installed programs in
+clearly labelled *GUI Applications* / *Terminal Programs* sections with
+one-click Launch buttons, plus a searchable *Browse Packages* view with
+Install buttons — all backed by the native pipeline below.
+
 Debian `apt` is the default package manager. There are two ways to use it;
 the second is much faster because it moves the two slow translated phases
 (apt's HTTP event loop and dpkg-deb/xz decompression) into native macOS

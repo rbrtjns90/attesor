@@ -51,7 +51,13 @@ if [ -d "$S/usr/share/applications" ]; then
         # First token, minus env wrappers and %-field codes.
         bin=$(printf '%s' "$exec_line" | sed 's/%[a-zA-Z]//g' | awk '{print $1}')
         [ -n "$bin" ] || continue
-        case "$bin" in /*) ;; *) continue ;; esac
+        case "$bin" in
+            /*) ;;
+            *)  # Bare command name: resolve against the bin dirs.
+                for d in /usr/bin /usr/games /usr/local/bin /usr/sbin /bin /sbin; do
+                    if [ -x "$S$d/$bin" ]; then bin="$d/$bin"; break; fi
+                done ;;
+        esac
         [ -x "$S$bin" ] || continue
         printf '%s\t%s\n' "$bin" "${name:-$(basename "$bin")}" >>"$gui_names_file"
         printf '%s\n' "$bin" >>"$gui_bins_file"
