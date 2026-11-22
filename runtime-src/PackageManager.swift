@@ -472,6 +472,20 @@ final class AppState: ObservableObject {
                                                  withIntermediateDirectories: true)
         p.arguments = ["--sysroot", root, root + prog.binary]
         p.environment = env
+        // Keep guest stdout/stderr: diagnosing launch/server failures is
+        // impossible when output goes to /dev/null.
+        let logDir = Repo.root.path + "/runtime/var/log"
+        try? FileManager.default.createDirectory(atPath: logDir,
+                                                 withIntermediateDirectories: true)
+        let logPath = logDir + "/\(prog.name).log"
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+        if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+            handle.truncateFile(atOffset: 0)
+            p.standardOutput = handle
+            p.standardError = handle
+        }
         try p.run()
     }
 
@@ -492,7 +506,8 @@ final class AppState: ObservableObject {
             # Attesor Package Manager launch
             export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C \
                 XAUTHORITY="$HOME/.Xauthority" HOME=/root
-            mkdir -p "\(Repo.sysroot(named: prog.sysroot).path)/root"
+            mkdir -p "\(Repo.sysroot(named: prog.sysroot).path)/root" \
+                "\(Repo.root.path)/runtime/var/log"
             exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot(named: prog.sysroot).path)" \
                 "\(Repo.sysroot(named: prog.sysroot).path)\(prog.binary)"
             """
