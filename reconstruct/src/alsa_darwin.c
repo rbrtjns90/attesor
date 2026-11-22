@@ -242,18 +242,38 @@ static int alsa_dbg(void)
 static void alsa_callback(void *ctx, AudioQueueRef queue, AudioQueueBufferRef buf)
 {
     oah_alsa *d = ctx;
-    (void)queue;
+    int idx = -1, refill = 0;
     pthread_mutex_lock(&d->mu);
     for (int i = 0; i < NBUF; i++) {
         if (d->bufs[i] == buf) {
             d->in_flight[i] = 0;
             d->n_in_flight--;
             d->played += d->frag / d->frame;
+            idx = i;
             break;
         }
     }
-    pthread_cond_signal(&d->cv);
+    /* Refill the freed buffer straight from the staging area: otherwise
+     * staged frames count toward `written` but can strand when the writer
+     * sleeps — played then never advances and avail never reopens. */
+    if (idx >= 0 && d->stage_len >= d->frag) {
+        memcpy(buf->mAudioData, d->stage, d->frag);
+        buf->mAudioDataByteSize = (UInt32)d->frag;
+        memmove(d->stage, d->stage + d->frag, d->stage_len - d->frag);
+        d->stage_len -= d->frag;
+        refill = 1;
+    }
+    pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->mu);
+    if (refill) {
+        OSStatus st = AudioQueueEnqueueBuffer(queue, buf, 0, NULL);
+        pthread_mutex_lock(&d->mu);
+        if (st == noErr) {
+            d->in_flight[idx] = 1;
+            d->n_in_flight++;
+        }
+        pthread_mutex_unlock(&d->mu);
+    }
     if (alsa_dbg()) {
         fprintf(stderr, "alsa played=%llu inflight=%d\n",
                 (unsigned long long)d->played, d->n_in_flight);
@@ -329,6 +349,13 @@ static int alsa_queue_create(oah_alsa *d)
 /* Wait for a queue-buffer drain: each completion advances `played`, which
  * reopens avail for blocked writers. Releases the guest lock while
  * waiting — same rule as the flush wait below. */
+/* Frames committed but not yet played. played can pass written when a
+ * drain lands after a counter reset — clamp instead of underflowing. */
+static u64 alsa_delay(const oah_alsa *d)
+{
+    return d->played > d->written ? 0 : d->written - d->played;
+}
+
 static void alsa_wait(oah_alsa *d)
 {
     pthread_mutex_lock(&d->mu);
@@ -420,6 +447,10 @@ static void alsa_reset_counters(oah_alsa *d)
     for (int i = 0; i < NBUF; i++) {
         d->in_flight[i] = 0;
     }
+    /* Writers blocked on avail=0 must wake: counters just reopened all
+     * space, and no drain callback will ever signal them again (the
+     * queue was stopped/reset). */
+    pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->mu);
 }
 
@@ -756,9 +787,12 @@ static int alsa_hw_params_commit(oah_alsa *d, u8 *p)
         period < 32 || buf_size < period) {
         return -EINVAL;
     }
-    if (buf_size < period * periods) {
-        /* ALSA allows buffer_size >= period_size*periods is the common
-         * negotiation; accept caller-provided smaller ratios anyway */
+    if (buf_size < period * 16) {
+        /* Guests like SDL negotiate tiny buffers (~2 periods = 46ms),
+         * which leaves no slack against feed-thread stalls: the queue
+         * underruns to silence before the guest can refill. Floor the
+         * buffer so avail lets the guest run ahead. */
+        buf_size = period * 16;
     }
     d->fmt = fmt;
     d->rate = rate;
@@ -820,7 +854,7 @@ static s64 alsa_status(oah_image *img, oah_alsa *d, u64 arg)
     }
     memset(out, 0, 152);
     pthread_mutex_lock(&d->mu);
-    u64 delay = d->written - d->played;
+    u64 delay = alsa_delay(d);
     u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
     hp_set_u32(out, 0, (u32)d->state);           /* state */
     hp_set_u64(out, 40, d->written);             /* appl_ptr */
@@ -881,7 +915,7 @@ static s64 alsa_writei(oah_image *img, oah_alsa *d, u64 arg)
         u64 done = 0;
         while (done < x.frames) {
             pthread_mutex_lock(&d->mu);
-            u64 delay = d->written - d->played;
+            u64 delay = alsa_delay(d);
             u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
             pthread_mutex_unlock(&d->mu);
             if (!avail) {
@@ -1083,7 +1117,7 @@ s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
     case ALSA_PCM_DELAY: {
         if (!out) return -EFAULT;
         pthread_mutex_lock(&d->mu);
-        hp_set_u64(out, 0, d->written - d->played);
+        hp_set_u64(out, 0, alsa_delay(d));
         pthread_mutex_unlock(&d->mu);
         return 0;
     }
@@ -1146,7 +1180,7 @@ s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
         pthread_mutex_lock(&d->mu);
         hp_set_u32(sp, 8, (u32)d->state);
         hp_set_u64(sp, 16, d->played);
-        hp_set_u64(sp, 64, d->written - d->played);
+        hp_set_u64(sp, 64, alsa_delay(d));
         hp_set_u64(sp, 72, d->written);
         hp_set_u64(sp, 80, d->avail_min);
         pthread_mutex_unlock(&d->mu);
@@ -1183,7 +1217,7 @@ int oah_alsa_poll(int fd, int events)
         return P_POLLERR;
     }
     pthread_mutex_lock(&d->mu);
-    u64 delay = d->written - d->played;
+    u64 delay = alsa_delay(d);
     u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
     u64 need = d->avail_min;
     pthread_mutex_unlock(&d->mu);
@@ -1228,7 +1262,7 @@ s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
     u64 done = 0;
     while (done < frames) {
         pthread_mutex_lock(&d->mu);
-        u64 delay = d->written - d->played;
+        u64 delay = alsa_delay(d);
         u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
         pthread_mutex_unlock(&d->mu);
         u64 room = (d->stage_cap - d->stage_len) / d->frame;

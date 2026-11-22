@@ -404,7 +404,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         bool vector_66 = operand_override && (ext == 0x10 || ext == 0x11 ||
                          ext == 0x6e || ext == 0x7e || ext == 0x6c ||
                          ext == 0x12 || ext == 0x13 || ext == 0x16 || ext == 0x17 ||
-                         (ext >= 0x60 && ext <= 0x62) || (ext >= 0x68 && ext <= 0x6a) ||
+                         (ext >= 0x60 && ext <= 0x63) || (ext >= 0x68 && ext <= 0x6b) ||
                          (ext >= 0x64 && ext <= 0x67) || (ext >= 0x74 && ext <= 0x76) ||
                          (ext >= 0x54 && ext <= 0x57) || ext == 0x28 || ext == 0x29 || ext == 0x6d || (ext >= 0x70 && ext <= 0x73) ||
                          ext == 0xc4 || ext == 0xc5 || ext == 0xc6 ||

@@ -140,12 +140,35 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
     }
     switch (op) {
+    case 0x63: { /* packsswb: 8+8 words -> 16 bytes, signed saturate */
+        u8 packed[16];
+        for (unsigned i = 0; i < 16; i++) {
+            int16_t value;
+            memcpy(&value, (i < 8 ? xmm : other) + (i % 8) * 2, 2);
+            value = value < -128 ? -128 : value > 127 ? 127 : value;
+            packed[i] = (u8)value;
+        }
+        memcpy(xmm, packed, sizeof(packed));
+        break;
+    }
     case 0x67: {
         u8 packed[16];
         for (unsigned i = 0; i < 16; i++) {
             int16_t value;
             memcpy(&value, (i < 8 ? xmm : other) + (i % 8) * 2, 2);
             packed[i] = value < 0 ? 0 : value > 255 ? 255 : (u8)value;
+        }
+        memcpy(xmm, packed, sizeof(packed));
+        break;
+    }
+    case 0x6b: { /* packssdw: 4+4 dwords -> 8 words, signed saturate */
+        u8 packed[16];
+        for (unsigned i = 0; i < 8; i++) {
+            int32_t value;
+            memcpy(&value, (i < 4 ? xmm : other) + (i % 4) * 4, 4);
+            value = value < -32768 ? -32768 : value > 32767 ? 32767 : value;
+            int16_t narrowed = (int16_t)value;
+            memcpy(packed + i * 2, &narrowed, 2);
         }
         memcpy(xmm, packed, sizeof(packed));
         break;

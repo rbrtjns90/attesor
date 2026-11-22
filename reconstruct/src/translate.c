@@ -1318,6 +1318,10 @@ static bool emit_ld_rm128(oah_asm_buf *buf, const oah_guest *g,
 #define OAH_V_ZIP2(sz) (0x4e007800u | ((u32)(sz) << 22))
 #define OAH_V_UMIN     0x6e206c00u
 #define OAH_V_UMAX     0x6e206400u
+/* Signed saturating narrow: SQXTN writes the low lanes, SQXTN2 the high —
+ * together they match x86 packss* (dest narrows low, source high). */
+#define OAH_V_SQXTN(sz)  (0x0e214800u | ((u32)(sz) << 22))
+#define OAH_V_SQXTN2(sz) (0x4e214800u | ((u32)(sz) << 22))
 
 static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                                   const oah_insn *in, u64 next)
@@ -1369,6 +1373,18 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                emit_ld_rm128(buf, g, in, next, 17) &&
                oah_emit_vec3(buf, enc, 16, 16, 17) &&
                emit_st_xmm_reg(buf, g, 16, in->src, T4);
+    case 0x63:  /* packsswb: sat-narrow 8+8 words -> 16 bytes */
+    case 0x6b:  /* packssdw: sat-narrow 4+4 dwords -> 8 words */
+        {
+            u32 l2 = in->vector_opcode == 0x63 ? 0 : 1;
+            if (!emit_ld_xmm_reg(buf, g, 16, in->src, T4) ||
+                !emit_ld_rm128(buf, g, in, next, 17)) {
+                return false;
+            }
+            oah_asm_emit32(buf, OAH_V_SQXTN(l2) | (16u << 5) | 16);
+            oah_asm_emit32(buf, OAH_V_SQXTN2(l2) | (17u << 5) | 16);
+            return emit_st_xmm_reg(buf, g, 16, in->src, T4);
+        }
     case 0xda: enc = OAH_V_UMIN; goto alu;     /* pminub */
     case 0xde: enc = OAH_V_UMAX; goto alu;     /* pmaxub */
     case 0x71:  /* psrlw /2, psraw /4, psllw /6 */
