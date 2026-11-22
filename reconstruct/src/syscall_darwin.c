@@ -1080,12 +1080,19 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
         host_flags);
 }
 
-/* Guest-root emulation: inside a writable sysroot the guest presents uid/gid
- * 0 so package tools (dpkg, apt, maintainer scripts) behave; id-changing
- * calls become no-ops since the host user owns all sysroot files. */
+/* Guest-root emulation: a writable sysroot marked .attesor-guest-root
+ * presents uid/gid 0 so package tools (dpkg, apt, maintainer scripts)
+ * behave; id-changing calls become no-ops since the host user owns all
+ * sysroot files. Plain writable sysroots (e.g. freeciv) keep the host
+ * uid — some programs refuse to run as root. */
 static bool guest_root(const oah_image *img)
 {
-    return img->sysroot && sysroot_writable(img);
+    if (!img->sysroot || !sysroot_writable(img)) {
+        return false;
+    }
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/.attesor-guest-root", img->sysroot);
+    return access(marker, F_OK) == 0;
 }
 
 /* mkdir -p the parent chain of a resolved sysroot path: writes into FHS

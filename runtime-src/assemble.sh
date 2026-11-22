@@ -80,6 +80,9 @@ need "$runtime/sysroots/freeciv/usr/share/games/freeciv-attesor"
 # HOME=/root resolves inside the sysroot; without the writable marker every
 # guest mkdir/save there fails EROFS (freeciv's token dir, client rc, saves).
 touch "$runtime/sysroots/freeciv/.attesor-writable"
+# apt/dpkg must see uid 0; guest-root is a separate marker so writable
+# sysroots like freeciv keep the host uid (freeciv refuses to run as root).
+touch "$runtime/sysroots/debian-expanded/.attesor-guest-root" 2>/dev/null || true
 need "$runtime/sysroots/debian-expanded/usr/bin/true"
 need "$runtime/sysroots/debian-python/usr/bin/python3.11"
 need "$runtime/sysroots/debian-x11"

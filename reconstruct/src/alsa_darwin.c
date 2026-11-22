@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "oah/elf_map.h"
+#include "oah/syscall_bridge.h"
 #include "oah/types.h"
 
 /* Linux errno values that differ from or don't exist on Darwin. */
@@ -154,7 +155,11 @@
 #define IV_EMPTY   8
 
 #define MAX_ALSA 16
-#define NBUF 4
+#define NBUF 16
+/* Staging absorbs several periods so a guest writei can deposit a whole
+ * buffer's worth in one call; a one-period stage forces guests into tiny
+ * fragment writes — each an emulated-syscall round trip. */
+#define STAGE_PERIODS 32
 
 typedef struct {
     int fd;
@@ -174,7 +179,7 @@ typedef struct {
     int started;
     u64 written, played;      /* frames */
     u8 *stage;
-    size_t stage_len, frag;   /* frag = period bytes */
+    size_t stage_len, stage_cap, frag;   /* frag = period bytes */
     pthread_mutex_t mu;
     pthread_cond_t cv;
 } oah_alsa;
@@ -321,6 +326,23 @@ static int alsa_queue_create(oah_alsa *d)
     return 0;
 }
 
+/* Wait for a queue-buffer drain: each completion advances `played`, which
+ * reopens avail for blocked writers. Releases the guest lock while
+ * waiting — same rule as the flush wait below. */
+static void alsa_wait(oah_alsa *d)
+{
+    pthread_mutex_lock(&d->mu);
+    bool released = oah_darwin_has_workers();
+    if (released) {
+        oah_darwin_guest_leave();
+    }
+    pthread_cond_wait(&d->cv, &d->mu);
+    if (released) {
+        oah_darwin_guest_enter();
+    }
+    pthread_mutex_unlock(&d->mu);
+}
+
 /* Push staged bytes into queue buffers. Starts the queue once the
  * negotiated start_threshold of queued frames is reached. Blocks
  * while all buffers are in flight unless nonblock. */
@@ -345,7 +367,17 @@ static int alsa_flush(oah_alsa *d)
                 pthread_mutex_unlock(&d->mu);
                 return -LX_EAGAIN;
             }
+            /* Waiting on a free queue buffer must not hold the guest lock:
+             * the wait lasts a whole audio period and would freeze every
+             * other guest thread. */
+            bool released = oah_darwin_has_workers();
+            if (released) {
+                oah_darwin_guest_leave();
+            }
             pthread_cond_wait(&d->cv, &d->mu);
+            if (released) {
+                oah_darwin_guest_enter();
+            }
             pthread_mutex_unlock(&d->mu);
             continue;
         }
@@ -433,7 +465,14 @@ static int alsa_drain(oah_alsa *d)
     d->state = ALSA_ST_DRAINING;
     pthread_mutex_lock(&d->mu);
     while (d->n_in_flight > 0) {
+        bool released = oah_darwin_has_workers();
+        if (released) {
+            oah_darwin_guest_leave();
+        }
         pthread_cond_wait(&d->cv, &d->mu);
+        if (released) {
+            oah_darwin_guest_enter();
+        }
     }
     pthread_mutex_unlock(&d->mu);
     if (d->queue) {
@@ -504,7 +543,8 @@ int oah_alsa_open(const char *path, int flags)
     d->avail_min = 1024;
     d->state = ALSA_ST_OPEN;
     d->frag = 4096;
-    d->stage = malloc(d->frag);
+    d->stage_cap = d->frag * STAGE_PERIODS;
+    d->stage = malloc(d->stage_cap);
     d->nonblock = (flags & O_NONBLOCK) != 0;
     pthread_mutex_init(&d->mu, NULL);
     pthread_cond_init(&d->cv, NULL);
@@ -734,7 +774,8 @@ static int alsa_hw_params_commit(oah_alsa *d, u8 *p)
     }
     free(d->stage);
     d->frag = frag;
-    d->stage = malloc(d->frag);
+    d->stage_cap = frag * STAGE_PERIODS;
+    d->stage = malloc(d->stage_cap);
     if (!d->stage) {
         return -ENOMEM;
     }
@@ -819,49 +860,63 @@ static s64 alsa_writei(oah_image *img, oah_alsa *d, u64 arg)
         return -EIO;
     }
     {
-        pthread_mutex_lock(&d->mu);
-        u64 delay = d->written - d->played;
-        u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
-        pthread_mutex_unlock(&d->mu);
-        if (!avail) {
-            if (d->nonblock) {
-                x.result = -LX_EAGAIN;
-                goto put;
-            }
-            /* fall through: flush below will block on a free buffer */
-            avail = 1;
-        }
-        u64 frames = x.frames < avail ? x.frames : avail;
-        u64 room = (d->frag - d->stage_len) / d->frame;
-        if (frames > room) {
-            frames = room;
-            if (!frames) {
-                int rc = alsa_flush(d);
-                if (rc) {
-                    x.result = rc;
-                    goto put;
-                }
-                room = (d->frag - d->stage_len) / d->frame;
-                frames = x.frames < avail ? x.frames : avail;
-                if (frames > room) frames = room;
-            }
-        }
-        u64 want = frames * d->frame;
-        const void *src = oah_guest_access(img, x.buf, want, PROT_READ);
+        /* Blocking waits release the guest lock, so a pointer into guest
+         * memory can dangle — bounce like guest_blocking_io when other
+         * guest threads are live. */
+        bool bounce = oah_darwin_has_workers();
+        u64 nbytes = x.frames * d->frame;
+        const u8 *src = oah_guest_access(img, x.buf, nbytes, PROT_READ);
+        u8 *copy = NULL;
         if (!src) {
             return -EFAULT;
         }
-        memcpy(d->stage + d->stage_len, src, want);
-        d->stage_len += want;
-        d->written += frames;
-        int rc = alsa_flush(d);
-        if (rc == -LX_EAGAIN) {
-            x.result = frames ? (s64)frames : -LX_EAGAIN;
-        } else if (rc) {
-            return frames ? 0 : rc;
-        } else {
-            x.result = (s64)frames;
+        if (bounce) {
+            copy = malloc(nbytes);
+            if (!copy) {
+                return -ENOMEM;
+            }
+            memcpy(copy, src, nbytes);
+            src = copy;
         }
+        u64 done = 0;
+        while (done < x.frames) {
+            pthread_mutex_lock(&d->mu);
+            u64 delay = d->written - d->played;
+            u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
+            pthread_mutex_unlock(&d->mu);
+            if (!avail) {
+                if (d->nonblock) {
+                    x.result = done ? (s64)done : -LX_EAGAIN;
+                    goto putcopy;
+                }
+                alsa_wait(d);
+                continue;
+            }
+            u64 room = (d->stage_cap - d->stage_len) / d->frame;
+            if (!room) {
+                int rc = alsa_flush(d);
+                if (rc) {
+                    x.result = done ? (s64)done : rc;
+                    goto putcopy;
+                }
+                continue;
+            }
+            u64 n = x.frames - done;
+            if (n > avail) n = avail;
+            if (n > room) n = room;
+            memcpy(d->stage + d->stage_len, src + done * d->frame, n * d->frame);
+            d->stage_len += n * d->frame;
+            d->written += n;
+            done += n;
+            int rc = alsa_flush(d);
+            if (rc && rc != -LX_EAGAIN) {
+                x.result = done ? (s64)done : rc;
+                goto putcopy;
+            }
+        }
+        x.result = (s64)done;
+putcopy:
+        free(copy);
         goto put;
     }
 done0:
@@ -1153,49 +1208,60 @@ s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
         return -EIO;
     }
     u64 frames = len / d->frame;
-    const void *src = oah_guest_access(img, gva, frames * d->frame, PROT_READ);
+    /* Blocking waits below release the guest lock — bounce the guest
+     * buffer like guest_blocking_io when other guest threads are live. */
+    bool bounce = oah_darwin_has_workers();
+    const u8 *src = oah_guest_access(img, gva, frames * d->frame, PROT_READ);
+    u8 *copy = NULL;
     if (!src) {
         return -EFAULT;
     }
+    if (bounce) {
+        copy = malloc(frames * d->frame);
+        if (!copy) {
+            return -ENOMEM;
+        }
+        memcpy(copy, src, frames * d->frame);
+        src = copy;
+    }
+    s64 result = 0;
     u64 done = 0;
     while (done < frames) {
         pthread_mutex_lock(&d->mu);
         u64 delay = d->written - d->played;
         u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
         pthread_mutex_unlock(&d->mu);
-        if (!avail) {
+        u64 room = (d->stage_cap - d->stage_len) / d->frame;
+        u64 can = avail < room ? avail : room;
+        if (!can) {
             if (d->nonblock) {
-                return done ? (s64)(done * d->frame) : -LX_EAGAIN;
+                result = done ? (s64)(done * d->frame) : -LX_EAGAIN;
+                goto out;
             }
-            int rc = alsa_flush(d);
+            /* No counter-avail: wait for a drain to advance played.
+             * Avail but no stage room: flush pushes a period out. */
+            int rc = avail ? alsa_flush(d) : (alsa_wait(d), 0);
             if (rc) {
-                return done ? (s64)(done * d->frame) : rc;
+                result = done ? (s64)(done * d->frame) : rc;
+                goto out;
             }
             continue;
         }
-        u64 want = frames - done < avail ? frames - done : avail;
-        u64 room = (d->frag - d->stage_len) / d->frame;
-        if (want > room) {
-            want = room;
-            if (!want) {
-                int rc = alsa_flush(d);
-                if (rc) {
-                    return done ? (s64)(done * d->frame) : rc;
-                }
-                continue;
-            }
-        }
-        memcpy(d->stage + d->stage_len,
-               (const u8 *)src + done * d->frame, want * d->frame);
+        u64 want = frames - done < can ? frames - done : can;
+        memcpy(d->stage + d->stage_len, src + done * d->frame, want * d->frame);
         d->stage_len += want * d->frame;
         d->written += want;
         done += want;
         int rc = alsa_flush(d);
         if (rc && rc != -LX_EAGAIN) {
-            return done ? (s64)(done * d->frame) : rc;
+            result = done ? (s64)(done * d->frame) : rc;
+            goto out;
         }
     }
-    return (s64)(done * d->frame);
+    result = (s64)(done * d->frame);
+out:
+    free(copy);
+    return result;
 }
 
 #endif /* __APPLE__ */

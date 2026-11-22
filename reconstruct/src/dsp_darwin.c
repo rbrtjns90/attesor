@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "oah/elf_map.h"
+#include "oah/syscall_bridge.h"
 #include "oah/types.h"
 
 /* Linux errno values differ from Darwin's above ~32 (e.g. EAGAIN is
@@ -193,7 +194,16 @@ static int dsp_flush(oah_dsp *d)
                 pthread_mutex_unlock(&d->mu);
                 return -LX_EAGAIN;
             }
+            /* See alsa_darwin.c: a blocked audio wait must not hold the
+             * guest lock while other guest threads are live. */
+            bool released = oah_darwin_has_workers();
+            if (released) {
+                oah_darwin_guest_leave();
+            }
             pthread_cond_wait(&d->cv, &d->mu);
+            if (released) {
+                oah_darwin_guest_enter();
+            }
             pthread_mutex_unlock(&d->mu);
             continue;
         }
