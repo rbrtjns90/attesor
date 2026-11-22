@@ -1242,10 +1242,29 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
  * the guest's lifetime, so fragments materialize it as an immediate — this
  * works under every entry ABI (native trampoline, chain hops, C executor). */
 static bool oah_frag_sse;
+static u8 oah_sse_tab[256]; /* OAH_SSE_OPS comma-hex list, for bisection */
 
 void oah_translate_enable_sse(bool on)
 {
+    const char *ops;
     oah_frag_sse = on;
+    memset(oah_sse_tab, 1, sizeof(oah_sse_tab));
+    if (on && (ops = getenv("OAH_SSE_OPS")) != NULL) {
+        char *copy = strdup(ops), *tok = copy;
+        memset(oah_sse_tab, 0, sizeof(oah_sse_tab));
+        while (tok) {
+            char *comma = strchr(tok, ',');
+            u32 op;
+            if (comma) {
+                *comma = '\0';
+            }
+            if (sscanf(tok, "%x", &op) == 1 && op < 256) {
+                oah_sse_tab[op] = 1;
+            }
+            tok = comma ? comma + 1 : NULL;
+        }
+        free(copy);
+    }
 }
 
 /* hr = &g->xmm[idx]. The shadow base is emitted as a fixed-length
@@ -1421,11 +1440,11 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         }
     case 0x12:  /* movlpd xmm, m64 / movhlps xmm, xmm */
         if (!in->memory) {
-            /* movhlps: dst.d[0] = src.d[0] */
-            return emit_ld_xmm_reg(buf, g, 17, in->dst, T4) &&
-                   emit_ld_xmm_reg(buf, g, 16, in->src, T5) &&
-                   oah_emit_ins_elem(buf, 3, 16, 0, 17, 0) &&
-                   emit_st_xmm_reg(buf, g, 16, in->src, T5);
+            /* movhlps: dst.d[0] = src.d[1]; dst upper qword kept */
+            return emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
+                   emit_ld_xmm_reg(buf, g, 17, in->dst, T5) &&
+                   oah_emit_ins_elem(buf, 3, 16, 0, 17, 1) &&
+                   emit_st_xmm_reg(buf, g, 16, in->src, T4);
         }
         return emit_ea(buf, g, &in->address, next, T0) &&
                emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
@@ -1843,7 +1862,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             }
             break;
         case OAH_OP_VECTOR:
-            if (!oah_frag_sse ||
+            if (!oah_frag_sse || !oah_sse_tab[in.vector_opcode] ||
                 !frag_translate_vector(buf, g, &in, after)) {
                 boundary_interp = true;
             }

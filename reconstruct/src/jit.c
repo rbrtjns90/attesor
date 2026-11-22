@@ -965,8 +965,9 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
         return oah_jit_run_native(g, img, max_insns);
     }
     /* Cached fragments reach &g->xmm via an OAH_RELOC_XMMBASE immediate
-     * rebound at materialize time, so SSE translation is safe here. */
-    oah_translate_enable_sse(true);
+     * rebound at materialize time, so SSE translation is safe here.
+     * OAH_JIT_NOSSE keeps SSE in the interpreter for bisection. */
+    oah_translate_enable_sse(getenv("OAH_JIT_NOSSE") == NULL);
     if (aot) {
         jit_prewarm(img, g);
     }
