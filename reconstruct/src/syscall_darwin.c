@@ -1016,12 +1016,26 @@ int oah_dsp_open(int flags);
 int oah_dsp_close(int fd);
 s64 oah_dsp_write(oah_image *img, int fd, u64 gva, u64 len);
 s64 oah_dsp_ioctl(oah_image *img, int fd, u64 req, u64 arg);
+bool oah_alsa_owns(int fd);
+int oah_alsa_open(const char *path, int flags);
+int oah_alsa_close(int fd);
+s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len);
+s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg);
+void oah_alsa_note_flags(int fd, int host_flags);
 
 static int open_guest_path(oah_image *img, int dirfd, const char *path, int host_flags, u64 mode)
 {
     if (!strcmp(path, "/dev/dsp") || !strcmp(path, "/dev/sound/dsp") ||
         !strcmp(path, "/dev/audio") || !strcmp(path, "/dev/audio1")) {
         int fd = oah_dsp_open(host_flags);
+        if (fd >= 0) {
+            return fd;
+        }
+        errno = fd < -1 ? -fd : ENODEV;
+        return -1;
+    }
+    if (!strncmp(path, "/dev/snd/", 9)) {
+        int fd = oah_alsa_open(path, host_flags);
         if (fd >= 0) {
             return fd;
         }
@@ -3676,6 +3690,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         result = counter ? guest_eventfd_io(img, (int)a0, counter, a1, a2, nr == OAH_X86_NR_READ) :
                  oah_dsp_owns((int)a0) ? (nr == OAH_X86_NR_READ ? -EINVAL
                                        : oah_dsp_write(img, (int)a0, a1, a2)) :
+                 oah_alsa_owns((int)a0) ? (nr == OAH_X86_NR_READ ? -EINVAL
+                                        : oah_alsa_write(img, (int)a0, a1, a2)) :
                            guest_blocking_io(img, (int)a0, a1, a2, nr == OAH_X86_NR_READ, false, 0);
         break;
     }
@@ -3694,6 +3710,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         forget_readiness_fd((int)a0);
         untrack_fd_path((int)a0);
         result = oah_dsp_owns((int)a0) ? host_result(oah_dsp_close((int)a0))
+                 : oah_alsa_owns((int)a0) ? host_result(oah_alsa_close((int)a0))
                                       : host_result(close((int)a0));
         break;
     case 4: /* stat */
@@ -3821,6 +3838,10 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         if (oah_dsp_owns((int)a0)) {
             result = oah_dsp_ioctl(img, (int)a0, a1, a2);
+            break;
+        }
+        if (oah_alsa_owns((int)a0)) {
+            result = oah_alsa_ioctl(img, (int)a0, a1, a2);
             break;
         }
         if (a1 == 0x541b) { /* FIONREAD */
@@ -4659,6 +4680,9 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         } else if (a1 == 4) {
             int flags = (a2 & 0x400 ? O_APPEND : 0) | (a2 & 0x800 ? O_NONBLOCK : 0);
             result = host_result(fcntl((int)a0, F_SETFL, flags));
+            if (result >= 0 && oah_alsa_owns((int)a0)) {
+                oah_alsa_note_flags((int)a0, fcntl((int)a0, F_GETFL));
+            }
         } else if (a1 >= 5 && a1 <= 7) { /* F_GETLK, F_SETLK, F_SETLKW */
             struct { int16_t type, whence; int64_t start, len; int32_t pid; } guest_fl;
             const void *input = oah_guest_access(img, a2, sizeof(guest_fl), PROT_READ);

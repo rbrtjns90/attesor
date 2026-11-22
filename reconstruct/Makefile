@@ -52,7 +52,7 @@ EXEC_SRC = \
 LINUX_SRC = $(SRC) $(EXEC_SRC) src/syscall_bridge.c
 
 ifeq ($(HOST_OS),Darwin)
-HOST_SRC = $(SRC) $(EXEC_SRC) src/syscall_darwin.c src/dsp_darwin.c
+HOST_SRC = $(SRC) $(EXEC_SRC) src/syscall_darwin.c src/dsp_darwin.c src/alsa_darwin.c
 else
 HOST_SRC = $(LINUX_SRC)
 endif
