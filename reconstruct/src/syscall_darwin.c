@@ -3123,23 +3123,31 @@ static s64 guest_socket_mmessage(oah_image *img, int fd, u64 vec, u64 count,
             return ready < 0 ? linux_error(errno) : 0;
         }
     }
+    /* Linux MSG_WAITFORONE (0x10000) turns on MSG_DONTWAIT after the
+     * first received datagram; without it every entry uses the caller's
+     * flags verbatim. sendmmsg never gains MSG_DONTWAIT. A successful
+     * zero-length receive still counts as a message, and a copy-out
+     * fault after at least one entry reports the completed count. */
     u64 done = 0;
     for (; done < count; done++) {
         u64 entry = vec + done * 64;
-        s64 one = guest_socket_message(img, fd, entry,
-                                       flags | (done ? 0x40 : 0), receiving);
+        u64 per_flags = flags;
+        if (receiving) {
+            per_flags &= ~(u64)0x10000;
+            if (done && (flags & 0x10000)) {
+                per_flags |= 0x40;
+            }
+        }
+        s64 one = guest_socket_message(img, fd, entry, per_flags, receiving);
         if (one < 0) {
             return done ? (s64)done : one;
         }
         void *len_out = oah_guest_access(img, entry + 56, 4, PROT_WRITE);
         if (!len_out) {
-            return -EFAULT;
+            return done ? (s64)done : -EFAULT;
         }
         u32 sent = (u32)one;
         memcpy(len_out, &sent, sizeof(sent));
-        if (receiving && one == 0) {
-            break;
-        }
     }
     return (s64)done;
 }

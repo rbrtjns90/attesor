@@ -132,6 +132,7 @@ def main():
                 for fixture, expected in (
                     ("python_threads.py", b"six workers joined\n"),
                     ("python_readiness.py", b"epoll and eventfd readiness checks passed\n"),
+                    ("python_mmsg.py", b"mmsg semantics checks passed\n"),
                 ):
                     verify(runner, directory, f"Debian {fixture}",
                            ["--max-insns", "500000000", "--sysroot", str(root),
