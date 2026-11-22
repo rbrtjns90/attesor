@@ -1408,8 +1408,18 @@ static void tag_mapped_module(oah_image *img, u64 gva, u64 size, int fd)
 static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags, int fd, u64 offset)
 {
     flags &= ~(0x800ull | 0x20000ull); /* Linux MAP_DENYWRITE and MAP_STACK. */
+    /* Advisory flags we can safely ignore: MAP_32BIT (0x40),
+     * MAP_GROWSDOWN (0x100), MAP_LOCKED (0x2000), MAP_NORESERVE
+     * (0x4000), MAP_POPULATE (0x8000), MAP_NONBLOCK (0x10000).
+     * MAP_32BIT only constrains host address choice; the guest
+     * address space is ours anyway. */
+    flags &= ~(0x40ull | 0x100ull | 0x2000ull | 0x4000ull | 0x8000ull | 0x10000ull);
+    if ((flags & 0x3) == 0x3) {
+        /* MAP_SHARED_VALIDATE == MAP_SHARED for our purposes. */
+        flags = (flags & ~0x3ull) | 0x1;
+    }
     if (!size || size > (1ull << 30) || (prot & ~7ull) ||
-        (flags != 0x01 && flags != 0x21 &&
+        (flags != 0x01 && flags != 0x11 && flags != 0x21 && flags != 0x31 &&
          flags != 0x02 && flags != 0x12 && flags != 0x22 && flags != 0x32)) {
         return -EINVAL;
     }
