@@ -84,7 +84,8 @@ emit_terminal() {
 $MARK terminal — $bin
 A=$A
 S=$S
-export OAH_CACHE_DIR="\$A/runtime/var/cache/jit" LC_ALL=C
+export OAH_CACHE_DIR="\$A/runtime/var/cache/jit" LC_ALL=C \
+    XAUTHORITY="\$HOME/.Xauthority" HOME=/root
 exec "\$A/reconstruct/oah" --sysroot "\$S" "\$S$bin" "\$@"
 EOF
     chmod +x "$TERM_DIR/$name.command"
@@ -105,7 +106,8 @@ if ! ready; then
     i=0
     until ready; do i=\$((i+1)); [ \$i -lt 30 ] || exit 1; /bin/sleep 1; done
 fi
-export DISPLAY="\$display" LC_ALL=C OAH_CACHE_DIR="\$A/runtime/var/cache/jit"
+export DISPLAY="\$display" LC_ALL=C OAH_CACHE_DIR="\$A/runtime/var/cache/jit" \
+    XAUTHORITY="\$HOME/.Xauthority" HOME=/root
 exec "\$A/reconstruct/oah" --sysroot "\$S" "\$S$bin" "\$@"
 EOF
     chmod +x "$GUI_DIR/$name.command"

@@ -64,6 +64,8 @@ func launch(_ file: URL, requested: Mode) throws {
     let args = ["--max-insns", "1500000000", "--sysroot", root, executable.path]
     var env = ProcessInfo.processInfo.environment
     env["LC_ALL"] = "C"
+    env["HOME"] = "/root"
+    env["XAUTHORITY"] = NSHomeDirectory() + "/.Xauthority"
     if mode == .window {
         env["DISPLAY"] = ":0"
         env["XFILESEARCHPATH"] = root + "/etc/X11/app-defaults/%N"

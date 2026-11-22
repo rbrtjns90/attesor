@@ -196,6 +196,37 @@ void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
             return seg->host + (gva - seg->gva);
         }
     }
+    /* Accesses can straddle adjacent guest mappings (e.g. a 16-byte SSE
+     * store spanning two mmaps). Allow the range when every byte is
+     * covered and the host side is contiguous. */
+    if (img && len && gva + len > gva) {
+        u64 cur = gva, end = gva + len;
+        u8 *first = NULL;
+        while (cur < end) {
+            const oah_load_seg *seg = NULL;
+            for (unsigned i = 0; i < img->nseg; i++) {
+                const oah_load_seg *s = &img->segs[i];
+                if (cur >= s->gva && cur - s->gva < s->size &&
+                    (s->prot & prot) == prot) {
+                    seg = s;
+                    break;
+                }
+            }
+            if (!seg) {
+                break;
+            }
+            u8 *h = seg->host + (cur - seg->gva);
+            if (!first) {
+                first = h;
+            } else if (h != first + (cur - gva)) {
+                break;
+            }
+            cur = seg->gva + seg->size;
+        }
+        if (cur >= end && first) {
+            return first;
+        }
+    }
     if (getenv("OAH_SEG_DEBUG")) {
         fprintf(stderr, "access MISS gva=%llx len=%llu prot=%u nseg=%u heap=%p guard=%llx brk=%llx\n",
                 (unsigned long long)gva, (unsigned long long)len, prot,

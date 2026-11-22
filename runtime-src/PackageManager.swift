@@ -393,6 +393,8 @@ final class AppState: ObservableObject {
     private func launchGUI(_ prog: InstalledProgram) throws {
         var env = ProcessInfo.processInfo.environment
         env["LC_ALL"] = "C"
+        env["HOME"] = "/root"
+        env["XAUTHORITY"] = NSHomeDirectory() + "/.Xauthority"
         env["DISPLAY"] = ":0"
         env["OAH_CACHE_DIR"] = Repo.root.path + "/runtime/var/cache/jit"
         env["XFILESEARCHPATH"] = Repo.sysroot(named: prog.sysroot).path + "/etc/X11/app-defaults/%N"
@@ -435,7 +437,8 @@ final class AppState: ObservableObject {
         let script = """
             #!/bin/sh
             # Attesor Package Manager launch
-            export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C
+            export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C \
+                XAUTHORITY="$HOME/.Xauthority" HOME=/root
             exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot(named: prog.sysroot).path)" \
                 "\(Repo.sysroot(named: prog.sysroot).path)\(prog.binary)"
             """

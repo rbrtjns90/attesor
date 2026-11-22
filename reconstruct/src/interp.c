@@ -580,14 +580,62 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         break;
     }
     case 0xfc:
-    case 0xde:
     case 0xf8:
     case 0xda:
         for (unsigned i = 0; i < 16; i++) {
             unsigned sum = xmm[i] + other[i];
-            xmm[i] = op == 0xfc ? (u8)sum : op == 0xde ? (sum > 255 ? 255 : (u8)sum)
+            xmm[i] = op == 0xfc ? (u8)sum
                    : op == 0xf8 ? (u8)(xmm[i] - other[i])
                    : xmm[i] < other[i] ? xmm[i] : other[i];
+        }
+        break;
+    case 0xd8:              /* PSUBUSB */
+    case 0xdc:              /* PADDUSB */
+    case 0xde:              /* PMAXUB */
+    case 0xe0:              /* PAVGB */
+    case 0xe8:              /* PSUBSB */
+    case 0xec:              /* PADDSB */
+        for (unsigned i = 0; i < 16; i++) {
+            u8 a = xmm[i], b = other[i];
+            s32 r;
+            switch (op) {
+            case 0xd8: r = a > b ? a - b : 0; break;
+            case 0xdc: r = a + b; if (r > 255) r = 255; break;
+            case 0xde: r = a > b ? a : b; break;
+            case 0xe0: r = (a + b + 1) >> 1; break;
+            case 0xe8: r = (s8)a - (s8)b; r = r < -128 ? -128 : r > 127 ? 127 : r; break;
+            default:   r = (s8)a + (s8)b; r = r < -128 ? -128 : r > 127 ? 127 : r; break;
+            }
+            xmm[i] = (u8)r;
+        }
+        break;
+    case 0xd9:              /* PSUBUSW */
+    case 0xdd:              /* PADDUSW */
+    case 0xe3:              /* PAVGW */
+    case 0xe4:              /* PMULHUW */
+    case 0xe5:              /* PMULHW */
+    case 0xe9:              /* PSUBSW */
+    case 0xea:              /* PMINSW */
+    case 0xed:              /* PADDSW */
+    case 0xee:              /* PMAXSW */
+        for (unsigned i = 0; i < 16; i += 2) {
+            u16 a, b, w;
+            memcpy(&a, xmm + i, sizeof(a));
+            memcpy(&b, other + i, sizeof(b));
+            s32 r;
+            switch (op) {
+            case 0xd9: r = a > b ? a - b : 0; break;
+            case 0xdd: r = a + b; if (r > 65535) r = 65535; break;
+            case 0xe3: r = (a + b + 1) >> 1; break;
+            case 0xe4: r = ((u32)a * b) >> 16; break;
+            case 0xe5: r = ((s32)(s16)a * (s32)(s16)b) >> 16; break;
+            case 0xe9: r = (s16)a - (s16)b; r = r < -32768 ? -32768 : r > 32767 ? 32767 : r; break;
+            case 0xea: r = (s16)a < (s16)b ? a : b; break;
+            case 0xed: r = (s16)a + (s16)b; r = r < -32768 ? -32768 : r > 32767 ? 32767 : r; break;
+            default:   r = (s16)a > (s16)b ? a : b; break;
+            }
+            w = (u16)r;
+            memcpy(xmm + i, &w, sizeof(w));
         }
         break;
     case 0x57:
