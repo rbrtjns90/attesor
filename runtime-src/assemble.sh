@@ -77,6 +77,9 @@ need() { [ -e "$1" ] || { echo "assemble: MISSING payload: $1"; missing=1; }; }
 need "$runtime/sysroots/freeciv/usr/games/freeciv-sdl2"
 need "$runtime/sysroots/freeciv/usr/games/freeciv-server"
 need "$runtime/sysroots/freeciv/usr/share/games/freeciv-attesor"
+# HOME=/root resolves inside the sysroot; without the writable marker every
+# guest mkdir/save there fails EROFS (freeciv's token dir, client rc, saves).
+touch "$runtime/sysroots/freeciv/.attesor-writable"
 need "$runtime/sysroots/debian-expanded/usr/bin/true"
 need "$runtime/sysroots/debian-python/usr/bin/python3.11"
 need "$runtime/sysroots/debian-x11"

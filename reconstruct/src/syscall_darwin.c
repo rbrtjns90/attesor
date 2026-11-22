@@ -4638,6 +4638,10 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         result = !path ? -EFAULT : mr < 0 ? mr :
                  host_result(mkdirat(fd == -100 ? AT_FDCWD : fd,
                      mr ? mut : path, (mode_t)(nr == 83 ? a1 : a2)));
+        if (getenv("OAH_MKDIR_TRACE")) {
+            fprintf(stderr, "mkdir path=%s resolved=%s result=%lld\n",
+                    path ? path : "?", mr ? mut : path, (long long)result);
+        }
         break;
     }
     case 89: case 267: { /* readlink, readlinkat */
