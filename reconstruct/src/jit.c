@@ -780,7 +780,9 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
         }
         u64 val = r->kind == OAH_RELOC_GVA ? base + r->value
                   : r->kind == OAH_RELOC_FS ? g->fs_base
-                  : r->kind == OAH_RELOC_GS ? g->gs_base : ~(u64)0;
+                  : r->kind == OAH_RELOC_GS ? g->gs_base
+                  : r->kind == OAH_RELOC_XMMBASE
+                    ? (u64)(uintptr_t)&g->xmm[0][0] : ~(u64)0;
         if (val == ~(u64)0) {
             free(code);
             return NULL;
@@ -924,6 +926,9 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
     if (!jit_arena_init()) {
         return oah_jit_run_native(g, img, max_insns);
     }
+    /* Cached fragments reach &g->xmm via an OAH_RELOC_XMMBASE immediate
+     * rebound at materialize time, so SSE translation is safe here. */
+    oah_translate_enable_sse(true);
     if (aot) {
         jit_prewarm(img, g);
     }

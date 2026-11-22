@@ -557,3 +557,59 @@ bool oah_emit_mem(oah_asm_buf *buf, u32 size_log2, bool is_store,
     oah_asm_emit32(buf, base | (imm_bytes >> size_log2) << 10 | (u32)n << 5 | t);
     return true;
 }
+
+bool oah_emit_ldr_str_vec(oah_asm_buf *buf, bool is_store, bool is_q,
+                          u8 vt, oah_gpr rn, u32 imm_bytes)
+{
+    u8 n;
+    u32 shift = is_q ? 4 : 3;
+    if (vt > 31 || (imm_bytes & ((1u << shift) - 1u)) != 0 ||
+        imm_bytes > (0xfffu << shift) || !oah_gpr_to_num_sp(rn, &n)) {
+        return false;
+    }
+    oah_asm_emit32(buf, (is_q ? (is_store ? 0x3d800000u : 0x3dc00000u)
+                              : (is_store ? 0xfd000000u : 0xfd400000u)) |
+                            (imm_bytes >> shift) << 10 | (u32)n << 5 | vt);
+    return true;
+}
+
+bool oah_emit_vec3(oah_asm_buf *buf, u32 enc, u8 vd, u8 vn, u8 vm)
+{
+    if (vd > 31 || vn > 31 || vm > 31) {
+        return false;
+    }
+    oah_asm_emit32(buf, enc | (u32)vm << 16 | (u32)vn << 5 | vd);
+    return true;
+}
+
+bool oah_emit_ext16(oah_asm_buf *buf, u8 vd, u8 vn, u8 vm, u32 idx)
+{
+    if (vd > 31 || vn > 31 || vm > 31 || idx > 15) {
+        return false;
+    }
+    oah_asm_emit32(buf, 0x6e000000u | (u32)vm << 16 | (idx & 0xf) << 11 |
+                            (u32)vn << 5 | vd);
+    return true;
+}
+
+bool oah_emit_ins_gpr(oah_asm_buf *buf, u8 vd, u32 imm5, oah_gpr rn)
+{
+    u8 n;
+    if (vd > 31 || !oah_gpr_to_num(rn, &n)) {
+        return false;
+    }
+    oah_asm_emit32(buf, 0x4e001c00u | (imm5 & 0x1f) << 16 | (u32)n << 5 | vd);
+    return true;
+}
+
+bool oah_emit_umov_gpr(oah_asm_buf *buf, bool is_64, oah_gpr rd,
+                       u8 vn, u32 imm5)
+{
+    u8 d;
+    if (vn > 31 || !oah_gpr_to_num(rd, &d)) {
+        return false;
+    }
+    oah_asm_emit32(buf, (is_64 ? 0x4e003c00u : 0x0e003c00u) |
+                            (imm5 & 0x1f) << 16 | (u32)vn << 5 | d);
+    return true;
+}

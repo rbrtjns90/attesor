@@ -990,6 +990,206 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
     }
 }
 
+/* --- SSE -> NEON -----------------------------------------------------------
+ * Guest xmm state lives in g->xmm shadow memory at a fixed host address for
+ * the guest's lifetime, so fragments materialize it as an immediate — this
+ * works under every entry ABI (native trampoline, chain hops, C executor). */
+static bool oah_frag_sse;
+
+void oah_translate_enable_sse(bool on)
+{
+    oah_frag_sse = on;
+}
+
+/* hr = &g->xmm[idx]. The shadow base is emitted as a fixed-length
+ * immediate recorded with OAH_RELOC_XMMBASE so persisted fragments are
+ * rebound to the live guest at materialize time. */
+static bool emit_xmm_ptr(oah_asm_buf *buf, const oah_guest *g, u8 hr, u8 idx)
+{
+    if (idx > 15) {
+        return false;
+    }
+    return emit_reloc_imm(buf, hr, (u64)&g->xmm[0][0],
+                          OAH_RELOC_XMMBASE) &&
+           (idx == 0 || oah_emit_add_sub_imm(buf, true, false, hr, hr,
+                                             (u32)idx * 16));
+}
+
+static bool emit_ld_xmm_reg(oah_asm_buf *buf, const oah_guest *g, u8 v,
+                                 u8 idx, u8 hr)
+{
+    return emit_xmm_ptr(buf, g, hr, idx) &&
+           oah_emit_ldr_str_vec(buf, false, true, v, hr, 0);
+}
+
+static bool emit_st_xmm_reg(oah_asm_buf *buf, const oah_guest *g, u8 v,
+                                 u8 idx, u8 hr)
+{
+    return emit_xmm_ptr(buf, g, hr, idx) &&
+           oah_emit_ldr_str_vec(buf, true, true, v, hr, 0);
+}
+
+/* rm-side operand -> v (v16/v17 vector temps): memory EA or xmm[in->dst]. */
+static bool emit_ld_rm128(oah_asm_buf *buf, const oah_guest *g,
+                          const oah_insn *in, u64 next, u8 v)
+{
+    if (in->memory) {
+        return emit_ea(buf, g, &in->address, next, T0) &&
+               oah_emit_ldr_str_vec(buf, false, true, v, T0, 0);
+    }
+    return emit_ld_xmm_reg(buf, g, v, in->dst, T4);
+}
+
+/* Three-same vector encodings (Q=1). ADD/SUB/CMEQ element size goes in
+ * bits 23..22: b=0, h=1, s=2, d=3. */
+#define OAH_V_EOR  0x6e201c00u
+#define OAH_V_ORR  0x4ea01c00u
+#define OAH_V_AND  0x4e201c00u
+#define OAH_V_ADD(sz)  (0x4e208400u | ((u32)(sz) << 22))
+#define OAH_V_SUB(sz)  (0x6e208400u | ((u32)(sz) << 22))
+#define OAH_V_CMEQ(sz) (0x6e208c00u | ((u32)(sz) << 22))
+#define OAH_V_ZIP1_2D  0x4ec03800u
+#define OAH_V_ZIP2_2D  0x4ec07800u
+
+static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
+                                  const oah_insn *in, u64 next)
+{
+    u32 enc = 0;
+    switch (in->vector_opcode) {
+    case 0x6f:  /* movdqa/movdqu xmm, r/m128 */
+    case 0x10:  /* movups/movupd load */
+    case 0x28:  /* movaps load */
+        return emit_ld_rm128(buf, g, in, next, 16) &&
+               emit_st_xmm_reg(buf, g, 16, in->src, T4);
+    case 0x7f:  /* movdqa/movdqu r/m128, xmm */
+    case 0x11:  /* movups/movupd store */
+    case 0x29:  /* movaps store */
+        if (!emit_ld_xmm_reg(buf, g, 16, in->src, T4)) {
+            return false;
+        }
+        if (in->memory) {
+            return emit_ea(buf, g, &in->address, next, T0) &&
+                   oah_emit_ldr_str_vec(buf, true, true, 16, T0, 0);
+        }
+        return emit_st_xmm_reg(buf, g, 16, in->dst, T5);
+    case 0xef: enc = OAH_V_EOR;     goto alu;  /* pxor */
+    case 0xeb: enc = OAH_V_ORR;     goto alu;  /* por */
+    case 0xdb: enc = OAH_V_AND;     goto alu;  /* pand */
+    case 0xf8: enc = OAH_V_SUB(0);  goto alu;  /* psubb */
+    case 0xf9: enc = OAH_V_SUB(1);  goto alu;  /* psubw */
+    case 0xfa: enc = OAH_V_SUB(2);  goto alu;  /* psubd */
+    case 0xfb: enc = OAH_V_SUB(3);  goto alu;  /* psubq */
+    case 0xd4: enc = OAH_V_ADD(3);  goto alu;  /* paddq */
+    case 0x74: enc = OAH_V_CMEQ(0); goto alu;  /* pcmpeqb */
+    case 0x75: enc = OAH_V_CMEQ(1); goto alu;  /* pcmpeqw */
+    case 0x76: enc = OAH_V_CMEQ(2); goto alu;  /* pcmpeqd */
+    alu:
+        return emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
+               emit_ld_rm128(buf, g, in, next, 17) &&
+               oah_emit_vec3(buf, enc, 16, 16, 17) &&
+               emit_st_xmm_reg(buf, g, 16, in->src, T4);
+    case 0x6c:  /* punpcklqdq */
+    case 0x6d:  /* punpckhqdq */
+        return emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
+               emit_ld_rm128(buf, g, in, next, 17) &&
+               oah_emit_vec3(buf, in->vector_opcode == 0x6d ?
+                                 OAH_V_ZIP2_2D : OAH_V_ZIP1_2D,
+                             16, 16, 17) &&
+               emit_st_xmm_reg(buf, g, 16, in->src, T4);
+    case 0x73:  /* psrldq /2, pslldq /7 (imm byte) */
+        if (in->memory || (in->cc != 2 && in->cc != 7)) {
+            return false;
+        }
+        {
+            u32 k = (u32)in->imm;
+            if (!emit_ld_xmm_reg(buf, g, 16, in->dst, T4) ||
+                !oah_emit_vec3(buf, OAH_V_EOR, 18, 18, 18)) {
+                return false;
+            }
+            if (k <= 15) {
+                u32 ok = in->cc == 2 ?
+                    oah_emit_ext16(buf, 16, 16, 18, k) :
+                    oah_emit_ext16(buf, 16, 18, 16, 16 - k);
+                if (!ok) {
+                    return false;
+                }
+            } else if (!oah_emit_vec3(buf, OAH_V_EOR, 16, 16, 16)) {
+                return false;
+            }
+            return emit_st_xmm_reg(buf, g, 16, in->dst, T4);
+        }
+    case 0x16:  /* movhpd xmm, m64 */
+        if (!in->memory) {
+            return false;
+        }
+        return emit_ea(buf, g, &in->address, next, T0) &&
+               emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
+               oah_emit_mem(buf, 3, false, false, false, T6, T0, 0) &&
+               oah_emit_ins_gpr(buf, 16, 0x18, T6) &&
+               emit_st_xmm_reg(buf, g, 16, in->src, T4);
+    case 0x17:  /* movhpd m64, xmm */
+        if (!in->memory) {
+            return false;
+        }
+        return emit_ea(buf, g, &in->address, next, T0) &&
+               emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
+               oah_emit_umov_gpr(buf, true, T6, 16, 0x18) &&
+               oah_emit_mem(buf, 3, true, false, false, T6, T0, 0);
+    case 0x7a:  /* movq xmm, xmm64/m64 (f3 0f 7e): zero-extend low qword */
+        if (!oah_emit_vec3(buf, OAH_V_EOR, 16, 16, 16)) {
+            return false;
+        }
+        {
+            bool ok;
+            if (in->memory) {
+                ok = emit_ea(buf, g, &in->address, next, T0) &&
+                     oah_emit_mem(buf, 3, false, false, false, T6, T0, 0);
+            } else {
+                ok = emit_xmm_ptr(buf, g, T4, in->dst) &&
+                     oah_emit_ldr_str_uoff(buf, false, T6, T4, 0);
+            }
+            return ok && oah_emit_ins_gpr(buf, 16, 0x08, T6) &&
+                   emit_st_xmm_reg(buf, g, 16, in->src, T4);
+        }
+    case 0x6e:  /* movd xmm, r/m32 */
+        if (!oah_emit_vec3(buf, OAH_V_EOR, 16, 16, 16)) {
+            return false;
+        }
+        {
+            bool w64 = in->opsize == 8;
+            bool ok;
+            if (in->memory) {
+                ok = emit_ea(buf, g, &in->address, next, T0) &&
+                     oah_emit_mem(buf, w64 ? 3 : 2, false, false, w64,
+                                  T6, T0, 0);
+            } else {
+                ok = emit_read_gpr(buf, T6, in->dst, in->opsize,
+                                   in->rex_present);
+            }
+            return ok &&
+                   oah_emit_ins_gpr(buf, 16, w64 ? 0x08 : 0x04, T6) &&
+                   emit_st_xmm_reg(buf, g, 16, in->src, T4);
+        }
+    case 0x7e:  /* movd r/m, xmm (66 0f 7e) */
+        {
+            bool w64 = in->opsize == 8;
+            if (!emit_ld_xmm_reg(buf, g, 16, in->src, T4) ||
+                !oah_emit_umov_gpr(buf, w64, T6, 16, w64 ? 0x08 : 0x04)) {
+                return false;
+            }
+            if (in->memory) {
+                return emit_ea(buf, g, &in->address, next, T0) &&
+                       oah_emit_mem(buf, w64 ? 3 : 2, true, false, false,
+                                    T6, T0, 0);
+            }
+            return emit_store_gpr(buf, in->dst, T6, in->opsize,
+                                  in->rex_present);
+        }
+    default:
+        return false;
+    }
+}
+
 bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                         u64 rip, oah_frag_info *info)
 {
@@ -1022,6 +1222,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         bool done = false;
         bool boundary_interp = false;
         u64 insn_start = buf->size;
+        u32 reloc_start = info->nrelocs;
+        u32 reloc_overflow_start = info->reloc_overflow;
 
         /* Bisect aid: OAH_JIT_NOSTORE sends every memory-writing insn to the
          * interpreter so store-emit bugs can be isolated. */
@@ -1270,6 +1472,12 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                 done = true;
             }
             break;
+        case OAH_OP_VECTOR:
+            if (!oah_frag_sse ||
+                !frag_translate_vector(buf, g, &in, after)) {
+                boundary_interp = true;
+            }
+            break;
         default:
             boundary_interp = true;
             break;
@@ -1277,8 +1485,11 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
 
         if (boundary_interp) {
             /* End the fragment: x20 = cur (this insn runs under interp).
-             * Drop whatever the aborted case body emitted. */
+             * Drop whatever the aborted case body emitted, including any
+             * relocs recorded before it failed. */
             buf->size = insn_start;
+            info->nrelocs = reloc_start;
+            info->reloc_overflow = reloc_overflow_start;
             if (getenv("OAH_JIT_TRACE")) {
                 fprintf(stderr, "  boundary %llx op=%d sc=%d w=%d imm=%d b0=%02x b1=%02x b2=%02x mem=%d\n",
                         (unsigned long long)cur, in.op, in.scalar,

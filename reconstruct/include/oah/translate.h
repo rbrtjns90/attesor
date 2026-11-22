@@ -59,7 +59,8 @@ typedef struct {
     u64 value; /* GVA: guest absolute address emitted */
 } oah_frag_reloc;
 
-enum { OAH_RELOC_GVA = 0, OAH_RELOC_FS = 1, OAH_RELOC_GS = 2 };
+enum { OAH_RELOC_GVA = 0, OAH_RELOC_FS = 1, OAH_RELOC_GS = 2,
+       OAH_RELOC_XMMBASE = 3 };
 #define OAH_FRAG_MAX_RELOCS 24
 
 typedef struct {
@@ -75,6 +76,11 @@ typedef struct {
 
 bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                         u64 rip, oah_frag_info *info);
+
+/* Gate SSE translation: callers enable it only for entry ABIs where the
+ * xmm shadow address emitted via OAH_RELOC_XMMBASE stays valid at run
+ * time (i.e. the guest object outlives its cached fragments). */
+void oah_translate_enable_sse(bool on);
 
 /* Dispatcher: pack GPRs, translate+interpret fragments until guest exit. */
 oah_interp_result oah_jit_run(oah_guest *g, oah_image *img, u64 max_insns);

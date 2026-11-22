@@ -193,3 +193,23 @@ bool oah_emit_orn(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
 #endif
 
 #endif /* OAH_ASSEMBLER_H */
+
+/* SIMD&FP LDR/STR (unsigned offset). is_q: 128-bit (imm scaled 16),
+ * else 64-bit (scaled 8). vt is a raw vector register number 0..31. */
+bool oah_emit_ldr_str_vec(oah_asm_buf *buf, bool is_store, bool is_q,
+                          u8 vt, oah_gpr rn, u32 imm_bytes);
+
+/* Three-same integer vector op: enc supplies the Q/size/opcode fields;
+ * vd/vn/vm are raw vector register numbers. */
+bool oah_emit_vec3(oah_asm_buf *buf, u32 enc, u8 vd, u8 vn, u8 vm);
+
+/* EXT .16b: vd = bytes (vn:vm) starting at idx (0..15). */
+bool oah_emit_ext16(oah_asm_buf *buf, u8 vd, u8 vn, u8 vm, u32 idx);
+
+/* INS (vector element from general register): imm5 encodes element
+ * size+index: b=(i<<1)|1, h=(i<<2)|2, s=(i<<3)|4, d=(i<<4)|8. */
+bool oah_emit_ins_gpr(oah_asm_buf *buf, u8 vd, u32 imm5, oah_gpr rn);
+
+/* UMOV (vector element to general register). imm5 as above. */
+bool oah_emit_umov_gpr(oah_asm_buf *buf, bool is_64, oah_gpr rd,
+                       u8 vn, u32 imm5);
