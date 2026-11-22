@@ -150,10 +150,19 @@ typedef struct {
     u32 flags;
     u32 code_off;
     u32 code_len;
+    u32 stub_off; /* checkpoint stub; chained exits branch here */
     u32 nexits;
     u32 exit_off[2];
     u64 exit_rip[2];
 } oah_frag_entry;
+
+/* Chain accounting: a patched exit branches to the target's stub,
+ * which adds the target's guest-insn count to acc and continues the
+ * chain while acc <= limit; otherwise it rets to the dispatcher.
+ * This bounds every native entry to at most `limit` guest insns so
+ * the budget check and signal poll in the dispatch loop still run. */
+static struct { u64 acc, limit; } chain_ctl;
+#define OAH_CHAIN_WINDOW (64u << 10) /* guest insns between checkpoints */
 
 void oah_jit_native_enter(u64 *x, const void *code);
 
@@ -629,16 +638,62 @@ static void pcache_flush(oah_image *img)
     }
 }
 
+/* Emit a chain checkpoint stub at `at` for a fragment whose code starts
+ * at arena offset `target_off`. Chained exits branch to the stub; it
+ * charges frag_insns to chain_ctl.acc and either tails into the
+ * fragment or rets to the dispatcher when over the window. Uses only
+ * x16/x17/x21/x22, all free-clobber per the fragment register contract.
+ * Returns bytes written (<= OAH_STUB_SIZE). */
+#define OAH_STUB_SIZE 48
+static u32 jit_emit_stub(u8 *at, u32 frag_insns, u32 target_off)
+{
+    u64 pc = (u64)(uintptr_t)at;
+    u64 base = (u64)(uintptr_t)&chain_ctl;
+    u32 *w = (u32 *)at;
+    int n = 0;
+    s64 pdelta = ((s64)(base & ~0xfffull) - (s64)(pc & ~0xfffull)) >> 12;
+    if (pdelta >= -(1 << 20) && pdelta < (1 << 20)) {
+        w[n++] = 0x90000010u | (((u32)pdelta & 3) << 29) |
+                 ((((u32)pdelta >> 2) & 0x7ffff) << 5); /* adrp x16 */
+        w[n++] = 0x91000210u | ((u32)(base & 0xfff) << 10); /* add x16,lo */
+    } else {
+        /* Arena too far from .bss for adrp: materialize the address. */
+        w[n++] = 0xd2800010u | ((u32)(base & 0xffff) << 5);     /* movz */
+        w[n++] = 0xf2a00010u | ((u32)((base >> 16) & 0xffff) << 5);
+        w[n++] = 0xf2c00010u | ((u32)((base >> 32) & 0xffff) << 5);
+        w[n++] = 0xf2e00010u | ((u32)((base >> 48) & 0xffff) << 5);
+    }
+    w[n++] = 0xf9400211u;                          /* ldr x17, [x16] (acc) */
+    if (frag_insns <= 4095) {
+        w[n++] = 0x91000231u | (frag_insns << 10); /* add x17, x17, #insns */
+    } else {
+        if (frag_insns > 65535) {
+            frag_insns = 65535;
+        }
+        w[n++] = 0xd2800016u | (frag_insns << 5);  /* movz x22, #insns */
+        w[n++] = 0x8b160231u;                      /* add x17, x17, x22 */
+    }
+    w[n++] = 0xf9400615u;                          /* ldr x21, [x16,#8] */
+    w[n++] = 0xeb15023fu;                          /* cmp x17, x21 */
+    w[n++] = 0x54000068u;                          /* b.hi +12 -> ret */
+    w[n++] = 0xf9000211u;                          /* str x17, [x16] */
+    s64 diff = ((s64)((u64)(uintptr_t)jit_arena + target_off)
+                - (s64)(pc + (u64)n * 4)) >> 2;
+    w[n++] = 0x14000000u | ((u32)diff & 0x3ffffff); /* b fragment */
+    w[n++] = 0xd65f03c0u;                          /* ret (bail) */
+    return (u32)n * 4;
+}
+
 /* Copy code into the executable arena and index it. Shared by translation,
  * AOT prewarm, and persistent-cache materialization. */
 static const oah_frag_entry *jit_install(u64 rip, const oah_frag_info *info,
                                          const u8 *code, size_t code_len)
 {
-    if (code_len > jit_arena_size - jit_arena_used) {
+    if (code_len + OAH_STUB_SIZE > jit_arena_size - jit_arena_used) {
         /* Arena full: drop everything and retranslate on demand. */
         oah_jit_cache_flush();
     }
-    if (code_len > jit_arena_size) {
+    if (code_len + OAH_STUB_SIZE > jit_arena_size) {
         return NULL;
     }
     oah_frag_entry e = {
@@ -647,6 +702,7 @@ static const oah_frag_entry *jit_install(u64 rip, const oah_frag_info *info,
         .flags = info->interp_next ? OAH_FRAG_FALLBACK : 0,
         .code_off = (u32)jit_arena_used,
         .code_len = (u32)code_len,
+        .stub_off = (u32)jit_arena_used + (u32)code_len,
         .nexits = info->nexits > 2 ? 0 : info->nexits,
     };
     for (u32 i = 0; i < e.nexits; i++) {
@@ -655,9 +711,11 @@ static const oah_frag_entry *jit_install(u64 rip, const oah_frag_info *info,
     }
     pthread_jit_write_protect_np(0);
     memcpy(jit_arena + jit_arena_used, code, code_len);
+    u32 stub_len = jit_emit_stub(jit_arena + e.stub_off,
+                                 e.insns ? e.insns : 1, e.code_off);
     pthread_jit_write_protect_np(1);
-    sys_icache_invalidate(jit_arena + jit_arena_used, code_len);
-    jit_arena_used += code_len;
+    sys_icache_invalidate(jit_arena + jit_arena_used, code_len + stub_len);
+    jit_arena_used += code_len + stub_len;
     jit_insert(&e);
     return jit_lookup(rip);
 }
@@ -898,7 +956,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             for (u32 i = 0; i < chain_prev->nexits; i++) {
                 if (chain_prev->exit_off[i] &&
                     chain_prev->exit_rip[i] == frag->rip) {
-                    jit_chain_patch(chain_prev, i, frag->code_off);
+                    jit_chain_patch(chain_prev, i, frag->stub_off);
                 }
             }
         }
@@ -906,11 +964,17 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
         oah_pack_runtime_x(ctx, g);
         ctx[16] = g->rflags;
         ctx[17] = g->rip;
+        /* Bounded chaining: every native entry runs at most
+         * OAH_CHAIN_WINDOW (or the remaining budget) guest insns
+         * before returning for accounting and signal polling. */
+        chain_ctl.acc = 0;
+        u64 room = budget > r.insns ? budget - r.insns : 0;
+        chain_ctl.limit = room > OAH_CHAIN_WINDOW ? OAH_CHAIN_WINDOW : room;
         oah_jit_native_enter(ctx, jit_arena + frag->code_off);
         oah_unpack_runtime_x(g, ctx);
         g->rflags = ctx[16];
         g->rip = ctx[17];
-        r.insns += frag->insns;
+        r.insns += frag->insns + chain_ctl.acc;
 
 #if defined(__APPLE__)
         oah_darwin_guest_tick(g);
