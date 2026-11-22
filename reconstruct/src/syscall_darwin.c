@@ -976,8 +976,24 @@ static int guest_lockable_fd(int fd, int host_flags)
     return rw;
 }
 
+/* /dev/dsp OSS emulation over CoreAudio (src/dsp_darwin.c). */
+bool oah_dsp_owns(int fd);
+int oah_dsp_open(int flags);
+int oah_dsp_close(int fd);
+s64 oah_dsp_write(oah_image *img, int fd, u64 gva, u64 len);
+s64 oah_dsp_ioctl(oah_image *img, int fd, u64 req, u64 arg);
+
 static int open_guest_path(oah_image *img, int dirfd, const char *path, int host_flags, u64 mode)
 {
+    if (!strcmp(path, "/dev/dsp") || !strcmp(path, "/dev/sound/dsp") ||
+        !strcmp(path, "/dev/audio") || !strcmp(path, "/dev/audio1")) {
+        int fd = oah_dsp_open(host_flags);
+        if (fd >= 0) {
+            return fd;
+        }
+        errno = fd < -1 ? -fd : ENODEV;
+        return -1;
+    }
     if (sysroot_path(img, path)) {
         bool writing = (host_flags & O_ACCMODE) != O_RDONLY ||
                        (host_flags & (O_CREAT | O_TRUNC));
@@ -3433,6 +3449,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         guest_eventfd *counter = eventfd_for_fd((int)a0);
         result = counter ? guest_eventfd_io(img, (int)a0, counter, a1, a2, nr == OAH_X86_NR_READ) :
+                 oah_dsp_owns((int)a0) ? (nr == OAH_X86_NR_READ ? -EINVAL
+                                       : oah_dsp_write(img, (int)a0, a1, a2)) :
                            guest_blocking_io(img, (int)a0, a1, a2, nr == OAH_X86_NR_READ, false, 0);
         break;
     }
@@ -3450,7 +3468,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         forget_directory((int)a0);
         forget_readiness_fd((int)a0);
         untrack_fd_path((int)a0);
-        result = host_result(close((int)a0));
+        result = oah_dsp_owns((int)a0) ? host_result(oah_dsp_close((int)a0))
+                                      : host_result(close((int)a0));
         break;
     case 4: /* stat */
     case 6: /* lstat */
@@ -3572,6 +3591,10 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 16: { /* ioctl */
         if (eventfd_for_fd((int)a0)) {
             result = -ENOTTY;
+            break;
+        }
+        if (oah_dsp_owns((int)a0)) {
+            result = oah_dsp_ioctl(img, (int)a0, a1, a2);
             break;
         }
         if (a1 == 0x541b) { /* FIONREAD */
@@ -4435,6 +4458,23 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                 memcpy(output, values, sizeof(values));
             }
             result = 0;
+        }
+        break;
+    }
+    case 319: { /* memfd_create: anonymous file-backed fd, mmap-able */
+        static _Atomic int mfd_seq;
+        char shm_name[64];
+        snprintf(shm_name, sizeof(shm_name), "/attesor-mfd-%d-%d",
+                 getpid(), mfd_seq++);
+        int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) {
+            result = linux_error(errno);
+        } else {
+            shm_unlink(shm_name);
+            if (a1 & 1) { /* MFD_CLOEXEC */
+                fcntl(fd, F_SETFD, FD_CLOEXEC);
+            }
+            result = fd;
         }
         break;
     }
