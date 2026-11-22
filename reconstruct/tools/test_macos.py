@@ -68,6 +68,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--hello", type=Path, required=True)
+    parser.add_argument("--sse", type=Path)
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -91,6 +92,13 @@ def main():
                    (0, b"hello\n", b""))
             cache_matrix(runner, directory, "static Linux hello",
                          [str(args.hello.resolve())], (0, b"hello\n", b""))
+            if args.sse:
+                sse_expected = (0, args.sse.with_suffix(
+                    args.sse.suffix + ".expected").read_bytes(), b"")
+                verify(runner, directory, "SSE guest vector ops",
+                       [str(args.sse.resolve())], sse_expected)
+                cache_matrix(runner, directory, "SSE guest vector ops",
+                             [str(args.sse.resolve())], sse_expected)
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,
