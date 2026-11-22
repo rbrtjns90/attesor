@@ -25,6 +25,15 @@ struct Repo {
         return URL(fileURLWithPath: "/Users/rob/Documents/GitHub/attesor")
     }()
     static var sysroot: URL { root.appendingPathComponent("runtime/sysroots/debian-expanded") }
+    static var sysroots: [URL] {
+        let dir = root.appendingPathComponent("runtime/sysroots")
+        return ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { !$0.hasPrefix(".") }
+            .map { dir.appendingPathComponent($0) }
+    }
+    static func sysroot(named name: String) -> URL {
+        root.appendingPathComponent("runtime/sysroots/\(name)")
+    }
     static var oah: URL { root.appendingPathComponent("reconstruct/oah") }
     static var installer: URL { root.appendingPathComponent("runtime-src/apt-install.sh") }
     static var updater: URL { root.appendingPathComponent("runtime-src/apt-update.sh") }
@@ -38,10 +47,11 @@ struct Repo {
 // MARK: - Models
 
 struct InstalledProgram: Identifiable, Hashable {
-    var id: String { binary }
+    var id: String { "\(sysroot)|\(binary)" }
     let name: String      // display name (from .desktop, else basename)
     let binary: String    // guest path, e.g. /usr/games/cowsay
-    let package: String
+    let package: String   // dpkg package, empty for hand-built sysroots
+    let sysroot: String   // sysroot dir name, e.g. "debian-expanded"
     let isGUI: Bool
 }
 
@@ -148,73 +158,121 @@ final class AppState: ObservableObject {
     }
 
     /// GUI = executable named by a .desktop file (no Terminal=true, not
-    /// hidden); everything else in a bin dir is a terminal program.
-    /// Mirrors runtime-src/sync-programs.sh.
+    /// hidden) or, in hand-built sysroots, a binary linked against
+    /// graphics libraries; everything else in a bin dir is terminal.
+    /// Scans every sysroot under runtime/sysroots — debian-expanded is
+    /// dpkg-managed, the others (freeciv, debian-x11, debian-python) are
+    /// scanned by bin-dir contents instead.
     static func loadInstalled() -> ([InstalledProgram], [InstalledProgram]) {
         let fm = FileManager.default
-        var guiBins: [String: String] = [:]   // binary -> display name
-        if let desks = try? fm.contentsOfDirectory(atPath: Repo.applications.path) {
-            for file in desks where file.hasSuffix(".desktop") {
-                let url = Repo.applications.appendingPathComponent(file)
-                guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-                var name = "", exec = "", hidden = false, term = false, nodisplay = false
-                for line in text.split(separator: "\n") {
-                    if line.hasPrefix("Name=") && name.isEmpty { name = String(line.dropFirst(5)) }
-                    if line.hasPrefix("Exec=") && exec.isEmpty { exec = String(line.dropFirst(5)) }
-                    if line.hasPrefix("Hidden=") { hidden = line.contains("true") }
-                    if line.hasPrefix("Terminal=") { term = line.contains("true") }
-                    if line.hasPrefix("NoDisplay=") { nodisplay = line.contains("true") }
-                }
-                guard !hidden && !term && !nodisplay && !exec.isEmpty else { continue }
-                // First exec token, %-codes stripped, env wrappers skipped.
-                var tokens = exec.replacingOccurrences(of: "%[a-zA-Z]", with: "",
-                                     options: .regularExpression)
-                    .split(separator: " ").map(String.init)
-                while let first = tokens.first,
-                      (first == "env" || first.contains("=") || first.hasPrefix("-")) {
-                    tokens.removeFirst()
-                }
-                guard var bin = tokens.first else { continue }
-                if !bin.hasPrefix("/") {
-                    // Bare command name: resolve against the bin dirs.
-                    let found = ["/usr/bin", "/usr/games", "/usr/local/bin",
-                                 "/usr/sbin", "/bin", "/sbin"]
-                        .first { fm.isExecutableFile(atPath: Repo.sysroot.path + $0 + "/" + bin) }
-                    guard let found else { continue }
-                    bin = found + "/" + bin
-                }
-                guard fm.isExecutableFile(atPath: Repo.sysroot.path + bin) else { continue }
-                guiBins[bin] = name.isEmpty ? URL(fileURLWithPath: bin).lastPathComponent : name
-            }
-        }
-        let bindirs = ["/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/games/", "/bin/", "/sbin/"]
+        let binDirs = ["/usr/bin", "/usr/sbin", "/usr/local/bin",
+                       "/usr/games", "/bin", "/sbin"]
         var gui: [InstalledProgram] = []
         var term: [InstalledProgram] = []
-        guard let lists = try? fm.contentsOfDirectory(atPath: Repo.dpkgInfo.path) else { return ([], []) }
-        for file in lists where file.hasSuffix(".list") {
-            let pkg = String(file.dropLast(5))
-                .components(separatedBy: ":").first ?? String(file.dropLast(5))
-            guard let text = try? String(contentsOf: Repo.dpkgInfo.appendingPathComponent(file),
-                                         encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n") {
-                let path = String(line)
-                guard bindirs.contains(where: { path.hasPrefix($0) }),
-                      !path.hasSuffix("/"),
-                      path.components(separatedBy: "/").count <= 4 else { continue }
-                let full = Repo.sysroot.path + path
-                var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue,
-                      fm.isExecutableFile(atPath: full) else { continue }
-                if let display = guiBins[path] {
-                    gui.append(InstalledProgram(name: display, binary: path,
-                                                package: pkg, isGUI: true))
-                } else {
-                    term.append(InstalledProgram(name: URL(fileURLWithPath: path).lastPathComponent,
-                                                 binary: path, package: pkg, isGUI: false))
+
+        for root in Repo.sysroots {
+            let sname = root.lastPathComponent
+            // .desktop files -> GUI set (binary -> display name)
+            var guiBins: [String: String] = [:]
+            let appsDir = root.appendingPathComponent("usr/share/applications")
+            if let desks = try? fm.contentsOfDirectory(atPath: appsDir.path) {
+                for file in desks where file.hasSuffix(".desktop") {
+                    let url = appsDir.appendingPathComponent(file)
+                    guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                    var name = "", exec = "", hidden = false, term = false, nodisplay = false
+                    for line in text.split(separator: "\n") {
+                        if line.hasPrefix("Name=") && name.isEmpty { name = String(line.dropFirst(5)) }
+                        if line.hasPrefix("Exec=") && exec.isEmpty { exec = String(line.dropFirst(5)) }
+                        if line.hasPrefix("Hidden=") { hidden = line.contains("true") }
+                        if line.hasPrefix("Terminal=") { term = line.contains("true") }
+                        if line.hasPrefix("NoDisplay=") { nodisplay = line.contains("true") }
+                    }
+                    guard !hidden && !term && !nodisplay && !exec.isEmpty else { continue }
+                    var tokens = exec.replacingOccurrences(of: "%[a-zA-Z]", with: "",
+                                         options: .regularExpression)
+                        .split(separator: " ").map(String.init)
+                    while let first = tokens.first,
+                          (first == "env" || first.contains("=") || first.hasPrefix("-")) {
+                        tokens.removeFirst()
+                    }
+                    guard var bin = tokens.first else { continue }
+                    if !bin.hasPrefix("/") {
+                        let found = binDirs.first {
+                            fm.isExecutableFile(atPath: root.path + $0 + "/" + bin)
+                        }
+                        guard let found else { continue }
+                        bin = found + "/" + bin
+                    }
+                    guard fm.isExecutableFile(atPath: root.path + bin) else { continue }
+                    guiBins[bin] = name.isEmpty
+                        ? URL(fileURLWithPath: bin).lastPathComponent : name
+                }
+            }
+
+            let info = root.appendingPathComponent("var/lib/dpkg/info")
+            if let lists = try? fm.contentsOfDirectory(atPath: info.path) {
+                // dpkg-managed sysroot: every packaged executable in a bin dir.
+                for file in lists where file.hasSuffix(".list") {
+                    let base = String(file.dropLast(5))
+                    let pkg = base.components(separatedBy: ":").first ?? base
+                    guard let text = try? String(
+                        contentsOf: info.appendingPathComponent(file), encoding: .utf8)
+                    else { continue }
+                    for line in text.split(separator: "\n") {
+                        let path = String(line)
+                        guard binDirs.contains(where: { path.hasPrefix($0 + "/") }),
+                              !path.hasSuffix("/"),
+                              path.components(separatedBy: "/").count <= 4 else { continue }
+                        let full = root.path + path
+                        var isDir: ObjCBool = false
+                        guard fm.fileExists(atPath: full, isDirectory: &isDir),
+                              !isDir.boolValue, fm.isExecutableFile(atPath: full) else { continue }
+                        if let display = guiBins[path] {
+                            gui.append(InstalledProgram(name: display, binary: path,
+                                                        package: pkg, sysroot: sname, isGUI: true))
+                        } else {
+                            term.append(InstalledProgram(
+                                name: URL(fileURLWithPath: path).lastPathComponent,
+                                binary: path, package: pkg, sysroot: sname, isGUI: false))
+                        }
+                    }
+                }
+            } else {
+                // Hand-built sysroot: scan bin dirs directly; GUI if a
+                // .desktop names it or it links graphics libraries.
+                for dir in binDirs {
+                    guard let items = try? fm.contentsOfDirectory(atPath: root.path + dir)
+                    else { continue }
+                    for item in items {
+                        let path = dir + "/" + item
+                        let full = root.path + path
+                        var isDir: ObjCBool = false
+                        guard fm.fileExists(atPath: full, isDirectory: &isDir),
+                              !isDir.boolValue, fm.isExecutableFile(atPath: full) else { continue }
+                        let display = guiBins[path]
+                        let graphical = display != nil || looksGraphical(full)
+                        let entry = InstalledProgram(
+                            name: display ?? item, binary: path,
+                            package: "", sysroot: sname, isGUI: graphical)
+                        if graphical { gui.append(entry) } else { term.append(entry) }
+                    }
                 }
             }
         }
         return (gui.sorted { $0.name < $1.name }, term.sorted { $0.name < $1.name })
+    }
+
+    /// True when an ELF links a graphics library (same list Launcher.swift
+    /// uses). Uses llvm-objdump via xcrun when available.
+    static func looksGraphical(_ path: String) -> Bool {
+        guard let data = pipeOut("/usr/bin/xcrun", ["llvm-objdump", "-p", path]),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        let graphics = ["libX11", "libXaw", "libXt.", "libxcb", "libgtk", "libgdk",
+                        "libQt", "libSDL", "libglfw", "libGL.", "libEGL", "libvulkan",
+                        "libwayland-client"]
+        return text.split(separator: "\n").contains { line in
+            line.contains("NEEDED") && graphics.contains { line.contains($0) }
+        }
     }
 
     /// Decompress an index file. .xz via xz/python3, .gz via gunzip,
@@ -312,9 +370,10 @@ final class AppState: ObservableObject {
     }
 
     func uninstall(_ prog: InstalledProgram) async {
-        let dpkg = Repo.sysroot.path + "/usr/bin/dpkg"
+        let root = Repo.sysroot(named: prog.sysroot).path
+        let dpkg = root + "/usr/bin/dpkg"
         let rc = await run(Repo.oah.path,
-                           ["--sysroot", Repo.sysroot.path, dpkg, "-r", prog.package],
+                           ["--sysroot", root, dpkg, "-r", prog.package],
                            env: ["DEBIAN_FRONTEND": "noninteractive",
                                  "OAH_CACHE_DIR": Repo.root.path + "/runtime/var/cache/jit"],
                            title: "Removing \(prog.package)")
@@ -336,7 +395,7 @@ final class AppState: ObservableObject {
         env["LC_ALL"] = "C"
         env["DISPLAY"] = ":0"
         env["OAH_CACHE_DIR"] = Repo.root.path + "/runtime/var/cache/jit"
-        env["XFILESEARCHPATH"] = Repo.sysroot.path + "/etc/X11/app-defaults/%N"
+        env["XFILESEARCHPATH"] = Repo.sysroot(named: prog.sysroot).path + "/etc/X11/app-defaults/%N"
         guard FileManager.default.isExecutableFile(atPath: "/opt/X11/bin/xdpyinfo") else {
             throw LaunchError(message: "Install XQuartz to run graphical Linux applications.")
         }
@@ -355,8 +414,8 @@ final class AppState: ObservableObject {
         }
         let p = Process()
         p.executableURL = Repo.oah
-        p.arguments = ["--sysroot", Repo.sysroot.path,
-                       Repo.sysroot.path + prog.binary]
+        let root = Repo.sysroot(named: prog.sysroot).path
+        p.arguments = ["--sysroot", root, root + prog.binary]
         p.environment = env
         try p.run()
     }
@@ -377,8 +436,8 @@ final class AppState: ObservableObject {
             #!/bin/sh
             # Attesor Package Manager launch
             export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C
-            exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot.path)" \
-                "\(Repo.sysroot.path)\(prog.binary)"
+            exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot(named: prog.sysroot).path)" \
+                "\(Repo.sysroot(named: prog.sysroot).path)\(prog.binary)"
             """
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("Attesor-\(prog.name).command")
@@ -402,7 +461,7 @@ struct ProgramRow: View {
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 2) {
                 Text(prog.name).font(.body)
-                Text("\(prog.binary)  ·  \(prog.package)")
+                Text("\(prog.binary)  ·  \(prog.package.isEmpty ? prog.sysroot : prog.package)")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -412,8 +471,10 @@ struct ProgramRow: View {
         .padding(.vertical, 2)
         .contextMenu {
             Button("Launch", action: onLaunch)
-            Divider()
-            Button("Remove \(prog.package)…", role: .destructive, action: onRemove)
+            if !prog.package.isEmpty {
+                Divider()
+                Button("Remove \(prog.package)…", role: .destructive, action: onRemove)
+            }
         }
     }
 }
