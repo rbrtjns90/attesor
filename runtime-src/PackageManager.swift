@@ -326,7 +326,7 @@ final class AppState: ObservableObject {
 
     /// Decompress an index file. .xz via xz/python3, .gz via gunzip,
     /// .lz4 via lz4 if present, uncompressed read directly.
-    static func decodeIndex(_ url: URL) -> Data? {
+    nonisolated static func decodeIndex(_ url: URL) -> Data? {
         let path = url.path
         if path.hasSuffix(".lz4") {
             for tool in ["/opt/homebrew/bin/lz4", "/usr/local/bin/lz4"]
@@ -352,7 +352,7 @@ final class AppState: ObservableObject {
         return try? Data(contentsOf: url)
     }
 
-    static func pipeOut(_ tool: String, _ args: [String], stdin: Data? = nil) -> Data? {
+    nonisolated static func pipeOut(_ tool: String, _ args: [String], stdin: Data? = nil) -> Data? {
         let p = Process(), out = Pipe(), err = Pipe()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
@@ -466,6 +466,10 @@ final class AppState: ObservableObject {
         let p = Process()
         p.executableURL = Repo.oah
         let root = Repo.sysroot(named: prog.sysroot).path
+        // HOME=/root points into the sysroot; ensure it exists so guests
+        // doing level-by-level mkdir (freeciv's saves dir) succeed.
+        try? FileManager.default.createDirectory(atPath: root + "/root",
+                                                 withIntermediateDirectories: true)
         p.arguments = ["--sysroot", root, root + prog.binary]
         p.environment = env
         try p.run()
@@ -488,6 +492,7 @@ final class AppState: ObservableObject {
             # Attesor Package Manager launch
             export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C \
                 XAUTHORITY="$HOME/.Xauthority" HOME=/root
+            mkdir -p "\(Repo.sysroot(named: prog.sysroot).path)/root"
             exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot(named: prog.sysroot).path)" \
                 "\(Repo.sysroot(named: prog.sysroot).path)\(prog.binary)"
             """

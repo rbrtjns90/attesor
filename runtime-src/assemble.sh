@@ -50,7 +50,9 @@ chmod +x "$runtime/sync-programs.sh"
 mkdir -p "$apps/Attesor Package Manager.app/Contents/MacOS" \
          "$apps/Attesor Package Manager.app/Contents/Resources"
 echo "assemble: compiling PackageManager.swift"
-swiftc -O -parse-as-library -o \
+# -swift-version 5: the file predates strict concurrency; Swift 6 mode
+# turns its main-actor calls into hard errors.
+swiftc -O -parse-as-library -swift-version 5 -o \
     "$apps/Attesor Package Manager.app/Contents/MacOS/PackageManager" \
     "$src/PackageManager.swift" || die "swiftc failed"
 cp "$src/apps/Attesor Package Manager.plist" \

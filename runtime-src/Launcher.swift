@@ -61,6 +61,10 @@ func launch(_ file: URL, requested: Mode) throws {
         throw LaunchError(message: "Attesor or its Debian sysroot was moved. Keep the Apps and sysroots folders together under Attesor.")
     }
     recordLaunch(executable)
+    // HOME=/root points into the sysroot; make sure it exists or guests
+    // doing level-by-level mkdir (freeciv's saves dir) fail at the top.
+    try? FileManager.default.createDirectory(atPath: root + "/root",
+                                             withIntermediateDirectories: true)
     let args = ["--max-insns", "18446744073709551615", "--sysroot", root, executable.path]
     var env = ProcessInfo.processInfo.environment
     env["LC_ALL"] = "C"
