@@ -195,6 +195,8 @@ static guest_child **child_link(pid_t pid)
     return link;
 }
 
+static void guest_fork_child_cleanup(void);
+
 static void forget_child(pid_t pid)
 {
     guest_child **link = child_link(pid);
@@ -231,6 +233,7 @@ static s64 guest_fork(void)
         }
         host_alarm_pending = host_child_pending = 0;
         posix_timer_created = false;
+        guest_fork_child_cleanup();
     } else {
         *entry = (guest_child){pid, children};
         children = entry;
@@ -534,6 +537,19 @@ typedef struct guest_futex_waiter {
 } guest_futex_waiter;
 
 static guest_futex_waiter *futex_waiters;
+
+/* The parent's guest threads do not exist in a forked child: drop their
+ * bookkeeping so the single-threaded child can fork and exec, and rebuild
+ * the guest lock since a dead thread may have held it at the moment of
+ * fork. Re-acquire it because the calling thread's syscall path still runs
+ * under the lock. */
+static void guest_fork_child_cleanup(void)
+{
+    workers = 0;
+    futex_waiters = NULL;
+    pthread_mutex_init(&guest_lock, NULL);
+    pthread_mutex_lock(&guest_lock);
+}
 
 static s64 guest_futex_wake(u64 address, u32 count, u32 bits)
 {
@@ -2707,21 +2723,17 @@ static void forget_readiness_fd(int fd)
     forget_eventfd(fd);
 }
 
-static bool readiness_can_exec(void)
+/* Emulated fds cannot survive execve: the new process builds a fresh guest
+ * fd table, and a carried-over kqueue or eventfd pair would just be a stray
+ * host fd. Mark them close-on-exec instead of refusing the exec. */
+static void readiness_prepare_exec(void)
 {
     for (epoll_descriptor *entry = epolls; entry; entry = entry->next) {
-        int flags = fcntl(entry->fd, F_GETFD);
-        if (flags >= 0 && !(flags & FD_CLOEXEC)) {
-            return false;
-        }
+        fcntl(entry->fd, F_SETFD, FD_CLOEXEC);
     }
     for (eventfd_descriptor *entry = eventfds; entry; entry = entry->next) {
-        int flags = fcntl(entry->fd, F_GETFD);
-        if (flags >= 0 && !(flags & FD_CLOEXEC)) {
-            return false;
-        }
+        fcntl(entry->fd, F_SETFD, FD_CLOEXEC);
     }
-    return true;
 }
 
 typedef struct guest_dir {
@@ -4129,14 +4141,10 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             result = guest_clone_thread(g, img, a0, a1, a2, a3, a4);
             break;
         }
-        /* epoll/eventfd descriptors copy into the child harmlessly; only a
-         * real guest thread would make fork's single-threaded child state
-         * inconsistent. */
-        if (workers) {
-            result = -LINUX_ENOSYS;
-            break;
-        }
-        /* CLONE_VM (0x100) is safe to ignore when the child execs or exits
+        /* epoll/eventfd descriptors copy into the child harmlessly, and
+         * guest threads are cleaned up in guest_fork's child path; fork from
+         * a threaded process is required for spawn-style execvp.
+         * CLONE_VM (0x100) is safe to ignore when the child execs or exits
          * quickly; CLONE_VFORK (0x4000) gets the release-fd treatment like a
          * real vfork. glibc posix_spawn uses VM|VFORK|SIGCHLD and may pass a
          * stack pointer — the forked child keeps its existing stack, which
@@ -4169,7 +4177,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         break;
     case 57: case 58: /* fork, vfork */
-        result = workers ? -LINUX_ENOSYS : nr == 58 ? guest_vfork() : guest_fork();
+        result = nr == 58 ? guest_vfork() : guest_fork();
         if (getenv("OAH_EXEC_TRACE")) {
             fprintf(stderr, "[exec-trace] nr=%llu result=%lld workers=%u epolls=%p eventfds=%p\n",
                     (unsigned long long)nr, (long long)result, workers,
@@ -4177,12 +4185,14 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         }
         break;
     case 59:
-        result = workers || !readiness_can_exec() ? -LINUX_ENOSYS : guest_exec(img, a0, a1, a2);
+        /* execve ends every guest thread but the caller; the host execve
+         * does the same to their pthreads, so a live workers count is fine. */
+        readiness_prepare_exec();
+        result = guest_exec(img, a0, a1, a2);
         if (getenv("OAH_EXEC_TRACE")) {
             const char *exec_path = guest_path(img, a0);
-            fprintf(stderr, "[exec-trace] execve path=%s result=%lld workers=%u can_exec=%d\n",
-                    exec_path ? exec_path : "?", (long long)result, workers,
-                    (int)readiness_can_exec());
+            fprintf(stderr, "[exec-trace] execve path=%s result=%lld workers=%u\n",
+                    exec_path ? exec_path : "?", (long long)result, workers);
         }
         break;
     case 61: { /* wait4 */
