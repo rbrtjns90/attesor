@@ -12,6 +12,7 @@
 #if defined(__APPLE__)
 #include <limits.h>
 #include <mach-o/dyld.h>
+extern char **environ;
 #endif
 
 static void usage(const char *argv0)
@@ -220,6 +221,25 @@ int main(int argc, char **argv, char **envp)
     img.instruction_limit = instruction_limit;
     if (_NSGetExecutablePath(executable, &executable_size) == 0 && realpath(executable, launcher)) {
         img.launcher = launcher;
+    }
+    /* Sensible Linux defaults when the ambient env is a host env
+     * (Finder/Launcher launches). A macOS PATH lacks /usr/games, so
+     * execvp-style helpers like freeciv-server can't be found.
+     * Explicit --guest-exec env vectors are left alone. setenv may
+     * relocate environ, so envp is re-synced after the calls. */
+    if (!exec_path) {
+        const char *gp = getenv("PATH");
+        if (!gp || !strstr(gp, "/usr/games")) {
+            char np[2048];
+            snprintf(np, sizeof(np),
+                     "%s:/usr/local/bin:/usr/games:/usr/local/games",
+                     gp && *gp ? gp : "/usr/bin:/bin");
+            setenv("PATH", np, 1);
+        }
+        if (!getenv("SDL_AUDIODRIVER")) {
+            setenv("SDL_AUDIODRIVER", "alsa", 0);
+        }
+        envp = environ;
     }
 #endif
 
