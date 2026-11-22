@@ -195,16 +195,17 @@ static int dsp_flush(oah_dsp *d)
                 return -LX_EAGAIN;
             }
             /* See alsa_darwin.c: a blocked audio wait must not hold the
-             * guest lock while other guest threads are live. */
+             * guest lock while other guest threads are live. Lock order:
+             * drop d->mu before reacquiring the guest lock. */
             bool released = oah_darwin_has_workers();
             if (released) {
                 oah_darwin_guest_leave();
             }
             pthread_cond_wait(&d->cv, &d->mu);
+            pthread_mutex_unlock(&d->mu);
             if (released) {
                 oah_darwin_guest_enter();
             }
-            pthread_mutex_unlock(&d->mu);
             continue;
         }
         memcpy(d->bufs[idx]->mAudioData, d->stage, d->frag);

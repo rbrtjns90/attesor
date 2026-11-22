@@ -171,6 +171,8 @@ typedef struct {
     u64 start_threshold, avail_min;
     int state;
     int nonblock;
+    int closing;      /* set once at close; in-flight ops bail out */
+    int inflight;     /* ops holding this device open for deferred teardown */
     /* AudioQueue output */
     AudioQueueRef queue;
     AudioQueueBufferRef bufs[NBUF];
@@ -217,15 +219,43 @@ bool oah_alsa_owns(int fd)
     return yes;
 }
 
+/* Pin a device for the duration of an op: close() marks it closing and
+ * defers teardown until inflight drains to zero. */
+static oah_alsa *alsa_acquire(int fd)
+{
+    pthread_mutex_lock(&table_mu);
+    table_init();
+    oah_alsa *d = alsa_for(fd);
+    if (d) {
+        pthread_mutex_lock(&d->mu);
+        if (d->closing) {
+            d = NULL;
+        } else {
+            d->inflight++;
+        }
+        pthread_mutex_unlock(&d->mu);
+    }
+    pthread_mutex_unlock(&table_mu);
+    return d;
+}
+
+static void alsa_release(oah_alsa *d)
+{
+    pthread_mutex_lock(&d->mu);
+    if (--d->inflight == 0) {
+        pthread_cond_broadcast(&d->cv);
+    }
+    pthread_mutex_unlock(&d->mu);
+}
+
 /* Reflect host-side O_NONBLOCK changes (guest fcntl F_SETFL). */
 void oah_alsa_note_flags(int fd, int host_flags)
 {
-    pthread_mutex_lock(&table_mu);
-    oah_alsa *d = alsa_for(fd);
+    oah_alsa *d = alsa_acquire(fd);
     if (d) {
         d->nonblock = (host_flags & O_NONBLOCK) != 0;
+        alsa_release(d);
     }
-    pthread_mutex_unlock(&table_mu);
 }
 
 static int alsa_dbg(void)
@@ -256,7 +286,7 @@ static void alsa_callback(void *ctx, AudioQueueRef queue, AudioQueueBufferRef bu
     /* Refill the freed buffer straight from the staging area: otherwise
      * staged frames count toward `written` but can strand when the writer
      * sleeps — played then never advances and avail never reopens. */
-    if (idx >= 0 && d->stage_len >= d->frag) {
+    if (idx >= 0 && !d->closing && d->stage_len >= d->frag) {
         memcpy(buf->mAudioData, d->stage, d->frag);
         buf->mAudioDataByteSize = (UInt32)d->frag;
         memmove(d->stage, d->stage + d->frag, d->stage_len - d->frag);
@@ -284,6 +314,9 @@ static int alsa_queue_create(oah_alsa *d)
 {
     if (d->queue) {
         return 0;
+    }
+    if (d->closing) {
+        return -EIO;
     }
     AudioStreamBasicDescription fmt = {0};
     unsigned bits;
@@ -356,18 +389,27 @@ static u64 alsa_delay(const oah_alsa *d)
     return d->played > d->written ? 0 : d->written - d->played;
 }
 
-static void alsa_wait(oah_alsa *d)
+/* Returns -EIO when the device is closing. Lock order: never acquire the
+ * guest lock while holding d->mu — a syscall holding the guest lock may
+ * legitimately take d->mu (status/poll), so d->mu drops first. */
+static int alsa_wait(oah_alsa *d)
 {
     pthread_mutex_lock(&d->mu);
+    if (d->closing) {
+        pthread_mutex_unlock(&d->mu);
+        return -EIO;
+    }
     bool released = oah_darwin_has_workers();
     if (released) {
         oah_darwin_guest_leave();
     }
     pthread_cond_wait(&d->cv, &d->mu);
+    int closing = d->closing;
+    pthread_mutex_unlock(&d->mu);
     if (released) {
         oah_darwin_guest_enter();
     }
-    pthread_mutex_unlock(&d->mu);
+    return closing ? -EIO : 0;
 }
 
 /* Push staged bytes into queue buffers. Starts the queue once the
@@ -402,10 +444,14 @@ static int alsa_flush(oah_alsa *d)
                 oah_darwin_guest_leave();
             }
             pthread_cond_wait(&d->cv, &d->mu);
+            int closing = d->closing;
+            pthread_mutex_unlock(&d->mu);
             if (released) {
                 oah_darwin_guest_enter();
             }
-            pthread_mutex_unlock(&d->mu);
+            if (closing) {
+                return -EIO;
+            }
             continue;
         }
         memcpy(d->bufs[idx]->mAudioData, d->stage, d->frag);
@@ -495,14 +541,20 @@ static int alsa_drain(oah_alsa *d)
 {
     d->state = ALSA_ST_DRAINING;
     pthread_mutex_lock(&d->mu);
-    while (d->n_in_flight > 0) {
+    while (d->n_in_flight > 0 && !d->closing) {
         bool released = oah_darwin_has_workers();
         if (released) {
             oah_darwin_guest_leave();
         }
         pthread_cond_wait(&d->cv, &d->mu);
+        int closing = d->closing;
+        pthread_mutex_unlock(&d->mu);
         if (released) {
             oah_darwin_guest_enter();
+        }
+        pthread_mutex_lock(&d->mu);
+        if (closing) {
+            break;
         }
     }
     pthread_mutex_unlock(&d->mu);
@@ -590,11 +642,22 @@ int oah_alsa_open(const char *path, int flags)
 int oah_alsa_close(int fd)
 {
     pthread_mutex_lock(&table_mu);
+    table_init();
     oah_alsa *d = alsa_for(fd);
     if (!d) {
         pthread_mutex_unlock(&table_mu);
         return -1;
     }
+    pthread_mutex_lock(&d->mu);
+    d->closing = 1;
+    /* Writers blocked on the queue wake and bail; teardown waits until
+     * every in-flight op has left so no one touches freed resources —
+     * or a destroyed mutex/cond. */
+    pthread_cond_broadcast(&d->cv);
+    while (d->inflight > 0) {
+        pthread_cond_wait(&d->cv, &d->mu);
+    }
+    pthread_mutex_unlock(&d->mu);
     if (d->queue) {
         AudioQueueStop(d->queue, false);
         AudioQueueDispose(d->queue, true);
@@ -914,33 +977,40 @@ static s64 alsa_writei(oah_image *img, oah_alsa *d, u64 arg)
         }
         u64 done = 0;
         while (done < x.frames) {
+            /* avail/room/stage all share d->mu with the drain callback. */
             pthread_mutex_lock(&d->mu);
             u64 delay = alsa_delay(d);
             u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
+            u64 room = (d->stage_cap - d->stage_len) / d->frame;
+            u64 n = x.frames - done;
+            if (n > avail) n = avail;
+            if (n > room) n = room;
+            int closing = d->closing;
+            if (n && !closing) {
+                memcpy(d->stage + d->stage_len, src + done * d->frame,
+                       n * d->frame);
+                d->stage_len += n * d->frame;
+                d->written += n;
+            }
             pthread_mutex_unlock(&d->mu);
-            if (!avail) {
+            if (closing) {
+                x.result = done ? (s64)done : -EIO;
+                goto putcopy;
+            }
+            if (!n) {
                 if (d->nonblock) {
                     x.result = done ? (s64)done : -LX_EAGAIN;
                     goto putcopy;
                 }
-                alsa_wait(d);
-                continue;
-            }
-            u64 room = (d->stage_cap - d->stage_len) / d->frame;
-            if (!room) {
-                int rc = alsa_flush(d);
+                /* No counter-avail: wait for drains. Avail but no stage
+                 * room: flush pushes a period out. */
+                int rc = avail ? alsa_flush(d) : alsa_wait(d);
                 if (rc) {
                     x.result = done ? (s64)done : rc;
                     goto putcopy;
                 }
                 continue;
             }
-            u64 n = x.frames - done;
-            if (n > avail) n = avail;
-            if (n > room) n = room;
-            memcpy(d->stage + d->stage_len, src + done * d->frame, n * d->frame);
-            d->stage_len += n * d->frame;
-            d->written += n;
             done += n;
             int rc = alsa_flush(d);
             if (rc && rc != -LX_EAGAIN) {
@@ -1024,19 +1094,26 @@ static s64 alsa_ctl_ioctl(oah_image *img, oah_alsa *d, u64 req, u64 arg)
     }
 }
 
+static s64 oah_alsa_pcm_ioctl(oah_image *img, oah_alsa *d, u64 req, u64 arg);
+
 s64 oah_alsa_ioctl(oah_image *img, int fd, u64 req, u64 arg)
 {
-    pthread_mutex_lock(&table_mu);
-    oah_alsa *d = alsa_for(fd);
+    oah_alsa *d = alsa_acquire(fd);
     if (!d) {
-        pthread_mutex_unlock(&table_mu);
         return -ENOTTY;
     }
     if (d->is_ctl) {
-        pthread_mutex_unlock(&table_mu);
-        return alsa_ctl_ioctl(img, d, req, arg);
+        s64 rc = alsa_ctl_ioctl(img, d, req, arg);
+        alsa_release(d);
+        return rc;
     }
-    pthread_mutex_unlock(&table_mu);
+    s64 result = oah_alsa_pcm_ioctl(img, d, req, arg);
+    alsa_release(d);
+    return result;
+}
+
+static s64 oah_alsa_pcm_ioctl(oah_image *img, oah_alsa *d, u64 req, u64 arg)
+{
 
     u8 *out = arg ? oah_guest_access(img, arg, 640, PROT_WRITE) : NULL;
 
@@ -1202,18 +1279,16 @@ int oah_alsa_poll(int fd, int events)
 {
     enum { P_POLLOUT = 0x4, P_POLLWRNORM = 0x100,
            P_POLLERR = 0x8, P_POLLNVAL = 0x20 };
-    pthread_mutex_lock(&table_mu);
-    oah_alsa *d = alsa_for(fd);
+    oah_alsa *d = alsa_acquire(fd);
     if (!d) {
-        pthread_mutex_unlock(&table_mu);
         return P_POLLNVAL;
     }
     if (d->is_ctl) {
-        pthread_mutex_unlock(&table_mu);
+        alsa_release(d);
         return events & P_POLLOUT ? P_POLLOUT : 0;
     }
-    pthread_mutex_unlock(&table_mu);
     if (d->state == ALSA_ST_XRUN) {
+        alsa_release(d);
         return P_POLLERR;
     }
     pthread_mutex_lock(&d->mu);
@@ -1221,6 +1296,7 @@ int oah_alsa_poll(int fd, int events)
     u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
     u64 need = d->avail_min;
     pthread_mutex_unlock(&d->mu);
+    alsa_release(d);
     if (avail < need) {
         return 0;
     }
@@ -1231,14 +1307,12 @@ int oah_alsa_poll(int fd, int events)
 /* fd write() on a pcm fd takes interleaved frames like writei. */
 s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
 {
-    pthread_mutex_lock(&table_mu);
-    oah_alsa *d = alsa_for(fd);
+    oah_alsa *d = alsa_acquire(fd);
     if (!d || d->is_ctl) {
-        pthread_mutex_unlock(&table_mu);
         return -EINVAL;
     }
-    pthread_mutex_unlock(&table_mu);
     if (d->state < ALSA_ST_SETUP) {
+        alsa_release(d);
         return -EIO;
     }
     u64 frames = len / d->frame;
@@ -1248,11 +1322,13 @@ s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
     const u8 *src = oah_guest_access(img, gva, frames * d->frame, PROT_READ);
     u8 *copy = NULL;
     if (!src) {
+        alsa_release(d);
         return -EFAULT;
     }
     if (bounce) {
         copy = malloc(frames * d->frame);
         if (!copy) {
+            alsa_release(d);
             return -ENOMEM;
         }
         memcpy(copy, src, frames * d->frame);
@@ -1261,30 +1337,40 @@ s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
     s64 result = 0;
     u64 done = 0;
     while (done < frames) {
+        /* avail/room/stage all share d->mu with the drain callback. */
         pthread_mutex_lock(&d->mu);
         u64 delay = alsa_delay(d);
         u64 avail = delay < d->buffer_frames ? d->buffer_frames - delay : 0;
-        pthread_mutex_unlock(&d->mu);
         u64 room = (d->stage_cap - d->stage_len) / d->frame;
-        u64 can = avail < room ? avail : room;
-        if (!can) {
+        u64 want = frames - done;
+        if (want > avail) want = avail;
+        if (want > room) want = room;
+        int closing = d->closing;
+        if (want && !closing) {
+            memcpy(d->stage + d->stage_len, src + done * d->frame,
+                   want * d->frame);
+            d->stage_len += want * d->frame;
+            d->written += want;
+        }
+        pthread_mutex_unlock(&d->mu);
+        if (closing) {
+            result = done ? (s64)(done * d->frame) : -EIO;
+            goto out;
+        }
+        if (!want) {
             if (d->nonblock) {
                 result = done ? (s64)(done * d->frame) : -LX_EAGAIN;
                 goto out;
             }
             /* No counter-avail: wait for a drain to advance played.
              * Avail but no stage room: flush pushes a period out. */
-            int rc = avail ? alsa_flush(d) : (alsa_wait(d), 0);
+            int rc = avail ? alsa_flush(d) : alsa_wait(d);
             if (rc) {
                 result = done ? (s64)(done * d->frame) : rc;
                 goto out;
             }
             continue;
         }
-        u64 want = frames - done < can ? frames - done : can;
-        memcpy(d->stage + d->stage_len, src + done * d->frame, want * d->frame);
-        d->stage_len += want * d->frame;
-        d->written += want;
         done += want;
         int rc = alsa_flush(d);
         if (rc && rc != -LX_EAGAIN) {
@@ -1295,6 +1381,7 @@ s64 oah_alsa_write(oah_image *img, int fd, u64 gva, u64 len)
     result = (s64)(done * d->frame);
 out:
     free(copy);
+    alsa_release(d);
     return result;
 }
 
