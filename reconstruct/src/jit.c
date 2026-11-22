@@ -340,24 +340,9 @@ static void pcache_path(const oah_module *m, char *out, size_t size)
     pcache_path_in(dir, m, out, size);
 }
 
-/* Read-only fallback: when OAH_CACHE_DIR points at a non-default dir, also
- * consult the default cache so fragments written before the env var was
- * set (e.g. direct `oah` invocations) stay usable. Writes stay primary. */
-static bool pcache_alt_path(const oah_module *m, char *out, size_t size)
-{
-    const char *env = getenv("OAH_CACHE_DIR");
-    const char *home = getenv("HOME");
-    if (!env || !*env || !home || !*home) {
-        return false;
-    }
-    char def[PATH_MAX];
-    snprintf(def, sizeof(def), "%s/Library/Caches/Attesor/jit", home);
-    if (strcmp(env, def) == 0) {
-        return false;
-    }
-    pcache_path_in(def, m, out, size);
-    return true;
-}
+/* An explicit OAH_CACHE_DIR is authoritative: no fallback to the
+ * default cache, so tests and benchmarks get predictable cold-cache
+ * behavior. */
 
 /* Read and index the module's .oahjc (once). A non-NULL pcache with no
  * disk entries means "no usable file", distinct from a parse failure. */
@@ -376,16 +361,19 @@ static pcache *pcache_open(oah_image *img, int module)
     char path[PATH_MAX];
     pcache_path(m, path, sizeof(path));
     FILE *f = path[0] ? fopen(path, "rb") : NULL;
-    if (!f && pcache_alt_path(m, path, sizeof(path))) {
-        f = fopen(path, "rb");
-    }
     if (!f) {
         return pc;
     }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    u8 *blob = len > 0 ? malloc((size_t)len) : NULL;
+    /* Bound the size before allocating: a cache file is a small index
+     * of fragments, never tens of megabytes. */
+    if (len < 32 || len > (64L << 20)) {
+        fclose(f);
+        return pc;
+    }
+    u8 *blob = malloc((size_t)len);
     if (!blob || fread(blob, 1, (size_t)len, f) != (size_t)len) {
         fclose(f);
         free(blob);

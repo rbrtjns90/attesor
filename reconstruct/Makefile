@@ -4,8 +4,15 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -O2 -g
 CFLAGS  += -Iinclude
-GIT_SHA := $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo 0)
-CFLAGS  += -DOAH_BUILD_KEY=0x$(GIT_SHA)u
+# Cache identity must change whenever the translator inputs change, not
+# only when HEAD moves: hash HEAD + uncommitted diffs + file status +
+# compiler/flags so stale .oahjc files are invalidated.
+BUILD_KEY := $(shell { git rev-parse HEAD 2>/dev/null; \
+                       git diff HEAD -- src include Makefile 2>/dev/null; \
+                       git status --porcelain src include Makefile 2>/dev/null; \
+                       $(CC) --version 2>/dev/null | head -1; \
+                       echo "$(CFLAGS)"; } | cksum | cut -d' ' -f1)
+CFLAGS  += -DOAH_BUILD_KEY=$(BUILD_KEY)u
 HOST_OS := $(shell uname -s)
 ifeq ($(HOST_OS),Darwin)
 CFLAGS  += -D_DARWIN_C_SOURCE
