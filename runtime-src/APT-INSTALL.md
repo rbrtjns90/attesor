@@ -117,3 +117,30 @@ intermittent decompressor crash. The native path (`apt-update.sh` +
   Most degrade gracefully under `DEBIAN_FRONTEND=noninteractive`; ones
   that don't usually leave the package half-configured — fix the
   underlying cause and re-run `dpkg --configure -a`.
+
+## Install index (state.sqlite)
+
+`runtime/var/state.sqlite` is a host-side index of what is installed,
+rebuilt from the canonical sources (dpkg `status`/`*.list` files,
+`.desktop` files, bin-dir contents) by `runtime-src/state-sync.sh`.
+Tables: `packages`, `programs` (GUI/terminal classification),
+`events` (audit log), `meta`.
+
+Sync happens automatically:
+
+- `apt-install.sh` and `native-deb-install.sh` run it after installing
+- a dpkg `post-invoke` hook (installed by the sync script into
+  `etc/dpkg/dpkg.cfg.d/99attesor`) drops a `state-dirty` marker so
+  guest-side `apt`/`dpkg` changes get picked up — detection also
+  falls back to comparing `status` mtimes, so sync is reliable even
+  when guest hooks can't run
+- the Package Manager app runs it on launch, on refresh, and when the
+  window regains focus, then reads the DB for its program list
+
+Manual use:
+
+```sh
+runtime-src/state-sync.sh          # sync only if something changed
+runtime-src/state-sync.sh -f why   # force rebuild, log reason
+sqlite3 runtime/var/state.sqlite 'SELECT sysroot,binary,name,kind FROM programs WHERE kind="gui"'
+```

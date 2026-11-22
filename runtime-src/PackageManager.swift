@@ -38,6 +38,8 @@ struct Repo {
     static var installer: URL { root.appendingPathComponent("runtime-src/apt-install.sh") }
     static var updater: URL { root.appendingPathComponent("runtime-src/apt-update.sh") }
     static var syncer: URL { root.appendingPathComponent("runtime-src/sync-programs.sh") }
+    static var stateSync: URL { root.appendingPathComponent("runtime-src/state-sync.sh") }
+    static var stateDb: URL { root.appendingPathComponent("runtime/var/state.sqlite") }
     static var dpkgInfo: URL { sysroot.appendingPathComponent("var/lib/dpkg/info") }
     static var dpkgStatus: URL { sysroot.appendingPathComponent("var/lib/dpkg/status") }
     static var aptLists: URL { sysroot.appendingPathComponent("var/lib/apt/lists") }
@@ -137,13 +139,37 @@ final class AppState: ObservableObject {
     // --- loading -----------------------------------------------------------
 
     func reload() {
-        let (gui, term) = Self.loadInstalled()
-        guiPrograms = gui
-        termPrograms = term
-        packages = Self.loadPackages(installedNames: Self.loadInstalledNames())
+        // sysroot scanning + state-sync spawn processes — keep off main.
+        DispatchQueue.global(qos: .userInitiated).async {
+            Self.syncState()
+            let (gui, term) = Self.loadInstalled()
+            let names = Self.loadInstalledNames()
+            let pkgs = Self.loadPackages(installedNames: names)
+            DispatchQueue.main.async {
+                self.guiPrograms = gui
+                self.termPrograms = term
+                self.packages = pkgs
+            }
+        }
     }
 
-    static func loadInstalledNames() -> Set<String> {
+    /// Rebuild the install index (state.sqlite). Guest-side apt/dpkg
+    /// changes arrive via the state-dirty marker the post-invoke hook
+    /// drops; the script no-ops when nothing changed.
+    nonisolated static func syncState() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = [Repo.stateSync.path]
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    nonisolated static func loadInstalledNames() -> Set<String> {
+        if let data = pipeOut("/usr/bin/sqlite3", [Repo.stateDb.path,
+                "SELECT name FROM packages WHERE sysroot='debian-expanded';"]),
+           let text = String(data: data, encoding: .utf8), !text.isEmpty {
+            return Set(text.split(separator: "\n").map(String.init))
+        }
         guard let text = try? String(contentsOf: Repo.dpkgStatus, encoding: .utf8) else { return [] }
         var names = Set<String>()
         var pkg = "", installed = false
@@ -163,7 +189,8 @@ final class AppState: ObservableObject {
     /// Scans every sysroot under runtime/sysroots — debian-expanded is
     /// dpkg-managed, the others (freeciv, debian-x11, debian-python) are
     /// scanned by bin-dir contents instead.
-    static func loadInstalled() -> ([InstalledProgram], [InstalledProgram]) {
+    nonisolated static func loadInstalled() -> ([InstalledProgram], [InstalledProgram]) {
+        if let fromDb = loadInstalledDB() { return fromDb }
         let fm = FileManager.default
         let binDirs = ["/usr/bin", "/usr/sbin", "/usr/local/bin",
                        "/usr/games", "/bin", "/sbin"]
@@ -262,9 +289,31 @@ final class AppState: ObservableObject {
         return (gui.sorted { $0.name < $1.name }, term.sorted { $0.name < $1.name })
     }
 
+    /// Read the program index built by state-sync.sh. nil when the DB is
+    /// absent or empty so callers can fall back to scanning.
+    nonisolated static func loadInstalledDB() -> ([InstalledProgram], [InstalledProgram])? {
+        guard FileManager.default.fileExists(atPath: Repo.stateDb.path),
+              let data = pipeOut("/usr/bin/sqlite3", [Repo.stateDb.path,
+                  "SELECT sysroot,binary,name,kind,package FROM programs ORDER BY kind,name;"]),
+              let text = String(data: data, encoding: .utf8),
+              !text.isEmpty else { return nil }
+        var gui: [InstalledProgram] = []
+        var term: [InstalledProgram] = []
+        for line in text.split(separator: "\n") {
+            let f = line.split(separator: "|", omittingEmptySubsequences: false)
+                .map(String.init)
+            guard f.count >= 5 else { continue }
+            let p = InstalledProgram(
+                name: f[2].isEmpty ? URL(fileURLWithPath: f[1]).lastPathComponent : f[2],
+                binary: f[1], package: f[4], sysroot: f[0], isGUI: f[3] == "gui")
+            if p.isGUI { gui.append(p) } else { term.append(p) }
+        }
+        return (gui.isEmpty && term.isEmpty) ? nil : (gui, term)
+    }
+
     /// True when an ELF links a graphics library (same list Launcher.swift
     /// uses). Uses llvm-objdump via xcrun when available.
-    static func looksGraphical(_ path: String) -> Bool {
+    nonisolated static func looksGraphical(_ path: String) -> Bool {
         guard let data = pipeOut("/usr/bin/xcrun", ["llvm-objdump", "-p", path]),
               let text = String(data: data, encoding: .utf8) else { return false }
         let graphics = ["libX11", "libXaw", "libXt.", "libxcb", "libgtk", "libgdk",
@@ -316,7 +365,7 @@ final class AppState: ObservableObject {
         return p.terminationStatus == 0 ? data : nil
     }
 
-    static func loadPackages(installedNames: Set<String>) -> [PackageEntry] {
+    nonisolated static func loadPackages(installedNames: Set<String>) -> [PackageEntry] {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: Repo.aptLists.path)
         else { return [] }
         var result: [PackageEntry] = []
@@ -657,6 +706,11 @@ struct AttesorPackageManager: App {
                 .environmentObject(state)
                 .frame(minWidth: 640, minHeight: 480)
                 .onAppear { state.reload() }
+                // Picks up guest-side apt/dpkg installs made in the shell.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.didBecomeActiveNotification)) { _ in
+                    state.reload()
+                }
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 780, height: 560)

@@ -102,8 +102,8 @@ for deb in "$@"; do
 
     # info/<pkg>.list — `/.` then every member as absolute path.
     {
-        ar -p "$deb" "$dm" | tar -tf - | sed -e 's|/+$||' \
-            -e 's|^\./|/|' -e 's|^\.$|/.|'
+        ar -p "$deb" "$dm" | tar -tf - | sed -e 's|/*$||' \
+            -e 's|^\./|/|' -e 's|^\.$|/.|' -e 's|^$|/.|'
     } > "$INFO/$pkg.list"
 
     # Control members become info files verbatim.
@@ -174,3 +174,6 @@ echo "== configuring under translator (dpkg --configure -a)"
 DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR=$A/runtime/var/cache/jit LC_ALL=C \
     "$A/reconstruct/oah" --sysroot "$SYSROOT" \
     "$SYSROOT/usr/bin/dpkg" --configure -a
+
+# keep the host-side install index in sync
+"$(dirname "$0")/state-sync.sh" native-deb-install || true

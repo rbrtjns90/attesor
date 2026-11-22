@@ -85,3 +85,4 @@ FORCE="$force" "$INSTALLER" "$S" "$dir"/*.deb || {
     exit 1
 }
 echo "== installed: ${pkgs[*]}"
+"$(dirname "$0")/state-sync.sh" "native-install:${pkgs[*]}" || true
