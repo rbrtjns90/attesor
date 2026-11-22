@@ -163,6 +163,11 @@ bool oah_emit_csinc(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
 /* Multiply: MUL (madd ra=31), SMULH, SMADDL (w->x). */
 bool oah_emit_mul(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
                   oah_gpr rm);
+/* UDIV (dp2) and MSUB (dp4, ra operand). */
+bool oah_emit_udiv(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   oah_gpr rm);
+bool oah_emit_msub(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   oah_gpr rm, oah_gpr ra);
 bool oah_emit_smulh(oah_asm_buf *buf, oah_gpr rd, oah_gpr rn, oah_gpr rm);
 bool oah_emit_smull(oah_asm_buf *buf, oah_gpr rd, oah_gpr rn, oah_gpr rm);
 

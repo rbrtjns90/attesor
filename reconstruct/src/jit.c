@@ -155,6 +155,8 @@ typedef struct {
     u32 nexits;
     u32 exit_off[2];
     u64 exit_rip[2];
+    u32 nbails;
+    u64 bail_rip[4];
 } oah_frag_entry;
 
 /* Chain accounting: a patched exit branches to the target's stub,
@@ -306,7 +308,7 @@ static bool jit_arena_init(void)
  * object shares one identity (a per-TU define would let incremental
  * builds mix stale keys). */
 unsigned oah_build_key(void);
-static const u8 pcache_magic[8] = {'O', 'A', 'H', 'J', 'C', '0', '0', '1'};
+static const u8 pcache_magic[8] = {'O', 'A', 'H', 'J', 'C', '0', '0', '2'};
 
 typedef struct {
     u32 off;
@@ -325,6 +327,8 @@ typedef struct {
     u32 nexits;
     u32 exit_off[2];
     u64 exit_rip[2]; /* disk: module-relative; pend: absolute */
+    u32 nbails;
+    u64 bail_rip[4]; /* non-chainable exits needing an interp step */
     u8 *code;
     pcache_rel *rel;
 } pcache_ent;
@@ -479,6 +483,18 @@ static pcache *pcache_open(oah_image *img, int module)
         e->exit_rip[0] = ((const u64 *)p)[2];
         e->exit_rip[1] = ((const u64 *)p)[3];
         p += 32;
+        if (p + 40 > end) {
+            break;
+        }
+        e->nbails = ((const u32 *)p)[0];
+        if (e->nbails > 4) {
+            break;
+        }
+        e->bail_rip[0] = ((const u64 *)p)[1];
+        e->bail_rip[1] = ((const u64 *)p)[2];
+        e->bail_rip[2] = ((const u64 *)p)[3];
+        e->bail_rip[3] = ((const u64 *)p)[4];
+        p += 40;
         count++;
     }
     pc->blob = blob;
@@ -555,6 +571,10 @@ static void pcache_pend(oah_image *img, int module, u64 rip,
         e->exit_off[i] = info->exit_off[i];
         e->exit_rip[i] = info->exit_rip[i];
     }
+    e->nbails = info->nbails;
+    for (u32 i = 0; i < e->nbails; i++) {
+        e->bail_rip[i] = info->bail_rip[i];
+    }
     e->code = malloc(code_len ? code_len : 1);
     e->rel = malloc(info->nrelocs ? info->nrelocs * sizeof(*e->rel) : 1);
     if (!e->code || !e->rel) {
@@ -630,6 +650,9 @@ static void pcache_flush_module(oah_module *m)
         for (u32 j = 0; j < all[i].nexits; j++) {
             all[i].exit_rip[j] -= base;
         }
+        for (u32 j = 0; j < all[i].nbails; j++) {
+            all[i].bail_rip[j] -= base;
+        }
     }
     qsort(all, total, sizeof(*all), pcache_ent_cmp);
     u32 out = 0;
@@ -652,10 +675,18 @@ static void pcache_flush_module(oah_module *m)
         ((u32 *)trailer)[2] = all[i].exit_off[1];
         ((u64 *)trailer)[2] = all[i].exit_rip[0];
         ((u64 *)trailer)[3] = all[i].exit_rip[1];
+        u8 trailer2[40];
+        memset(trailer2, 0, sizeof(trailer2));
+        ((u32 *)trailer2)[0] = all[i].nbails;
+        ((u64 *)trailer2)[1] = all[i].bail_rip[0];
+        ((u64 *)trailer2)[2] = all[i].bail_rip[1];
+        ((u64 *)trailer2)[3] = all[i].bail_rip[2];
+        ((u64 *)trailer2)[4] = all[i].bail_rip[3];
         bad = fwrite(ent, 1, sizeof(ent), f) != sizeof(ent) ||
               fwrite(all[i].code, 1, all[i].code_len, f) != all[i].code_len ||
               fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f) != all[i].nrel ||
-              fwrite(trailer, 1, sizeof(trailer), f) != sizeof(trailer);
+              fwrite(trailer, 1, sizeof(trailer), f) != sizeof(trailer) ||
+              fwrite(trailer2, 1, sizeof(trailer2), f) != sizeof(trailer2);
         out++;
     }
     if (!bad && (fseek(f, 12, SEEK_SET) != 0 || fwrite(&out, 4, 1, f) != 1)) {
@@ -744,10 +775,14 @@ static const oah_frag_entry *jit_install(u64 rip, const oah_frag_info *info,
         .code_len = (u32)code_len,
         .stub_off = (u32)jit_arena_used + (u32)code_len,
         .nexits = info->nexits > 2 ? 0 : info->nexits,
+        .nbails = info->nbails,
     };
     for (u32 i = 0; i < e.nexits; i++) {
         e.exit_off[i] = info->exit_off[i];
         e.exit_rip[i] = info->exit_rip[i];
+    }
+    for (u32 i = 0; i < e.nbails && i < 4; i++) {
+        e.bail_rip[i] = info->bail_rip[i];
     }
     pthread_jit_write_protect_np(0);
     memcpy(jit_arena + jit_arena_used, code, code_len);
@@ -798,6 +833,9 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
         info.exit_off[info.nexits] = e->exit_off[i];
         info.exit_rip[info.nexits] = base + e->exit_rip[i];
         info.nexits++;
+    }
+    for (u32 i = 0; i < e->nbails && i < 4; i++) {
+        info.bail_rip[info.nbails++] = base + e->bail_rip[i];
     }
     const oah_frag_entry *res = jit_install(rip, &info, code, e->code_len);
     free(code);
@@ -1046,7 +1084,13 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
         }
 #endif
         u64 interp_rip = ctx[17];
-        if (frag->flags & OAH_FRAG_FALLBACK) {
+        /* Bail exits (e.g. div edge cases) return the faulting insn's
+         * RIP and must run one interpreter step, like a fallback. */
+        bool need_step = (frag->flags & OAH_FRAG_FALLBACK) != 0;
+        for (u32 i = 0; !need_step && i < frag->nbails; i++) {
+            need_step = frag->bail_rip[i] == interp_rip;
+        }
+        if (need_step) {
             fallback_steps++;
             if (jit_stats) {
                 u64 avail = OAH_X86_MAX_INSN;

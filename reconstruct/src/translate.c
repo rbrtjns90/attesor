@@ -523,6 +523,23 @@ static bool frag_exit_imm(oah_asm_buf *buf, u64 next)
     return true;
 }
 
+/* Same exit shape as frag_exit_imm but recorded as a bail: the
+ * dispatcher runs one interpreter step at the returned RIP, and the
+ * exit is never chain-patched (chaining to a frag at the bailing insn
+ * would loop forever). */
+static bool frag_bail_exit(oah_asm_buf *buf, u64 next)
+{
+    if (!emit_reloc_imm(buf, F_NR, next, OAH_RELOC_GVA) ||
+        !oah_emit_ret(buf)) {
+        return false;
+    }
+    if (!frag_relocs || frag_relocs->nbails >= 4) {
+        return false;
+    }
+    frag_relocs->bail_rip[frag_relocs->nbails++] = next;
+    return true;
+}
+
 /* Push/Pop on the guest stack (identity memory, RSP = x12). */
 static bool emit_push64(oah_asm_buf *buf, u8 val)
 {
@@ -571,7 +588,7 @@ static bool frag_scalar_supported(const oah_insn *in)
     case OAH_SC_BSF: case OAH_SC_BSR: case OAH_SC_XCHG:
         return true;
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
-    case OAH_SC_ROL: case OAH_SC_ROR:
+    case OAH_SC_ROL: case OAH_SC_ROR: case OAH_SC_DIV:
         return true;
     default:
         return false;
@@ -917,6 +934,109 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
             }
         }
         return emit_store_result(buf, in, res, T0);
+    }
+    case OAH_SC_DIV: {
+        /* Unsigned only; IDIV stays on the interpreter. Divisor is the
+         * rm operand (T1). Fast path: masked divisor nonzero, dividend
+         * fits one register (rdx == 0 for 64-bit div), quotient fits.
+         * Every #DE-shaped edge case branches to an out-of-line stub
+         * that exits the fragment so the interpreter runs this insn. */
+        u32 bits = width * 8;
+        u8 tdiv = T3, tquot = T4, tdividend = T5, trem = T7;
+        u64 bail_off[4];
+        u32 bail_enc[4];
+        unsigned nbail = 0;
+        if (bits < 64) {
+            if (!frag_ubfx(buf, tdiv, T1, 0, bits)) {
+                return false;
+            }
+        } else if (!frag_mov(buf, true, tdiv, T1)) {
+            return false;
+        }
+        bail_off[nbail] = buf->size;
+        bail_enc[nbail++] = 0x34000000u | (u32)(bits == 64) << 31 | tdiv;
+        if (!oah_emit_cbz_cbnz(buf, bits == 64, false, tdiv, 0)) {
+            return false;
+        }
+        switch (width) {
+        case 1:  /* dividend = AX */
+            if (!frag_ubfx(buf, tdividend, xn(OAH_X86_RAX), 0, 16)) {
+                return false;
+            }
+            break;
+        case 2:  /* dividend = DX:AX */
+            if (!frag_ubfx(buf, tdividend, xn(OAH_X86_RDX), 0, 16) ||
+                !frag_ubfx(buf, T6, xn(OAH_X86_RAX), 0, 16) ||
+                !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, tdividend,
+                                    T6, tdividend, 0, 16)) {
+                return false;
+            }
+            break;
+        case 4:  /* dividend = EDX:EAX */
+            if (!frag_ubfx(buf, tdividend, xn(OAH_X86_RDX), 0, 32) ||
+                !frag_ubfx(buf, T6, xn(OAH_X86_RAX), 0, 32) ||
+                !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, tdividend,
+                                    T6, tdividend, 0, 32)) {
+                return false;
+            }
+            break;
+        default: /* dividend = RDX:RAX; bail on the wide case */
+            bail_off[nbail] = buf->size;
+            bail_enc[nbail++] = 0xb5000000u | xn(OAH_X86_RDX);
+            if (!oah_emit_cbz_cbnz(buf, true, true, xn(OAH_X86_RDX), 0) ||
+                !frag_mov(buf, true, tdividend, xn(OAH_X86_RAX))) {
+                return false;
+            }
+            break;
+        }
+        if (!oah_emit_udiv(buf, width >= 4, tquot, tdividend, tdiv)) {
+            return false;
+        }
+        if (bits < 64) {
+            /* quotient must fit in `bits`; else #DE -> interpreter */
+            bail_off[nbail] = buf->size + 4; /* after the ubfx */
+            bail_enc[nbail++] =
+                0x34000000u | (u32)(width >= 4) << 31 | 0x01000000u | T6;
+            if (!oah_emit_ubfm(buf, width >= 4, T6, tquot, bits,
+                               width >= 4 ? 63 : 31) ||
+                !oah_emit_cbz_cbnz(buf, width >= 4, true, T6, 0)) {
+                return false;
+            }
+        }
+        if (!oah_emit_msub(buf, width >= 4, trem, tquot, tdiv, tdividend)) {
+            return false;
+        }
+        /* quot -> RAX[bits], rem -> RDX[bits] */
+        if (width == 1) {
+            if (!frag_bfi(buf, xn(OAH_X86_RAX), tquot, 0, 8) ||
+                !frag_bfi(buf, xn(OAH_X86_RAX), trem, 8, 8)) {
+                return false;
+            }
+        } else {
+            if (!emit_store_gpr(buf, OAH_X86_RAX, tquot, width,
+                                false) ||
+                !emit_store_gpr(buf, OAH_X86_RDX, trem, width, false)) {
+                return false;
+            }
+        }
+        /* Skip the out-of-line bail stub, then emit it. */
+        u64 over = buf->size;
+        u64 stub;
+        oah_asm_emit32(buf, 0x14000000u); /* b <after stub> */
+        stub = buf->size;
+        if (!frag_bail_exit(buf, next - in->length)) {
+            return false;
+        }
+        while (nbail) {
+            unsigned i = --nbail;
+            oah_asm_patch32(buf, bail_off[i],
+                            bail_enc[i] |
+                            (u32)(((stub - bail_off[i]) >> 2) << 5));
+        }
+        oah_asm_patch32(buf, over,
+                        0x14000000u |
+                        (u32)(((buf->size - over) >> 2) & 0x3ffffff));
+        return true;
     }
     case OAH_SC_ROL: case OAH_SC_ROR: {
         /* masked count: x86 wraps rol r8/r16 by the operand width for

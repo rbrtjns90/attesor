@@ -665,3 +665,29 @@ bool oah_emit_ins_elem(oah_asm_buf *buf, u32 elem_size_log2, u8 vd,
                             (u32)vn << 5 | vd);
     return true;
 }
+
+bool oah_emit_udiv(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   oah_gpr rm)
+{
+    u8 d, n, m;
+    if (!oah_gpr_to_num(rd, &d) || !oah_gpr_to_num(rn, &n) ||
+        !oah_gpr_to_num(rm, &m)) {
+        return false;
+    }
+    oah_asm_emit32(buf, 0x1ac00800u | (u32)is_64 << 31 | (u32)m << 16 |
+                            (u32)n << 5 | d);
+    return true;
+}
+
+bool oah_emit_msub(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   oah_gpr rm, oah_gpr ra)
+{
+    u8 d, n, m, a;
+    if (!oah_gpr_to_num(rd, &d) || !oah_gpr_to_num(rn, &n) ||
+        !oah_gpr_to_num(rm, &m) || !oah_gpr_to_num(ra, &a)) {
+        return false;
+    }
+    oah_asm_emit32(buf, 0x1b008000u | (u32)is_64 << 31 | (u32)m << 16 |
+                            (u32)a << 10 | (u32)n << 5 | d);
+    return true;
+}

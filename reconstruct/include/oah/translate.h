@@ -71,6 +71,8 @@ typedef struct {
     u32 nexits;      /* chainable constant-RIP exits recorded */
     u32 exit_off[2]; /* byte offset of each exit's ret insn */
     u64 exit_rip[2]; /* constant guest target of each exit */
+    u32 nbails;      /* non-chainable exits that need an interp step */
+    u64 bail_rip[4]; /* guest RIP each bail exit returns */
     oah_frag_reloc relocs[OAH_FRAG_MAX_RELOCS];
 } oah_frag_info;
 
