@@ -120,6 +120,21 @@ make test-macos BUSYBOX_STATIC=/path/to/busybox.static \
 
 This command executes the fixtures directly on macOS. Dynamic guests require matching x86-64 libraries. Use a trusted sysroot and trusted executables. The Darwin implementation covers the tested syscall subset, including private library mappings. Guest threads, general host signal delivery, and broad Linux application compatibility remain open.
 
+Each `test-macos` case runs three ways by default — the JIT with fragment
+chaining on, the JIT with `OAH_JIT_NOCHAIN=1`, and the interpreter — and a
+smaller matrix checks that cache-disabled, cold-cache, and warm-cache runs
+produce identical output. When the Debian sysroot fixture is present the
+suite also covers strict-sysroot confinement (`OAH_SYSROOT_STRICT=1`):
+host absolute paths must not be visible, sysroot paths must serve reads,
+missing paths must return ENOENT, and relative paths must stay inside the
+sysroot. `tools/test_freeciv.sh` exercises the Freeciv protocol headlessly
+(dummy SDL video); an XQuartz-backed rendering check is a separate manual
+step since it needs a real X display.
+
+```sh
+make test-macos-gate   # release gate: fails if the pinned Debian sysroots are absent
+```
+
 ### macOS dependencies and Linux syscall coverage
 
 ```sh

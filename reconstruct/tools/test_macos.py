@@ -1,4 +1,12 @@
-"""Run pinned Linux ELF fixtures in attesor's two native macOS modes."""
+"""Run pinned Linux ELF fixtures in attesor's native macOS modes.
+
+Default coverage: every case runs under the JIT (with and without
+fragment chaining) and under the interpreter. A small matrix also
+checks that cache-disabled, cold-cache, and warm-cache runs produce
+identical results. Debian sysroot fixtures are exercised when the
+matching --*-sysroot arguments point at a populated tree; pass
+--require-fixtures to fail rather than skip them (release gate).
+"""
 
 import argparse
 import hashlib
@@ -16,9 +24,29 @@ TIMEOUT_HASHES = {
 }
 
 
+MODES = (("jit", [], {}),
+         ("jit-nochain", [], {"OAH_JIT_NOCHAIN": "1"}),
+         ("interpret", ["--interpret"], {}))
+
+
 def verify(runner, directory, title, command, expected, stdin=b"", *, extra_env=None):
-    for mode, options in (("jit", []), ("interpret", ["--interpret"])):
-        actual = run([runner, *options, *command], directory, stdin, extra_env=extra_env)
+    for mode, options, mode_env in MODES:
+        env = dict(extra_env or {})
+        env.update(mode_env)
+        actual = run([runner, *options, *command], directory, stdin,
+                     extra_env=env or None)
+        if actual != expected:
+            raise ValueError(f"{mode} {title}: expected {expected!r}, got {actual!r}")
+        print(f"PASS {mode}: {title}")
+
+
+def cache_matrix(runner, directory, title, command, expected, stdin=b""):
+    """cache-disabled, cold, and warm runs must produce identical output."""
+    cache_dir = Path(directory) / "jit-cache"
+    for mode, env in (("nocache", {"OAH_JIT_NOCACHE": "1"}),
+                      ("cold-cache", {"OAH_CACHE_DIR": str(cache_dir)}),
+                      ("warm-cache", {"OAH_CACHE_DIR": str(cache_dir)})):
+        actual = run([runner, *command], directory, stdin, extra_env=env)
         if actual != expected:
             raise ValueError(f"{mode} {title}: expected {expected!r}, got {actual!r}")
         print(f"PASS {mode}: {title}")
@@ -44,13 +72,25 @@ def main():
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
     parser.add_argument("--debian-python-sysroot", type=Path)
+    parser.add_argument("--require-fixtures", action="store_true",
+                        help="fail instead of skipping when the pinned Debian "
+                             "sysroots are absent (release gate)")
     args = parser.parse_args()
     runner = str(args.runner.resolve())
+    if args.require_fixtures:
+        missing = [name for name, path in
+                   (("debian-sysroot", args.debian_sysroot),
+                    ("debian-python-sysroot", args.debian_python_sysroot))
+                   if not path or not path.is_dir()]
+        if missing:
+            parser.exit(1, f"required fixtures missing: {', '.join(missing)}\n")
     try:
         with tempfile.TemporaryDirectory(prefix="attesor-macos-") as directory:
             (Path(directory) / "input.txt").write_bytes(SAMPLE)
             verify(runner, directory, "static Linux hello", [str(args.hello.resolve())],
                    (0, b"hello\n", b""))
+            cache_matrix(runner, directory, "static Linux hello",
+                         [str(args.hello.resolve())], (0, b"hello\n", b""))
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,
@@ -80,6 +120,9 @@ def main():
                     verify(runner, directory, f"glibc {name} {argv}",
                            ["--sysroot", str(root), str(root / "usr/bin" / name), *argv],
                            expected, stdin)
+                cache_matrix(runner, directory, "glibc cat input.txt",
+                             ["--sysroot", str(root), str(root / "usr/bin/cat"),
+                              "input.txt"], (0, SAMPLE, b""))
                 if all((root / path).is_file() for path in TIMEOUT_HASHES):
                     for path, expected in TIMEOUT_HASHES.items():
                         if hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:

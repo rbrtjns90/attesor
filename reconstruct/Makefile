@@ -82,7 +82,7 @@ QEMU_AARCH64   ?= qemu-aarch64-static
 # Keep oah's load address far from a typical ET_EXEC guest at 0x400000.
 AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 
-.PHONY: all test test-unit test-macos test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
+.PHONY: all test test-unit test-macos test-macos-gate test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
 
@@ -131,7 +131,15 @@ test-macos: oah tests/hello.x86_64 tests/test_elf_map
 	    $(if $(BUSYBOX_STATIC),--busybox "$(BUSYBOX_STATIC)") \
 	    $(if $(ALPINE_SYSROOT),--alpine-sysroot "$(ALPINE_SYSROOT)") \
 	    $(if $(DEBIAN_SYSROOT),--debian-sysroot "$(DEBIAN_SYSROOT)") \
-	    $(if $(DEBIAN_PYTHON_SYSROOT),--debian-python-sysroot "$(DEBIAN_PYTHON_SYSROOT)")
+	    $(if $(DEBIAN_PYTHON_SYSROOT),--debian-python-sysroot "$(DEBIAN_PYTHON_SYSROOT)") \
+	    $(REQUIRE_FIXTURES)
+
+# test-macos-gate is the release check: it requires the pinned Debian
+# sysroots to be provisioned and fails if they are missing.
+test-macos-gate: REQUIRE_FIXTURES=--require-fixtures
+test-macos-gate: test-macos
+
+
 
 tests/branch_guest.x86_64: tests/branch_guest.c
 	$(CC_X86_64) -O2 -nostdlib -static -no-pie -fno-stack-protector -fno-pie \
