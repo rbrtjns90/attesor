@@ -89,6 +89,29 @@ def main():
                            [*timeout, "2", "/usr/bin/true"], (0, b"", b""))
                     verify(runner, directory, "glibc timeout terminates its child",
                            [*timeout, "0.05", "/usr/bin/sleep", "2"], (124, b"", b""))
+                strict = {"OAH_SYSROOT_STRICT": "1"}
+                cat = str(root / "usr/bin/cat").encode()
+                verify(runner, directory, "strict mode hides host paths",
+                       ["--sysroot", str(root), str(root / "usr/bin/cat"),
+                        "/System/Library/CoreServices/SystemVersion.plist"],
+                       (1, b"", cat + b": /System/Library/CoreServices/SystemVersion.plist: No such file or directory\n"),
+                       extra_env=strict)
+                verify(runner, directory, "strict mode serves sysroot paths",
+                       ["--sysroot", str(root), str(root / "usr/bin/cat"),
+                        "/etc/debian_version"],
+                       (0, (root / "etc/debian_version").read_bytes(), b""),
+                       extra_env=strict)
+                verify(runner, directory, "strict mode rejects missing sysroot file",
+                       ["--sysroot", str(root), str(root / "usr/bin/cat"),
+                        "/definitely/missing"],
+                       (1, b"", cat + b": /definitely/missing: No such file or directory\n"),
+                       extra_env=strict)
+                if not (root / "etc/hostname").exists():
+                    verify(runner, directory, "strict mode relative path confined",
+                           ["--sysroot", str(root), str(root / "bin/sh"), "-c",
+                            "cd /etc && cat hostname"],
+                           (1, b"", b"cat: hostname: No such file or directory\n"),
+                           extra_env=strict)
                 shell = root / "bin/sh"
                 if shell.is_file():
                     if hashlib.sha256(shell.read_bytes()).hexdigest() != "f5adb8bf0100ed0f8c7782ca5f92814e9229525a4b4e0d401cf3bea09ac960a6":

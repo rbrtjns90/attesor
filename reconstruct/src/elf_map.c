@@ -263,52 +263,93 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
     return fd;
 }
 #elif defined(__APPLE__)
+/* Walk `path` under `root` like Linux RESOLVE_IN_ROOT: ".." is clamped
+ * at root, intermediate components fully resolve, and absolute symlink
+ * targets re-anchor at root instead of escaping to the host fs.
+ * With leaf_follow a trailing symlink resolves too; otherwise the leaf
+ * stays literal (lstat semantics, for rename/unlink/lstat callers).
+ * Nonexistent leaf components are appended literally so O_CREAT and
+ * mkdir land in the right directory. Returns 0 or -errno. */
+static int resolve_in_root(const char *root, const char *path, char *out,
+                           size_t cap, bool leaf_follow)
+{
+    char pending[PATH_MAX * 2];
+    size_t root_len = strlen(root);
+    if (snprintf(pending, sizeof(pending), "%s", path) >=
+        (int)sizeof(pending) || root_len + 2 > cap) {
+        return -ENAMETOOLONG;
+    }
+    strcpy(out, root);
+    int links = 0;
+    while (*pending) {
+        char *p = pending;
+        while (*p == '/') { p++; }
+        if (!*p) { break; }
+        char *slash = strchr(p, '/');
+        bool last = !slash;
+        if (slash) { *slash = 0; }
+        char *rest = slash ? slash + 1 : p + strlen(p);
+        if (!strcmp(p, ".")) {
+            memmove(pending, rest, strlen(rest) + 1);
+            continue;
+        }
+        if (!strcmp(p, "..")) {
+            size_t out_len = strlen(out);
+            if (out_len > root_len) {
+                char *s = strrchr(out, '/');
+                *s = 0;
+                if (!out[0]) { strcpy(out, "/"); }
+            }
+            memmove(pending, rest, strlen(rest) + 1);
+            continue;
+        }
+        char cand[PATH_MAX];
+        if (snprintf(cand, sizeof(cand), "%s/%s", out, p) >=
+            (int)sizeof(cand)) {
+            return -ENAMETOOLONG;
+        }
+        struct stat st;
+        bool exists = lstat(cand, &st) == 0;
+        if (exists && S_ISLNK(st.st_mode) && (!last || leaf_follow)) {
+            if (++links > 40) { return -ELOOP; }
+            char target[PATH_MAX];
+            ssize_t n = readlink(cand, target, sizeof(target) - 1);
+            if (n < 0) { return -errno; }
+            target[n] = 0;
+            if (target[0] == '/') {
+                /* Re-anchor at root: absolute targets stay in the root. */
+                out[root_len] = 0;
+            }
+            /* rest aliases pending — compose in a separate buffer. */
+            char next[PATH_MAX * 2];
+            if (snprintf(next, sizeof(next), "%s%s%s", target,
+                         *rest ? "/" : "", rest) >= (int)sizeof(next)) {
+                return -ENAMETOOLONG;
+            }
+            strcpy(pending, next);
+            continue;
+        }
+        if (!exists && !last) { return -ENOENT; }
+        if (exists && !S_ISDIR(st.st_mode) && !last) { return -ENOTDIR; }
+        size_t out_len = strlen(out);
+        if (out_len + 1 + strlen(p) + 1 > cap) { return -ENAMETOOLONG; }
+        out[out_len] = '/';
+        strcpy(out + out_len + 1, p);
+        memmove(pending, rest, strlen(rest) + 1);
+    }
+    return 0;
+}
+
 int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
 {
-    char root[PATH_MAX], request[PATH_MAX], resolved[PATH_MAX];
-    if (path[0] != '/') {
+    char root[PATH_MAX], resolved[PATH_MAX];
+    if (path[0] != '/' || !realpath(sysroot, root)) {
         errno = EINVAL;
         return -1;
     }
-    if (!realpath(sysroot, root)) {
-        return -1;
-    }
-    int length = snprintf(request, sizeof(request), "%s%s", root, path);
-    if (length < 0 || (size_t)length >= sizeof(request)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    if (!realpath(request, resolved)) {
-        if (!(flags & O_CREAT)) {
-            return -1;
-        }
-        /* Leaf doesn't exist yet: resolve the deepest real ancestor and
-         * append the remainder so O_CREAT lands inside the root. */
-        char ancestor[PATH_MAX];
-        strlcpy(ancestor, request, sizeof(ancestor));
-        for (;;) {
-            char *slash = strrchr(ancestor, '/');
-            if (!slash || slash == ancestor) {
-                errno = ENOENT;
-                return -1;
-            }
-            *slash = 0;
-            if (realpath(ancestor, resolved)) {
-                break;
-            }
-            if (errno != ENOENT && errno != ENOTDIR) {
-                return -1;
-            }
-        }
-        size_t used = strlen(resolved);
-        snprintf(resolved + used, sizeof(resolved) - used, "%s",
-                 request + strlen(ancestor));
-    }
-    size_t root_len = strlen(root);
-    if (strcmp(root, "/") != 0 &&
-        (strncmp(resolved, root, root_len) != 0 ||
-         (resolved[root_len] != '/' && resolved[root_len] != 0))) {
-        errno = EACCES;
+    int rc = resolve_in_root(root, path, resolved, sizeof(resolved), true);
+    if (rc < 0) {
+        errno = -rc;
         return -1;
     }
     return open(resolved, flags | O_NOFOLLOW, (mode_t)mode);
@@ -319,82 +360,19 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
 bool oah_sysroot_hostpath(const char *sysroot, const char *path,
                           char *resolved, size_t capacity)
 {
-    char root[PATH_MAX], request[PATH_MAX];
+    char root[PATH_MAX];
     if (path[0] != '/' || !realpath(sysroot, root)) {
         errno = EINVAL;
         return false;
     }
-    int length = snprintf(request, sizeof(request), "%s%s", root, path);
-    if (length < 0 || (size_t)length >= sizeof(request) ||
-        (size_t)length >= capacity) {
-        errno = ENAMETOOLONG;
-        return false;
-    }
     /* Resolve only the parent directory: the leaf must keep lstat
      * semantics so mutating calls (rename, unlink, lstat) never follow a
-     * symlink to its target. Intermediate components still resolve. */
-    char parent[PATH_MAX];
-    strlcpy(parent, request, sizeof(parent));
-    char *slash = strrchr(parent, '/');
-    if (!slash) {
-        errno = ENOENT;
+     * symlink to its target. Intermediate components resolve, with
+     * absolute symlink targets re-anchored inside the root. */
+    int rc = resolve_in_root(root, path, resolved, capacity, false);
+    if (rc < 0) {
+        errno = -rc;
         return false;
-    }
-    const char *leaf = slash + 1;
-    if (slash == parent) {
-        parent[1] = 0;
-    } else {
-        *slash = 0;
-    }
-    if (!*leaf || !strcmp(leaf, ".") || !strcmp(leaf, "..")) {
-        /* Directory path: resolve it fully (no leaf to protect). */
-        if (!realpath(request, resolved)) {
-            char ancestor[PATH_MAX];
-            strlcpy(ancestor, request, sizeof(ancestor));
-            for (;;) {
-                char *s = strrchr(ancestor, '/');
-                if (!s || s == ancestor) {
-                    errno = ENOENT;
-                    return false;
-                }
-                *s = 0;
-                if (realpath(ancestor, resolved)) {
-                    break;
-                }
-                if (errno != ENOENT && errno != ENOTDIR) {
-                    return false;
-                }
-            }
-        }
-    } else if (realpath(parent, resolved)) {
-        size_t used = strlen(resolved);
-        if (used + 1 + strlen(leaf) + 1 > capacity) {
-            errno = ENAMETOOLONG;
-            return false;
-        }
-        resolved[used] = '/';
-        strcpy(resolved + used + 1, leaf);
-    } else {
-        /* Resolve the deepest existing ancestor, then append the tail. */
-        char ancestor[PATH_MAX];
-        strlcpy(ancestor, request, sizeof(ancestor));
-        for (;;) {
-            slash = strrchr(ancestor, '/');
-            if (!slash || slash == ancestor) {
-                errno = ENOENT;
-                return false;
-            }
-            *slash = 0;
-            if (realpath(ancestor, resolved)) {
-                break;
-            }
-            if (errno != ENOENT && errno != ENOTDIR) {
-                return false;
-            }
-        }
-        size_t used = strlen(resolved);
-        snprintf(resolved + used, capacity - used, "%s",
-                 request + strlen(ancestor));
     }
     size_t root_len = strlen(root);
     return strcmp(root, "/") == 0 ||
@@ -416,6 +394,12 @@ bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot
             }
         }
         if (fd < 0) {
+            /* Strict sysroot mode: a missing guest program is ENOENT, never
+             * a host fallback to a same-named host binary. */
+            if (guest_exec && sysroot && getenv("OAH_SYSROOT_STRICT")) {
+                errno = ENOENT;
+                return false;
+            }
             fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         }
         if (fd < 0) {
@@ -739,7 +723,12 @@ bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot)
     if (!map_elf_fd(img, fd, sysroot ? interp_path : NULL, NULL)) {
         return false;
     }
-    img->sysroot = sysroot;
+    if (sysroot) {
+        /* Anchor the sysroot as an absolute path so it stays valid after
+         * the guest chdirs (strict mode confines relative paths too). */
+        char abs[PATH_MAX];
+        img->sysroot = realpath(sysroot, abs) ? strdup(abs) : sysroot;
+    }
     int module = oah_image_module_register(
         img, exe_host[0] ? exe_host : path);
     if (module >= 0) {

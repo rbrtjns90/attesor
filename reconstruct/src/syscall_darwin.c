@@ -29,12 +29,15 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/xattr.h>
 #include <sys/time.h>
 #include <time.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 /* x86-64 Linux error numbers that differ from Darwin's. */
 enum {
@@ -918,10 +921,41 @@ static bool sysroot_writable(const oah_image *img)
     return access(marker, F_OK) == 0;
 }
 
+/* Strict sysroot mode (OAH_SYSROOT_STRICT=1): the package-install
+ * contract. Every absolute path resolves inside the sysroot — no host
+ * fallback for missing files, no mutating passthrough — except real
+ * device nodes which map to host devices. */
+static bool sysroot_strict(const oah_image *img)
+{
+    static int strict = -1;
+    if (strict < 0) {
+        strict = getenv("OAH_SYSROOT_STRICT") != NULL;
+    }
+    return strict > 0 && img->sysroot != NULL;
+}
+
+static bool guest_device_path(const char *path)
+{
+    static const char *devs[] = {
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/random",
+        "/dev/urandom", "/dev/tty", "/dev/stdin", "/dev/stdout",
+        "/dev/stderr", "/dev/ptmx",
+    };
+    for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
+        if (!strcmp(path, devs[i])) {
+            return true;
+        }
+    }
+    return !strncmp(path, "/dev/fd/", 8) || !strncmp(path, "/dev/pts/", 9);
+}
+
 static bool sysroot_path(const oah_image *img, const char *path)
 {
     if (!img->sysroot) {
         return false;
+    }
+    if (sysroot_strict(img)) {
+        return path[0] == '/' && !guest_device_path(path);
     }
     /* FHS dirs resolve inside the sysroot. Reads fall back to the host when
      * the file is absent there; writes need the writable marker. */
@@ -1003,8 +1037,10 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
         }
         int fd = oah_sysroot_open(img->sysroot, path, host_flags, (u32)mode);
         fd = guest_lockable_fd(fd, host_flags);
-        /* Reads fall back to the host when the sysroot lacks the file. */
-        if (fd >= 0 || writing || (errno != ENOENT && errno != ENOTDIR)) {
+        /* Reads fall back to the host when the sysroot lacks the file.
+         * Strict mode never falls back: ENOENT is the honest answer. */
+        if (sysroot_strict(img) || fd >= 0 || writing ||
+            (errno != ENOENT && errno != ENOTDIR)) {
             return fd;
         }
     }
@@ -1111,7 +1147,81 @@ static int resolve_mut_path(const oah_image *img, const char *path,
         ensure_parents(out);
         return 1;
     }
-    return -linux_error(errno);
+    return linux_error(errno);
+}
+
+/* Recorded ownership for sysroot files: guest chown writes the
+ * requested uid/gid into xattrs so stat reports them back and package
+ * metadata is verifiable, without claiming host ownership changed. */
+static int record_guest_owner(const char *hostpath, u64 uid, u64 gid,
+                              bool nofollow)
+{
+    char buf[16];
+    u32 opts = nofollow ? XATTR_NOFOLLOW : 0;
+    int n = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)uid);
+    /* macOS requires write permission on the file for user xattrs; package
+     * extraction legitimately chowns files still at mode 000, so briefly
+     * raise the mode and restore it when the first write is refused. */
+    int retries = 0;
+    struct stat st;
+    for (;;) {
+        if (setxattr(hostpath, "user.oah.uid", buf, (size_t)n, 0, opts) == 0) {
+            n = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)gid);
+            if (setxattr(hostpath, "user.oah.gid", buf, (size_t)n, 0,
+                         opts) == 0) {
+                if (retries) {
+                    chmod(hostpath, st.st_mode);
+                }
+                return 0;
+            }
+        }
+        int error = errno;
+        if (retries++ || (error != EACCES && error != EPERM) ||
+            lstat(hostpath, &st) < 0 ||
+            (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) ||
+            chmod(hostpath, (st.st_mode & ~S_IFMT) |
+                            (S_ISDIR(st.st_mode) ? 0700 : 0600)) < 0) {
+            errno = error;
+            return linux_error(errno);
+        }
+    }
+}
+
+/* True when `abs` (an absolute host path) lies inside the sysroot. */
+static bool under_sysroot(const oah_image *img, const char *abs)
+{
+    static const char *root_for;
+    static char root_abs[PATH_MAX];
+    if (!img->sysroot) {
+        return false;
+    }
+    if (root_for != img->sysroot) {
+        if (!realpath(img->sysroot, root_abs)) {
+            return false;
+        }
+        root_for = img->sysroot;
+    }
+    size_t rl = strlen(root_abs);
+    return !strncmp(abs, root_abs, rl) &&
+           (abs[rl] == '/' || abs[rl] == 0);
+}
+
+/* Read recorded ownership back; returns true when xattrs present. */
+static bool recorded_owner(const char *hostpath, u32 *uid, u32 *gid)
+{
+    char buf[16];
+    ssize_t u = getxattr(hostpath, "user.oah.uid", buf, sizeof(buf) - 1, 0, 0);
+    if (u <= 0) {
+        return false;
+    }
+    buf[u] = 0;
+    *uid = (u32)strtoul(buf, NULL, 10);
+    ssize_t g = getxattr(hostpath, "user.oah.gid", buf, sizeof(buf) - 1, 0, 0);
+    if (g > 0) {
+        buf[g] = 0;
+        *gid = (u32)strtoul(buf, NULL, 10);
+    }
+    return true;
 }
 
 /* For *reading* path calls (chdir, readlink, ...): resolve FHS paths into
@@ -1124,9 +1234,60 @@ static int resolve_read_path(const oah_image *img, const char *path,
     }
     if (oah_sysroot_hostpath(img->sysroot, path, out, capacity)) {
         struct stat st;
+        if (sysroot_strict(img)) {
+            return 1; /* strict: no host fallback; ENOENT comes from out */
+        }
         return lstat(out, &st) == 0 ? 1 : 0;
     }
-    return 0;
+    return sysroot_strict(img) ? linux_error(errno) : 0;
+}
+
+/* Resolve a chown/chmod-style path to a host path inside the sysroot for
+ * recorded-ownership handling. Handles absolute paths (component walk),
+ * relative paths (anchored at dirfd or the guest cwd, which strict mode
+ * keeps inside the sysroot), and AT_EMPTY_PATH (dirfd is the target).
+ * Returns 1 when `out` holds a sysroot path to record on, 0 when the target
+ * lies outside the sysroot (host semantics apply), <0 on resolution error
+ * which the caller must propagate. */
+static int owner_record_path(const oah_image *img, int dirfd,
+                             const char *path, bool empty_path,
+                             char *out, size_t capacity)
+{
+    if (!img->sysroot || !path) {
+        return 0;
+    }
+    if (!*path) {
+        if (!empty_path || dirfd == AT_FDCWD ||
+            fcntl(dirfd, F_GETPATH, out) < 0) {
+            return 0;
+        }
+        return under_sysroot(img, out) ? 1 : 0;
+    }
+    if (path[0] == '/') {
+        int rr = resolve_read_path(img, path, out, capacity);
+        if (rr < 0) {
+            return rr;
+        }
+        return rr > 0 ? 1 : 0;
+    }
+    char base[PATH_MAX], joined[PATH_MAX], real[PATH_MAX];
+    if (dirfd == AT_FDCWD) {
+        if (!getcwd(base, sizeof(base))) {
+            return false;
+        }
+    } else if (fcntl(dirfd, F_GETPATH, base) < 0) {
+        return false;
+    }
+    if (snprintf(joined, sizeof(joined), "%s/%s", base, path) >=
+            (int)sizeof(joined) ||
+        !realpath(joined, real)) {
+        return sysroot_strict(img) ? linux_error(errno) : 0;
+    }
+    if (!under_sysroot(img, real)) {
+        return sysroot_strict(img) ? -ENOENT : 0;
+    }
+    snprintf(out, capacity, "%s", real);
+    return 1;
 }
 
 static const struct { u32 guest; int host; } open_flags[] = {
@@ -1240,15 +1401,28 @@ static s64 guest_stat(oah_image *img, int dirfd, const char *path, u64 addr, u64
     }
     struct stat st;
     int result;
+    const char *owner_path = NULL;
+    char resolved[PATH_MAX];
     if (!path || (!*path && (flags & 0x1000) && dirfd != -100)) {
         result = fstat(dirfd, &st);
+        /* statx(AT_EMPTY_PATH)/fstat on a sysroot-opened fd: recover the
+         * host path so recorded ownership still applies. */
+        static char fd_path[PATH_MAX];
+        if (result == 0 &&
+            fcntl(dirfd, F_GETPATH, fd_path) == 0 &&
+            under_sysroot(img, fd_path)) {
+            owner_path = fd_path;
+        }
     } else if (sysroot_path(img, path)) {
         /* Resolve through the sysroot first (component walk keeps the leaf
          * symlink intact for AT_SYMLINK_NOFOLLOW and makes relative links
          * resolve inside the sysroot); fall back to the host on ENOENT. */
-        char resolved[PATH_MAX];
-        const char *sp = resolve_read_path(img, path, resolved,
-                                           sizeof(resolved)) ? resolved : path;
+        int rr = resolve_read_path(img, path, resolved, sizeof(resolved));
+        if (rr < 0) {
+            return rr;
+        }
+        const char *sp = rr ? resolved : path;
+        owner_path = rr ? resolved : NULL;
         result = fstatat(dirfd == -100 ? AT_FDCWD : dirfd, sp, &st,
                          flags & 0x100 ? AT_SYMLINK_NOFOLLOW : 0);
     } else {
@@ -1278,6 +1452,13 @@ static s64 guest_stat(oah_image *img, int dirfd, const char *path, u64 addr, u64
         .mtime_sec = st.st_mtimespec.tv_sec, .mtime_nsec = st.st_mtimespec.tv_nsec,
         .ctime_sec = st.st_ctimespec.tv_sec, .ctime_nsec = st.st_ctimespec.tv_nsec
     };
+    if (owner_path) {
+        u32 uid, gid;
+        if (recorded_owner(owner_path, &uid, &gid)) {
+            converted.uid = uid;
+            converted.gid = gid;
+        }
+    }
     memcpy(output, &converted, sizeof(converted));
     return 0;
 }
@@ -3254,13 +3435,25 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
         }
     }
     if (!result) {
-        char *const host_env[] = {NULL};
+        /* Translator configuration lives in the host environment; carry the
+         * OAH_* variables into the exec'd child so settings like strict
+         * sysroot mode, cache selection, and tracing survive guest execve. */
+        char *host_env[64];
+        size_t host_env_count = 0;
+        char *const *envp;
+        for (envp = environ; *envp && host_env_count + 1 < sizeof(host_env) / sizeof(*host_env);
+             envp++) {
+            if (strncmp(*envp, "OAH_", 4) == 0) {
+                host_env[host_env_count++] = *envp;
+            }
+        }
+        host_env[host_env_count] = NULL;
         struct itimerval timer;
         const struct itimerval stopped = {0};
         if (posix_timer_created && setitimer(ITIMER_REAL, &stopped, &timer) < 0) {
             result = linux_error(errno);
         } else {
-            result = host_result(execve(img->launcher, args, host_env));
+            result = host_result(execve(img->launcher, args, (char *const *)host_env));
             if (posix_timer_created) {
                 setitimer(ITIMER_REAL, &timer, NULL);
             }
@@ -3367,6 +3560,20 @@ static s64 guest_sleep(oah_image *img, u64 id, u64 flags, u64 request, u64 remai
 
 oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
 {
+    /* Strict sysroot mode anchors the process cwd inside the sysroot so
+     * relative paths and AT_FDCWD stay confined. A cwd the guest itself
+     * established (inherited across execve) is inside the sysroot already
+     * and must be preserved — anchoring again would reset it to "/". */
+    static int strict_chdir = -1;
+    if (strict_chdir < 0) {
+        strict_chdir = 0;
+        if (img->sysroot && getenv("OAH_SYSROOT_STRICT")) {
+            char cwd[PATH_MAX];
+            strict_chdir = (getcwd(cwd, sizeof(cwd)) &&
+                            under_sysroot(img, cwd)) ||
+                           chdir(img->sysroot) == 0;
+        }
+    }
     u64 nr = g->gpr[OAH_X86_RAX];
     u64 a0 = g->gpr[OAH_X86_RDI], a1 = g->gpr[OAH_X86_RSI];
     u64 a2 = g->gpr[OAH_X86_RDX], a3 = g->gpr[OAH_X86_R10];
@@ -3512,8 +3719,9 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             }
             char rp[PATH_MAX];
             int rr = resolve_read_path(img, path, rp, sizeof(rp));
-            result = host_result(statvfs(rr ? rp : path, &sv));
-            if (result < 0 && rr && (errno == ENOENT || errno == ENOTDIR)) {
+            result = rr < 0 ? rr : host_result(statvfs(rr ? rp : path, &sv));
+            if (result < 0 && rr > 0 && !sysroot_strict(img) &&
+                (errno == ENOENT || errno == ENOTDIR)) {
                 result = host_result(statvfs(path, &sv));
             }
         }
@@ -3688,10 +3896,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         } else {
             char rp[PATH_MAX];
             int rr = resolve_read_path(img, path, rp, sizeof(rp));
-            result = rr ? host_result(faccessat(AT_FDCWD, rp, (int)mode, host_flags))
+            result = rr < 0 ? rr :
+                     rr ? host_result(faccessat(AT_FDCWD, rp, (int)mode, host_flags))
                         : host_result(faccessat(dirfd, path, (int)mode, host_flags));
-            /* Reads fall back to the host when the sysroot lacks the file. */
-            if (result < 0 && rr && sysroot_path(img, path) &&
+            /* Reads fall back to the host when the sysroot lacks the file
+             * (non-strict mode only; strict keeps the sysroot verdict). */
+            if (result < 0 && rr > 0 && !sysroot_strict(img) &&
                 (errno == ENOENT || errno == ENOTDIR)) {
                 result = host_result(faccessat(dirfd, path, (int)mode, host_flags));
             }
@@ -3811,14 +4021,20 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             result = guest_clone_thread(g, img, a0, a1, a2, a3, a4);
             break;
         }
-        if (workers || epolls || eventfds) {
+        /* epoll/eventfd descriptors copy into the child harmlessly; only a
+         * real guest thread would make fork's single-threaded child state
+         * inconsistent. */
+        if (workers) {
             result = -LINUX_ENOSYS;
             break;
         }
         /* CLONE_VM (0x100) is safe to ignore when the child execs or exits
          * quickly; CLONE_VFORK (0x4000) gets the release-fd treatment like a
-         * real vfork. glibc posix_spawn uses VM|VFORK|SIGCHLD. */
-        if ((a0 & ~0x1204100ull) != 17 || a1 || a2 || a4) {
+         * real vfork. glibc posix_spawn uses VM|VFORK|SIGCHLD and may pass a
+         * stack pointer — the forked child keeps its existing stack, which
+         * is fine because the child only prepares and calls execve. */
+        if ((a0 & ~0x1204100ull) != 17 || a2 || a4 ||
+            (a1 && (a0 & 0x4100) != 0x4100)) {
             if (getenv("OAH_EXEC_TRACE")) {
                 fprintf(stderr, "[exec-trace] clone rejected flags=%llx a1=%llx a2=%llx a4=%llx\n",
                         (unsigned long long)a0, (unsigned long long)a1,
@@ -3832,13 +4048,20 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             break;
         }
         result = (a0 & 0x4000) ? guest_vfork() : guest_fork();
+        if (result == 0 && a1) {
+            /* Real clone starts the child on the supplied stack — its return
+             * address there selects the entry point (glibc posix_spawn
+             * parks __spawni_child's frame on it). fork() keeps RSP, so
+             * move the child onto the requested stack explicitly. */
+            g->gpr[OAH_X86_RSP] = a1;
+        }
         if (!result && (a0 & 0x1000000)) {
             u32 tid = getpid();
             memcpy(oah_guest_access(img, a3, 4, PROT_WRITE), &tid, sizeof(tid));
         }
         break;
     case 57: case 58: /* fork, vfork */
-        result = workers || epolls || eventfds ? -LINUX_ENOSYS : nr == 58 ? guest_vfork() : guest_fork();
+        result = workers ? -LINUX_ENOSYS : nr == 58 ? guest_vfork() : guest_fork();
         if (getenv("OAH_EXEC_TRACE")) {
             fprintf(stderr, "[exec-trace] nr=%llu result=%lld workers=%u epolls=%p eventfds=%p\n",
                     (unsigned long long)nr, (long long)result, workers,
@@ -3989,6 +4212,9 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 74: case 75: /* fsync, fdatasync */
         result = host_result(fsync((int)a0));
         break;
+    case 277: /* sync_file_range: approximate with an fd data flush */
+        result = a3 & ~7ull ? -EINVAL : host_result(fdatasync((int)a0));
+        break;
     case 228: case 229: { /* clock_gettime, clock_getres */
         clockid_t clock;
         struct timespec value;
@@ -4030,7 +4256,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         const char *path = guest_path(img, a0);
         char rp[PATH_MAX];
         int rr = resolve_read_path(img, path, rp, sizeof(rp));
-        result = !path ? -EFAULT : host_result(chdir(rr ? rp : path));
+        result = !path ? -EFAULT : rr < 0 ? rr : host_result(chdir(rr ? rp : path));
         break;
     }
     case 81: result = host_result(fchdir((int)a0)); break;
@@ -4129,9 +4355,150 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         break;
     }
     case 91: result = host_result(fchmod((int)a0, (mode_t)a1)); break;
-    case 93: result = guest_root(img) ? 0 :
-                 host_result(fchown((int)a0, (uid_t)a1, (gid_t)a2)); break;
+    case 93: { /* fchown */
+        char fp[PATH_MAX];
+        int orp = guest_root(img)
+                  ? owner_record_path(img, (int)a0, "", true, fp, sizeof(fp))
+                  : 0;
+        result = orp < 0 ? orp : orp ? record_guest_owner(fp, a1, a2, false)
+                                     : host_result(fchown((int)a0, (uid_t)a1,
+                                                          (gid_t)a2));
+        break;
+    }
     case 95: result = umask((mode_t)a0); break;
+    case 188: case 189: { /* setxattr, lsetxattr */
+        const char *path = guest_path(img, a0);
+        const char *name = a1 ? guest_path(img, a1) : NULL;
+        const void *value = a2 ? oah_guest_access(img, a2, a3, PROT_READ) : NULL;
+        char rp[PATH_MAX];
+        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        result = !path || (a2 && !value) || (a1 && !name) ? -EFAULT :
+                 a4 & ~3ull ? -EINVAL :
+                 rr < 0 ? rr :
+                 host_result(setxattr(rr ? rp : path, name ? name : "",
+                                      value, (size_t)a3, 0,
+                                      (nr == 189 ? XATTR_NOFOLLOW : 0) |
+                                      (a4 == 1 ? XATTR_CREATE :
+                                       a4 == 2 ? XATTR_REPLACE : 0)));
+        break;
+    }
+    case 190: /* fsetxattr */
+        result = host_result(fsetxattr((int)a0,
+                                       (const char *)guest_path(img, a1),
+                                       a2 ? oah_guest_access(img, a2, a3,
+                                                             PROT_READ) : NULL,
+                                       (size_t)a3, 0,
+                                       a4 == 1 ? XATTR_CREATE :
+                                       a4 == 2 ? XATTR_REPLACE : 0));
+        break;
+    case 197: case 198: { /* removexattr, lremovexattr */
+        const char *path = guest_path(img, a0);
+        const char *name = a1 ? guest_path(img, a1) : NULL;
+        char rp[PATH_MAX];
+        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        result = !path || (a1 && !name) ? -EFAULT :
+                 rr < 0 ? rr :
+                 host_result(removexattr(rr ? rp : path, name ? name : "",
+                                         nr == 198 ? XATTR_NOFOLLOW : 0));
+        break;
+    }
+    case 199: /* fremovexattr */
+        result = host_result(fremovexattr((int)a0,
+                                          (const char *)guest_path(img, a1),
+                                          0));
+        break;
+    case 191: case 192: case 194: case 195: { /* getxattr, lgetxattr,
+                                               listxattr, llistxattr */
+        const char *path = guest_path(img, a0);
+        char rp[PATH_MAX];
+        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        if (!path || rr < 0) {
+            result = !path ? -EFAULT : rr;
+            break;
+        }
+        const char *sp = rr ? rp : path;
+        bool list = nr == 194 || nr == 195;
+        u64 cap = list ? a1 : a2;
+        /* Host buffer: names for listxattr, value for getxattr. */
+        size_t capn = cap > 4096 ? 4096 : (size_t)cap;
+        u8 *tmp = malloc(capn ? capn : 1);
+        ssize_t n;
+        u32 opts = (nr == 192 || nr == 195) ? XATTR_NOFOLLOW : 0;
+        if (list) {
+            n = listxattr(sp, (char *)tmp, capn, opts);
+        } else {
+            const char *name = guest_path(img, a1);
+            if (!name) {
+                free(tmp);
+                result = -EFAULT;
+                break;
+            }
+            n = getxattr(sp, name, tmp, capn, 0, opts);
+        }
+        if (n < 0) {
+            int e = errno == ENOATTR || errno == ENODATA ? -61 /* ENODATA */
+                    : linux_error(errno);
+            free(tmp);
+            result = e;
+            break;
+        }
+        result = n;
+        if (cap) {
+            if (n > (ssize_t)cap) {
+                result = -34; /* ERANGE */
+            } else {
+                void *dst = oah_guest_access(img, list ? a1 : a2, (u64)n,
+                                             PROT_WRITE);
+                if (!dst) {
+                    result = -EFAULT;
+                } else {
+                    memcpy(dst, tmp, (size_t)n);
+                }
+            }
+        }
+        free(tmp);
+        break;
+    }
+    case 193: case 196: { /* fgetxattr, flistxattr */
+        bool list = nr == 196;
+        u64 cap = list ? a1 : a2;
+        size_t capn = cap > 4096 ? 4096 : (size_t)cap;
+        u8 *tmp = malloc(capn ? capn : 1);
+        ssize_t n;
+        if (list) {
+            n = flistxattr((int)a0, (char *)tmp, capn, 0);
+        } else {
+            const char *name = guest_path(img, a1);
+            if (!name) {
+                free(tmp);
+                result = -EFAULT;
+                break;
+            }
+            n = fgetxattr((int)a0, name, tmp, capn, 0, 0);
+        }
+        if (n < 0) {
+            int e = errno == ENOATTR || errno == ENODATA ? -61 : linux_error(errno);
+            free(tmp);
+            result = e;
+            break;
+        }
+        result = n;
+        if (cap) {
+            if (n > (ssize_t)cap) {
+                result = -34;
+            } else {
+                void *dst = oah_guest_access(img, list ? a1 : a2, (u64)n,
+                                             PROT_WRITE);
+                if (!dst) {
+                    result = -EFAULT;
+                } else {
+                    memcpy(dst, tmp, (size_t)n);
+                }
+            }
+        }
+        free(tmp);
+        break;
+    }
     case 133: case 259: { /* mknod, mknodat, FIFO only */
         const char *path = guest_path(img, nr == 133 ? a0 : a1);
         mode_t mode = (mode_t)(nr == 133 ? a1 : a2);
@@ -4162,7 +4529,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         int fd = nr == 89 ? -100 : (int)a0;
         char rp[PATH_MAX];
         int rr = resolve_read_path(img, path, rp, sizeof(rp));
-        result = !size ? -EINVAL : !path || !buffer ? -EFAULT :
+        result = rr < 0 ? rr : !size ? -EINVAL : !path || !buffer ? -EFAULT :
                  host_result(readlinkat(fd == -100 ? AT_FDCWD : fd,
                                         rr ? rp : path, buffer, size));
         if (result > 0 && img->sysroot &&
@@ -4396,19 +4763,45 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 92: case 94: { /* chown, lchown */
         const char *path = guest_path(img, a0);
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
-        result = guest_root(img) ? 0 :
-                 !path ? -EFAULT :
-                 host_result(nr == 92 ? chown(rr ? rp : path, (uid_t)a1, (gid_t)a2)
-                                      : lchown(rr ? rp : path, (uid_t)a1, (gid_t)a2));
+        int orp = !path ? 0 :
+                  owner_record_path(img, AT_FDCWD, path, false, rp, sizeof(rp));
+        if (!path) {
+            result = -EFAULT;
+        } else if (orp < 0) {
+            result = orp;
+        } else if (orp > 0 && guest_root(img)) {
+            /* Sysroot file: record the requested owner in xattrs so
+             * stat reports it and package metadata stays verifiable.
+             * lchown records on the link itself. */
+            result = record_guest_owner(rp, a1, a2, nr == 94);
+        } else {
+            result = host_result(nr == 92
+                                 ? chown(orp ? rp : path, (uid_t)a1, (gid_t)a2)
+                                 : lchown(orp ? rp : path,
+                                          (uid_t)a1, (gid_t)a2));
+        }
         break;
     }
     case 260: { /* fchownat */
         const char *path = guest_path(img, a1);
-        result = guest_root(img) ? 0 : !path ? -EFAULT :
-                 a4 & ~0x1100ull ? -EINVAL :
-                 host_result(fchownat(darwin_dirfd(a0), path, (uid_t)a2, (gid_t)a3,
-                                      a4 & 0x100 ? AT_SYMLINK_NOFOLLOW : 0));
+        char rp[PATH_MAX];
+        int orp = !path ? 0 :
+                  owner_record_path(img, darwin_dirfd(a0), path, a4 & 0x1000,
+                                    rp, sizeof(rp));
+        if (!path) {
+            result = -EFAULT;
+        } else if (a4 & ~0x1100ull) {
+            result = -EINVAL;
+        } else if (orp < 0) {
+            result = orp;
+        } else if (orp > 0 && guest_root(img)) {
+            result = record_guest_owner(rp, a2, a3, a4 & 0x100);
+        } else {
+            result = host_result(fchownat(darwin_dirfd(a0),
+                                          orp ? rp : path, (uid_t)a2,
+                                          (gid_t)a3,
+                                          a4 & 0x100 ? AT_SYMLINK_NOFOLLOW : 0));
+        }
         break;
     }
     case 115: { /* getgroups */
