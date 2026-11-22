@@ -571,6 +571,7 @@ static bool frag_scalar_supported(const oah_insn *in)
     case OAH_SC_BSF: case OAH_SC_BSR: case OAH_SC_XCHG:
         return true;
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
+    case OAH_SC_ROL: case OAH_SC_ROR:
         return true;
     default:
         return false;
@@ -911,6 +912,132 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                     !frag_ubfx(buf, T5, F_RF, 0, 1) ||
                     !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T4, T4, T5, 0, 0) ||
                     !frag_bfi(buf, F_RF, T4, 11, 1)) {
+                    return false;
+                }
+            }
+        }
+        return emit_store_result(buf, in, res, T0);
+    }
+    case OAH_SC_ROL: case OAH_SC_ROR: {
+        /* masked count: x86 wraps rol r8/r16 by the operand width for
+         * the rotate but applies flags to the masked count. CF is the
+         * bit rotated out; OF only updates when masked == 1. */
+        u32 bits = width * 8;
+        bool left = in->scalar == OAH_SC_ROL;
+        if (width < 4) {
+            return false; /* rare; let the interpreter handle it */
+        }
+        if (!in->immediate) {
+            if (!frag_ubfx(buf, T4, xn(OAH_X86_RCX), 0,
+                           width == 8 ? 6 : 5)) {
+                return false;
+            }
+            u64 skip_all = buf->size;
+            if (!oah_emit_cbz_cbnz(buf, false, false, T4, 0)) {
+                return false;
+            }
+            u8 amount = T4;
+            if (left) {
+                /* rol r,k = ror r,(bits-k); (-k) & (bits-1) */
+                if (!oah_emit_add_sub_reg(buf, false, true, false, T5, 31,
+                                          T4, 0, 0) ||
+                    !frag_ubfx(buf, T5, T5, 0, width == 8 ? 6 : 5)) {
+                    return false;
+                }
+                amount = T5;
+            }
+            /* No emit_merge_logic: rotates only touch CF/OF, they do
+             * not compute SZP like shifts do. */
+            if (!oah_emit_shift_var(buf, width == 8, 3, res, lhs, amount)) {
+                return false;
+            }
+            /* CF = res&1 [ROL] or res>>(bits-1) [ROR]. */
+            if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                               left ? 0 : bits - 1, left ? 0 : bits - 1) ||
+                !frag_bfi(buf, F_RF, T7, 0, 1)) {
+                return false;
+            }
+            /* OF (masked==1): ROL = msb^CF; ROR = msb^(msb-1). */
+            if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
+                                            T4, 1, 0)) {
+                return false;
+            }
+            u64 skip_of = buf->size;
+            if (!oah_emit_bcond(buf, OAH_ARM_NE, 0)) {
+                return false;
+            }
+            if (left) {
+                if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                   bits - 1, bits - 1) ||
+                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T7, T7,
+                                        res, 0, 0) ||
+                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                    return false;
+                }
+            } else {
+                if (!frag_lsr(buf, width == 8, T7, res, 1) ||
+                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, width == 8,
+                                        T7, T7, res, 0, 0) ||
+                    !oah_emit_ubfm(buf, width == 8, T7, T7,
+                                   bits - 2, bits - 2) ||
+                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                    return false;
+                }
+            }
+            oah_asm_patch32(buf, skip_of,
+                            0x54000000u |
+                            (((u32)(buf->size - skip_of) >> 2) << 5) |
+                            OAH_ARM_NE);
+            if (!emit_store_result(buf, in, res, T0)) {
+                return false;
+            }
+            oah_asm_patch32(buf, skip_all,
+                            0x34000000u |
+                            (((u32)(buf->size - skip_all) >> 2) << 5) |
+                            T4);
+            return true;
+        }
+        u32 masked = (u32)(in->imm & (width == 8 ? 63 : 31));
+        if (!masked) {
+            return true; /* x86: no state change at all */
+        }
+        u32 count = masked % bits;
+        if (!count) {
+            /* Full-width rotate: result = lhs, CF = edge bit of lhs. */
+            if (!frag_mov(buf, width == 8, res, lhs)) {
+                return false;
+            }
+        } else {
+            u32 k = left ? bits - count : count;
+            if (!frag_lsl(buf, width == 8, T5, lhs, bits - k) ||
+                !frag_lsr(buf, width == 8, res, lhs, k) ||
+                !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, width == 8, res,
+                                    res, T5, 0, 0)) {
+                return false;
+            }
+        }
+        if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                           left ? 0 : bits - 1, left ? 0 : bits - 1) ||
+            !frag_bfi(buf, F_RF, T7, 0, 1)) {
+            return false;
+        }
+        if (masked == 1) {
+            if (left) {
+                if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                   bits - 1, bits - 1) ||
+                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T7, T7,
+                                        res, 0, 0) ||
+                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                    return false;
+                }
+            } else {
+                if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                   bits - 2, bits - 2) ||
+                    !oah_emit_ubfm(buf, width == 8, T5, res,
+                                   bits - 1, bits - 1) ||
+                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T7, T7,
+                                        T5, 0, 0) ||
+                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
                     return false;
                 }
             }
