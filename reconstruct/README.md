@@ -91,7 +91,7 @@ Diagnostics, all off by default:
 | `OAH_JIT_NOALL` / `NOLOAD` / `NOSTORE` / `NOALU` / `NOCTRL` / `NOJCC` / `NOCALL` / `NORMW` | force instruction classes through the interpreter (bisection) |
 | `OAH_SEG_DEBUG` | dump the guest segment table on a permission miss |
 
-Measured on `freeciv-server --version` (dynamic glibc guest): cached JIT ≈0.41 s vs interpreter ≈1.09 s.
+Measured on `freeciv-server --version` (dynamic glibc guest): persistent-cache JIT ≈0.22 s warm / ≈0.30 s cold vs interpreter ≈1.05 s.
 
 ## Build and verify
 

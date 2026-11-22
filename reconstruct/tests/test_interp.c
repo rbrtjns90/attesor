@@ -24,6 +24,8 @@ static void image_identity(oah_image *img, u8 *buf, size_t n)
 
 int main(void)
 {
+#if defined(__linux__)
+    /* The x86->host number map only exists in the Linux bridge. */
     CHECK_EQ_U64(oah_x86_syscall_to_host(OAH_X86_NR_WRITE),
 #if defined(__aarch64__)
                  64
@@ -38,6 +40,7 @@ int main(void)
                  OAH_X86_NR_EXIT
 #endif
     );
+#endif
 
     {
         /* write(pipe, "hi", 2); exit(7) */

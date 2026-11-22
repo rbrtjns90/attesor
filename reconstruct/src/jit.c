@@ -250,7 +250,7 @@ static bool jit_arena_init(void)
  * the stale file is reclaimed by normal eviction or manual clearing.
  */
 
-#define OAH_PCACHE_VERSION 3u
+#define OAH_PCACHE_VERSION 4u
 /* Cache files are tied to the translator build: a rebuilt binary may emit
  * different code for the same guest, so old files must not be reused.
  * OAH_BUILD_KEY comes from the Makefile (git commit hash). */
@@ -392,9 +392,9 @@ static pcache *pcache_open(oah_image *img, int module)
         return pc;
     }
     fclose(f);
-    if (len < 24 || memcmp(blob, pcache_magic, 8) ||
+    if (len < 32 || memcmp(blob, pcache_magic, 8) ||
         ((const u32 *)blob)[2] != OAH_PCACHE_VERSION ||
-        ((const u32 *)blob)[5] != OAH_BUILD_KEY ||
+        ((const u32 *)blob)[6] != OAH_BUILD_KEY ||
         ((const u64 *)blob)[2] != m->key) {
         free(blob);
         return pc;
@@ -404,7 +404,7 @@ static pcache *pcache_open(oah_image *img, int module)
         free(blob);
         return pc;
     }
-    const u8 *p = blob + 24, *end = blob + len;
+    const u8 *p = blob + 32, *end = blob + len;
     pcache_ent *ents = calloc(n, sizeof(*ents));
     if (!ents) {
         free(blob);
@@ -419,7 +419,7 @@ static pcache *pcache_open(oah_image *img, int module)
         e->insns = ((const u32 *)p)[4];
         e->interp_next = ((const u32 *)p)[5];
         p += 24;
-        if (e->code_len > (u32)(end - p)) {
+        if ((size_t)(end - p) < (size_t)e->code_len) {
             break;
         }
         e->code = (u8 *)p;
@@ -567,13 +567,18 @@ static void pcache_flush_module(oah_module *m)
         free(all);
         return;
     }
-    u8 hdr[24];
+    u8 hdr[32];
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, pcache_magic, 8);
     ((u32 *)hdr)[2] = OAH_PCACHE_VERSION;
-    ((u32 *)hdr)[5] = OAH_BUILD_KEY;
+    ((u32 *)hdr)[6] = OAH_BUILD_KEY;
     ((u64 *)hdr)[2] = m->key;
-    fwrite(hdr, 1, sizeof(hdr), f);
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f);
+        unlink(tmp);
+        free(all);
+        return;
+    }
     /* Pending entries hold absolute addresses; disk entries are already
      * module-relative. Normalize everything to module-relative, using the
      * final base so late tags cannot skew earlier pending entries. */
@@ -591,7 +596,8 @@ static void pcache_flush_module(oah_module *m)
     }
     qsort(all, total, sizeof(*all), pcache_ent_cmp);
     u32 out = 0;
-    for (u32 i = 0; i < total; i++) {
+    int bad = 0;
+    for (u32 i = 0; i < total && !bad; i++) {
         if (out && all[i].off == all[i - 1].off) {
             continue; /* duplicate: first (sorted) copy wins */
         }
@@ -602,9 +608,6 @@ static void pcache_flush_module(oah_module *m)
         ((u32 *)ent)[3] = all[i].nrel;
         ((u32 *)ent)[4] = all[i].insns;
         ((u32 *)ent)[5] = all[i].interp_next;
-        fwrite(ent, 1, sizeof(ent), f);
-        fwrite(all[i].code, 1, all[i].code_len, f);
-        fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f);
         u8 trailer[32];
         memset(trailer, 0, sizeof(trailer));
         ((u32 *)trailer)[0] = all[i].nexits;
@@ -612,13 +615,19 @@ static void pcache_flush_module(oah_module *m)
         ((u32 *)trailer)[2] = all[i].exit_off[1];
         ((u64 *)trailer)[2] = all[i].exit_rip[0];
         ((u64 *)trailer)[3] = all[i].exit_rip[1];
-        fwrite(trailer, 1, sizeof(trailer), f);
+        bad = fwrite(ent, 1, sizeof(ent), f) != sizeof(ent) ||
+              fwrite(all[i].code, 1, all[i].code_len, f) != all[i].code_len ||
+              fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f) != all[i].nrel ||
+              fwrite(trailer, 1, sizeof(trailer), f) != sizeof(trailer);
         out++;
     }
-    fseek(f, 12, SEEK_SET);
-    fwrite(&out, 4, 1, f);
+    if (!bad && (fseek(f, 12, SEEK_SET) != 0 || fwrite(&out, 4, 1, f) != 1)) {
+        bad = 1;
+    }
     fclose(f);
-    rename(tmp, path);
+    if (bad || rename(tmp, path) != 0) {
+        unlink(tmp);
+    }
     free(all);
 }
 
@@ -679,7 +688,7 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
     u64 base = img->modules[module].base;
     for (u32 i = 0; i < e->nrel; i++) {
         const pcache_rel *r = &e->rel[i];
-        if (r->off + 16 > e->code_len) {
+        if (r->off > e->code_len || e->code_len - r->off < 16) {
             free(code);
             return NULL;
         }
@@ -695,7 +704,7 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
     oah_frag_info info = {.insns = e->insns ? e->insns : 1,
                           .interp_next = e->interp_next};
     for (u32 i = 0; i < e->nexits && i < 2; i++) {
-        if (e->exit_off[i] >= e->code_len) {
+        if (e->exit_off[i] > e->code_len || e->code_len - e->exit_off[i] < 4) {
             break;
         }
         info.exit_off[info.nexits] = e->exit_off[i];

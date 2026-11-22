@@ -75,7 +75,7 @@ QEMU_AARCH64   ?= qemu-aarch64-static
 # Keep oah's load address far from a typical ET_EXEC guest at 0x400000.
 AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 
-.PHONY: all test test-macos test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
+.PHONY: all test test-unit test-macos test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
 
@@ -97,15 +97,19 @@ tests/test_arm_native-aarch64: tests/test_arm_native.c $(LINUX_SRC)
 tests/hello.x86_64: tools/mk_hello_elf.py
 	python3 tools/mk_hello_elf.py $@
 
-ifeq ($(HOST_OS),Darwin)
-test: test-macos
-else
-test: $(TESTS) oah tests/hello.x86_64
+test-unit: $(TESTS)
 	@fail=0; \
 	for t in $(TESTS); do \
 	    echo "== $$t"; \
 	    ./$$t || fail=1; \
 	done; \
+	exit $$fail
+
+ifeq ($(HOST_OS),Darwin)
+test: test-unit test-macos
+else
+test: test-unit oah tests/hello.x86_64
+	@fail=0; \
 	echo "== oah tests/hello.x86_64"; \
 	./oah tests/hello.x86_64 > tests/hello.got || fail=1; \
 	printf 'hello\n' | cmp -s - tests/hello.got || { echo "  FAIL hello output"; fail=1; }; \
