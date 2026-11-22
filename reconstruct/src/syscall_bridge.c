@@ -152,7 +152,7 @@ static u64 guest_brk(oah_image *img, u64 addr)
         }
         img->segs[index] = (oah_load_seg){
             .gva = img->load_end + img->heap_guard, .size = end - img->heap_guard,
-            .host = img->heap_mapping + img->heap_guard, .prot = PROT_READ | PROT_WRITE
+            .host = img->heap_mapping + img->heap_guard, .prot = PROT_READ | PROT_WRITE, .module = -1
         };
     } else if (index < img->nseg) {
         img->segs[index] = img->segs[--img->nseg];
@@ -175,9 +175,9 @@ static void split_mapping(oah_image *img, unsigned i, u64 addr, u64 len, u32 pro
         seg->size = left;
         seg++;
     }
-    *seg++ = (oah_load_seg){addr, len, host, prot, original.file_mapping};
+    *seg++ = (oah_load_seg){addr, len, host, prot, original.file_mapping, original.module};
     if (right) {
-        *seg = (oah_load_seg){addr + len, right, host + len, original.prot, original.file_mapping};
+        *seg = (oah_load_seg){addr + len, right, host + len, original.prot, original.file_mapping, original.module};
     }
     img->nseg += extra;
     if (i < img->load_segments) {
@@ -263,7 +263,7 @@ static u64 guest_file_mmap(oah_image *img, u64 addr, u64 len, u32 prot,
     }
     img->segs[img->nseg++] = (oah_load_seg){
         .gva = (u64)(uintptr_t)staged, .size = len, .host = staged,
-        .prot = prot, .file_mapping = true
+        .prot = prot, .file_mapping = true, .module = -1
     };
     return (u64)(uintptr_t)staged;
 }
@@ -318,7 +318,7 @@ static u64 guest_mmap(oah_image *img, u64 addr, u64 len, u64 prot, u64 flags, u6
         return set_errno_ret(-1);
     }
     img->segs[img->nseg++] = (oah_load_seg){
-        .gva = (u64)(uintptr_t)ptr, .host = ptr, .size = len, .prot = (u32)prot
+        .gva = (u64)(uintptr_t)ptr, .host = ptr, .size = len, .prot = (u32)prot, .module = -1
     };
     return (u64)(uintptr_t)ptr;
 }

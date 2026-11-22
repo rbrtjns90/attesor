@@ -82,6 +82,79 @@ __asm__(
 );
 
 void oah_arm_native_enter(u64 *x, const void *code);
+
+/*
+ * Cached-fragment JIT entry. Same contract as oah_arm_native_enter plus:
+ *   ctx[16] = guest RFLAGS, round-tripped through host X19
+ *   ctx[17] = next guest RIP, round-tripped through host X20
+ * Fragments may freely clobber X16–X17 and X21–X28.
+ */
+__asm__(
+    ".text\n"
+    ".align 2\n"
+#if defined(__APPLE__)
+    ".global _oah_jit_native_enter\n"
+    "_oah_jit_native_enter:\n"
+#else
+    ".type oah_jit_native_enter, %function\n"
+    ".global oah_jit_native_enter\n"
+    "oah_jit_native_enter:\n"
+#endif
+    "    sub sp, sp, #128\n"
+    "    stp x29, x30, [sp]\n"
+#if defined(__APPLE__)
+    "    mov x29, sp\n"
+    "    str x19, [sp, #24]\n"
+#else
+    "    stp x18, x19, [sp, #16]\n"
+#endif
+    "    stp x20, x21, [sp, #32]\n"
+    "    stp x22, x23, [sp, #48]\n"
+    "    stp x24, x25, [sp, #64]\n"
+    "    stp x26, x27, [sp, #80]\n"
+    "    stp x28, xzr, [sp, #96]\n"
+    "    str x0, [sp, #112]\n"
+    "    mov x16, x0\n"
+    "    mov x17, x1\n"
+    "    ldp x0, x1, [x16, #0]\n"
+    "    ldp x2, x3, [x16, #16]\n"
+    "    ldp x4, x5, [x16, #32]\n"
+    "    ldp x6, x7, [x16, #48]\n"
+    "    ldp x8, x9, [x16, #64]\n"
+    "    ldp x10, x11, [x16, #80]\n"
+    "    ldp x12, x13, [x16, #96]\n"
+    "    ldp x14, x15, [x16, #112]\n"
+    "    ldp x19, x20, [x16, #128]\n"
+    "    blr x17\n"
+    "    ldr x16, [sp, #112]\n"
+    "    stp x0, x1, [x16, #0]\n"
+    "    stp x2, x3, [x16, #16]\n"
+    "    stp x4, x5, [x16, #32]\n"
+    "    stp x6, x7, [x16, #48]\n"
+    "    stp x8, x9, [x16, #64]\n"
+    "    stp x10, x11, [x16, #80]\n"
+    "    stp x12, x13, [x16, #96]\n"
+    "    stp x14, x15, [x16, #112]\n"
+    "    stp x19, x20, [x16, #128]\n"
+    "    ldp x29, x30, [sp]\n"
+#if defined(__APPLE__)
+    "    ldr x19, [sp, #24]\n"
+#else
+    "    ldp x18, x19, [sp, #16]\n"
+#endif
+    "    ldp x20, x21, [sp, #32]\n"
+    "    ldp x22, x23, [sp, #48]\n"
+    "    ldp x24, x25, [sp, #64]\n"
+    "    ldp x26, x27, [sp, #80]\n"
+    "    ldp x28, xzr, [sp, #96]\n"
+    "    add sp, sp, #128\n"
+    "    ret\n"
+#if !defined(__APPLE__)
+    ".size oah_jit_native_enter, .-oah_jit_native_enter\n"
+#endif
+);
+
+void oah_jit_native_enter(u64 *x, const void *code);
 #endif
 
 #if defined(__APPLE__) && defined(__aarch64__)

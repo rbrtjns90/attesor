@@ -10,6 +10,8 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+extern unsigned char *oah_jit_arena_for_debug;
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -20,6 +22,89 @@ static u32 prot_from_ph(u32 flags)
     return ((flags & PF_R) ? PROT_READ : 0) |
            ((flags & PF_W) ? PROT_WRITE : 0) |
            ((flags & PF_X) ? PROT_EXEC | PROT_READ : 0);
+}
+
+/* ---------- Module identity (persistent JIT cache) ---------- */
+
+static u64 module_key(const struct stat *st)
+{
+    u64 h = 1469598103934665603ull;
+    const u64 vals[] = {(u64)st->st_dev, (u64)st->st_ino, (u64)st->st_size,
+#if defined(__APPLE__)
+                        (u64)st->st_mtimespec.tv_sec,
+                        (u64)st->st_mtimespec.tv_nsec
+#else
+                        (u64)st->st_mtim.tv_sec,
+                        (u64)st->st_mtim.tv_nsec
+#endif
+    };
+    for (unsigned i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+        h = (h ^ vals[i]) * 1099511628211ull;
+    }
+    return h ? h : 1;
+}
+
+int oah_image_module_register(oah_image *img, const char *host_path)
+{
+    if (!img || !host_path || img->nmodule == OAH_MAX_MODULES) {
+        return -1;
+    }
+    struct stat st;
+    if (stat(host_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return -1;
+    }
+    u64 key = module_key(&st);
+    for (unsigned i = 0; i < img->nmodule; i++) {
+        if (img->modules[i].key == key) {
+            return (int)i;
+        }
+    }
+    oah_module *m = &img->modules[img->nmodule];
+    snprintf(m->path, sizeof(m->path), "%s", host_path);
+    m->key = key;
+    m->base = ~(u64)0;
+    m->jit_cache = NULL;
+    m->jit_cache_tried = false;
+    return (int)img->nmodule++;
+}
+
+void oah_image_tag_module(oah_image *img, u64 gva, u64 size, int module)
+{
+    if (!img || module < 0 || module >= (int)img->nmodule) {
+        return;
+    }
+    for (unsigned i = 0; i < img->nseg; i++) {
+        oah_load_seg *s = &img->segs[i];
+        if (s->gva >= gva && s->gva < gva + size) {
+            s->module = module;
+            if (s->gva < img->modules[module].base) {
+                img->modules[module].base = s->gva;
+            }
+        }
+    }
+}
+
+int oah_image_module_at(const oah_image *img, u64 gva)
+{
+    if (!img) {
+        return -1;
+    }
+    for (unsigned i = 0; i < img->nseg; i++) {
+        const oah_load_seg *s = &img->segs[i];
+        if (gva >= s->gva && gva - s->gva < s->size) {
+            return s->module;
+        }
+    }
+    return -1;
+}
+
+u64 oah_module_gva(const oah_image *img, int module, u64 off)
+{
+    if (!img || module < 0 || module >= (int)img->nmodule) {
+        return 0;
+    }
+    u64 base = img->modules[module].base;
+    return base == ~(u64)0 ? 0 : base + off;
 }
 
 void oah_unmap_elf(oah_image *img)
@@ -111,6 +196,20 @@ void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
             return seg->host + (gva - seg->gva);
         }
     }
+    if (getenv("OAH_SEG_DEBUG")) {
+        fprintf(stderr, "access MISS gva=%llx len=%llu prot=%u nseg=%u heap=%p guard=%llx brk=%llx\n",
+                (unsigned long long)gva, (unsigned long long)len, prot,
+                img ? img->nseg : 0, img ? img->heap_mapping : 0,
+                img ? (unsigned long long)img->heap_guard : 0,
+                img ? (unsigned long long)img->brk : 0);
+
+        for (unsigned i = 0; img && i < img->nseg && i < 40; i++) {
+            fprintf(stderr, "  seg[%u] gva=%llx size=%llx prot=%x host=%p\n", i,
+                    (unsigned long long)img->segs[i].gva,
+                    (unsigned long long)img->segs[i].size,
+                    img->segs[i].prot, img->segs[i].host);
+        }
+    }
     return NULL;
 }
 
@@ -149,7 +248,30 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
         return -1;
     }
     if (!realpath(request, resolved)) {
-        return -1;
+        if (!(flags & O_CREAT)) {
+            return -1;
+        }
+        /* Leaf doesn't exist yet: resolve the deepest real ancestor and
+         * append the remainder so O_CREAT lands inside the root. */
+        char ancestor[PATH_MAX];
+        strlcpy(ancestor, request, sizeof(ancestor));
+        for (;;) {
+            char *slash = strrchr(ancestor, '/');
+            if (!slash || slash == ancestor) {
+                errno = ENOENT;
+                return -1;
+            }
+            *slash = 0;
+            if (realpath(ancestor, resolved)) {
+                break;
+            }
+            if (errno != ENOENT && errno != ENOTDIR) {
+                return -1;
+            }
+        }
+        size_t used = strlen(resolved);
+        snprintf(resolved + used, sizeof(resolved) - used, "%s",
+                 request + strlen(ancestor));
     }
     size_t root_len = strlen(root);
     if (strcmp(root, "/") != 0 &&
@@ -159,6 +281,94 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
         return -1;
     }
     return open(resolved, flags | O_NOFOLLOW, (mode_t)mode);
+}
+
+/* Same resolution as oah_sysroot_open but returns the host path for calls
+ * that take paths (mkdirat, renameat, ...) rather than fds. */
+bool oah_sysroot_hostpath(const char *sysroot, const char *path,
+                          char *resolved, size_t capacity)
+{
+    char root[PATH_MAX], request[PATH_MAX];
+    if (path[0] != '/' || !realpath(sysroot, root)) {
+        errno = EINVAL;
+        return false;
+    }
+    int length = snprintf(request, sizeof(request), "%s%s", root, path);
+    if (length < 0 || (size_t)length >= sizeof(request) ||
+        (size_t)length >= capacity) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    /* Resolve only the parent directory: the leaf must keep lstat
+     * semantics so mutating calls (rename, unlink, lstat) never follow a
+     * symlink to its target. Intermediate components still resolve. */
+    char parent[PATH_MAX];
+    strlcpy(parent, request, sizeof(parent));
+    char *slash = strrchr(parent, '/');
+    if (!slash) {
+        errno = ENOENT;
+        return false;
+    }
+    const char *leaf = slash + 1;
+    if (slash == parent) {
+        parent[1] = 0;
+    } else {
+        *slash = 0;
+    }
+    if (!*leaf || !strcmp(leaf, ".") || !strcmp(leaf, "..")) {
+        /* Directory path: resolve it fully (no leaf to protect). */
+        if (!realpath(request, resolved)) {
+            char ancestor[PATH_MAX];
+            strlcpy(ancestor, request, sizeof(ancestor));
+            for (;;) {
+                char *s = strrchr(ancestor, '/');
+                if (!s || s == ancestor) {
+                    errno = ENOENT;
+                    return false;
+                }
+                *s = 0;
+                if (realpath(ancestor, resolved)) {
+                    break;
+                }
+                if (errno != ENOENT && errno != ENOTDIR) {
+                    return false;
+                }
+            }
+        }
+    } else if (realpath(parent, resolved)) {
+        size_t used = strlen(resolved);
+        if (used + 1 + strlen(leaf) + 1 > capacity) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        resolved[used] = '/';
+        strcpy(resolved + used + 1, leaf);
+    } else {
+        /* Resolve the deepest existing ancestor, then append the tail. */
+        char ancestor[PATH_MAX];
+        strlcpy(ancestor, request, sizeof(ancestor));
+        for (;;) {
+            slash = strrchr(ancestor, '/');
+            if (!slash || slash == ancestor) {
+                errno = ENOENT;
+                return false;
+            }
+            *slash = 0;
+            if (realpath(ancestor, resolved)) {
+                break;
+            }
+            if (errno != ENOENT && errno != ENOTDIR) {
+                return false;
+            }
+        }
+        size_t used = strlen(resolved);
+        snprintf(resolved + used, capacity - used, "%s",
+                 request + strlen(ancestor));
+    }
+    size_t root_len = strlen(root);
+    return strcmp(root, "/") == 0 ||
+           (strncmp(resolved, root, root_len) == 0 &&
+            (resolved[root_len] == '/' || resolved[root_len] == 0));
 }
 /* Resolve the guest program without passing a guest script to a host shell. */
 bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot,
@@ -382,7 +592,13 @@ static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)
     }
 #endif
     u64 span = high - low;
+#if defined(__APPLE__)
+    /* The brk heap is always identity-reserved on Darwin so translated
+     * fragments can address it with raw guest pointers. */
+    u64 heap_reserve = 64u << 20;
+#else
     u64 heap_reserve = interp && *interp ? (64u << 20) : 0;
+#endif
     u64 host_mask = (u64)host_page - 1;
     u64 allocation = (span + host_mask) & ~host_mask;
     bool identity_required = !software_pages && eh.e_type == ET_EXEC;
@@ -441,7 +657,8 @@ static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)
                 goto done;
             }
             img->segs[img->nseg++] = (oah_load_seg){
-                .gva = img->load_gva + first * image_page, .size = size, .host = host, .prot = prot
+                .gva = img->load_gva + first * image_page, .size = size,
+                .host = host, .prot = prot, .module = -1
             };
             img->load_segments = img->nseg;
         }
@@ -453,6 +670,11 @@ static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)
     img->phentsize = eh.e_phentsize;
     img->load_end = img->load_gva + span;
     img->brk = img->load_end;
+#if defined(__APPLE__)
+    if (img->heap_mapping) {
+        img->brk = (u64)(uintptr_t)img->heap_mapping;
+    }
+#endif
     success = oah_guest_access(img, img->entry, 1, PROT_EXEC) != NULL;
     if (success) {
         if (bias) {
@@ -476,16 +698,36 @@ bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot)
 {
     char interp_path[PATH_MAX] = {0};
     int fd = open(path, O_RDONLY | O_CLOEXEC);
+    char exe_host[PATH_MAX];
+    exe_host[0] = 0;
+#if defined(__APPLE__)
+    if (fd >= 0) {
+        (void)fcntl(fd, F_GETPATH, exe_host);
+    }
+#endif
     if (!map_elf_fd(img, fd, sysroot ? interp_path : NULL, NULL)) {
         return false;
     }
     img->sysroot = sysroot;
+    int module = oah_image_module_register(
+        img, exe_host[0] ? exe_host : path);
+    if (module >= 0) {
+        oah_image_tag_module(img, img->load_gva, img->load_end - img->load_gva,
+                             module);
+    }
     if (!*interp_path) {
         return true;
     }
 
     oah_image interpreter;
     fd = oah_sysroot_open(sysroot, interp_path, O_RDONLY | O_CLOEXEC, 0);
+    char interp_host[PATH_MAX];
+    interp_host[0] = 0;
+#if defined(__APPLE__)
+    if (fd >= 0) {
+        (void)fcntl(fd, F_GETPATH, interp_host);
+    }
+#endif
     if (!map_elf_fd(&interpreter, fd, NULL, &img->interp_base)) {
         int error = errno;
         oah_unmap_elf(img);
@@ -502,6 +744,21 @@ bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot)
            interpreter.nseg * sizeof(interpreter.segs[0]));
     img->nseg += interpreter.nseg;
     img->load_segments = img->nseg;
+    module = oah_image_module_register(
+        img, interp_host[0] ? interp_host : interp_path);
+    if (module >= 0) {
+        u64 lo = ~(u64)0, hi = 0;
+        for (unsigned i = 0; i < interpreter.nseg; i++) {
+            u64 g = interpreter.segs[i].gva;
+            if (g < lo) {
+                lo = g;
+            }
+            if (g + interpreter.segs[i].size > hi) {
+                hi = g + interpreter.segs[i].size;
+            }
+        }
+        oah_image_tag_module(img, lo, hi - lo, module);
+    }
     img->interp_mapping = interpreter.load_mapping;
     img->interp_mapping_size = interpreter.load_mapping_size;
     img->interp_entry = interpreter.entry;

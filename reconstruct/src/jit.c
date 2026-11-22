@@ -24,6 +24,7 @@ static oah_interp_result jit_loop(oah_guest *g, oah_image *img, u64 max_insns,
 
     while (r.insns < budget) {
 #if defined(__APPLE__)
+        oah_darwin_guest_tick(g);
         oah_sys_status signal_status = oah_guest_signal_poll(g, img);
         if (signal_status != OAH_SYS_CONTINUE) {
             r.status = signal_status == OAH_SYS_EXIT ? OAH_INTERP_EXIT : OAH_INTERP_FAULT;
@@ -110,3 +111,972 @@ oah_interp_result oah_jit_run_native(oah_guest *g, oah_image *img, u64 max_insns
     return jit_loop(g, img, max_insns, 0);
 #endif
 }
+
+/* ================= Cached-fragment JIT =================
+ *
+ * Rosetta-style fragment cache: guest RIP -> translated ARM64 code in a
+ * MAP_JIT arena. Fragments run under the oah_jit_native_enter contract:
+ *   x0–x15 guest GPRs, x19 guest RFLAGS, x20 next guest RIP.
+ * The dispatcher runs a fragment, reads x20, looks up the next fragment
+ * (translating on a miss), and falls back to the checked interpreter for
+ * one instruction whenever a block ends on an unhandled operation.
+ */
+
+#if defined(__APPLE__) && defined(__aarch64__)
+
+#include "oah/decode_insn.h"
+#include "oah/icache.h"
+
+#include <libkern/OSCacheControl.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <unistd.h>
+
+#define OAH_JIT_ARENA (32u << 20)
+#define OAH_JIT_TABLE_BITS 15
+#define OAH_JIT_TABLE_SIZE (1u << OAH_JIT_TABLE_BITS)
+
+#define OAH_FRAG_FALLBACK 1u /* run one interp step at exit RIP */
+
+typedef struct {
+    u64 rip;
+    u32 insns;
+    u32 flags;
+    u32 code_off;
+    u32 code_len;
+    u32 nexits;
+    u32 exit_off[2];
+    u64 exit_rip[2];
+} oah_frag_entry;
+
+void oah_jit_native_enter(u64 *x, const void *code);
+
+static oah_frag_entry jit_table[OAH_JIT_TABLE_SIZE];
+static u8 *jit_arena;
+unsigned char *oah_jit_arena_for_debug;
+
+static size_t jit_arena_size;
+static size_t jit_arena_used;
+
+static u64 jit_hash(u64 rip)
+{
+    return (rip * 0x9e3779b97f4a7c15ull) >> (64 - OAH_JIT_TABLE_BITS);
+}
+
+static oah_frag_entry *jit_lookup(u64 rip)
+{
+    u64 idx = jit_hash(rip);
+    for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
+        oah_frag_entry *e = &jit_table[(idx + i) & (OAH_JIT_TABLE_SIZE - 1)];
+        if (!e->rip) {
+            return NULL;
+        }
+        if (e->rip == rip) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void jit_insert(const oah_frag_entry *entry)
+{
+    u64 idx = jit_hash(entry->rip);
+    for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
+        oah_frag_entry *e = &jit_table[(idx + i) & (OAH_JIT_TABLE_SIZE - 1)];
+        if (!e->rip || e->rip == entry->rip) {
+            *e = *entry;
+            return;
+        }
+    }
+}
+
+/* The fragment the dispatcher last entered — its unlinked constant exits
+ * are repatched to `b` the next fragment when the target is already
+ * translated (Rosetta-style block repatching). */
+static oah_frag_entry *chain_prev;
+static bool jit_chain = true;
+
+/* Rewrite an exit's `ret` into `b <target>` when it is in range. */
+static void jit_chain_patch(oah_frag_entry *e, u32 slot, u32 target_off)
+{
+    u8 *site = jit_arena + e->code_off + e->exit_off[slot];
+    s64 diff = (s64)(jit_arena + target_off - site) >> 2;
+    if (diff < -(1ll << 25) || diff >= (1ll << 25)) {
+        return;
+    }
+    pthread_jit_write_protect_np(0);
+    *(u32 *)site = 0x14000000u | (u32)((u64)diff & 0x3ffffff);
+    sys_icache_invalidate(site, 4);
+    pthread_jit_write_protect_np(1);
+    e->exit_off[slot] = 0;
+}
+
+void oah_jit_cache_flush(void)
+{
+    memset(jit_table, 0, sizeof(jit_table));
+    jit_arena_used = 0;
+    chain_prev = NULL;
+}
+
+static bool jit_arena_init(void)
+{
+    if (jit_arena) {
+        return true;
+    }
+#if defined(__APPLE__)
+    jit_arena_size = OAH_JIT_ARENA;
+    jit_arena = mmap(NULL, jit_arena_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    oah_jit_arena_for_debug = jit_arena;
+    return jit_arena != MAP_FAILED;
+#else
+    return false;
+#endif
+}
+
+/* ================= Persistent fragment cache =================
+ *
+ * Each mapped guest ELF (exe, interpreter, libraries) gets a per-module
+ * .oahjc file under the cache dir. Entries carry relocations describing
+ * the fixed-length movz/movk materializations in the emitted code, so a
+ * cached fragment rebinds to the module's new load address at materialize
+ * time. Keyed by dev/ino/size/mtime — a changed file gets a new name and
+ * the stale file is reclaimed by normal eviction or manual clearing.
+ */
+
+#define OAH_PCACHE_VERSION 3u
+/* Cache files are tied to the translator build: a rebuilt binary may emit
+ * different code for the same guest, so old files must not be reused.
+ * OAH_BUILD_KEY comes from the Makefile (git commit hash). */
+#ifndef OAH_BUILD_KEY
+#define OAH_BUILD_KEY 0u
+#endif
+static const u8 pcache_magic[8] = {'O', 'A', 'H', 'J', 'C', '0', '0', '1'};
+
+typedef struct {
+    u32 off;
+    u32 kind;
+    u8 rd;
+    u8 pad[7];
+    u64 value; /* GVA: module-relative offset of the target */
+} pcache_rel;
+
+typedef struct {
+    u64 off; /* disk: module-relative rip; pend: absolute rip */
+    u32 code_len;
+    u32 nrel;
+    u32 insns;
+    u32 interp_next;
+    u32 nexits;
+    u32 exit_off[2];
+    u64 exit_rip[2]; /* disk: module-relative; pend: absolute */
+    u8 *code;
+    pcache_rel *rel;
+} pcache_ent;
+
+typedef struct {
+    u8 *blob;
+    size_t blob_size;
+    pcache_ent *disk;
+    u32 n_disk;
+    pcache_ent *pend;
+    u32 n_pend;
+    u32 cap_pend;
+} pcache;
+
+static bool jit_persist = true;
+
+static int pcache_mkdirs(const char *dir)
+{
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", dir);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    return mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static const char *pcache_dir(char *out, size_t size)
+{
+    const char *env = getenv("OAH_CACHE_DIR");
+    if (env && *env) {
+        snprintf(out, size, "%s", env);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) {
+            return NULL;
+        }
+        snprintf(out, size, "%s/Library/Caches/Attesor/jit", home);
+    }
+    return pcache_mkdirs(out) == 0 ? out : NULL;
+}
+
+static void pcache_path_in(const char *dir, const oah_module *m, char *out,
+                           size_t size)
+{
+    const char *base = strrchr(m->path, '/');
+    base = base ? base + 1 : m->path;
+    snprintf(out, size, "%s/%s-%016llx.oahjc", dir, base,
+             (unsigned long long)m->key);
+}
+
+static void pcache_path(const oah_module *m, char *out, size_t size)
+{
+    char dir[PATH_MAX];
+    if (!pcache_dir(dir, sizeof(dir))) {
+        out[0] = 0;
+        return;
+    }
+    pcache_path_in(dir, m, out, size);
+}
+
+/* Read-only fallback: when OAH_CACHE_DIR points at a non-default dir, also
+ * consult the default cache so fragments written before the env var was
+ * set (e.g. direct `oah` invocations) stay usable. Writes stay primary. */
+static bool pcache_alt_path(const oah_module *m, char *out, size_t size)
+{
+    const char *env = getenv("OAH_CACHE_DIR");
+    const char *home = getenv("HOME");
+    if (!env || !*env || !home || !*home) {
+        return false;
+    }
+    char def[PATH_MAX];
+    snprintf(def, sizeof(def), "%s/Library/Caches/Attesor/jit", home);
+    if (strcmp(env, def) == 0) {
+        return false;
+    }
+    pcache_path_in(def, m, out, size);
+    return true;
+}
+
+/* Read and index the module's .oahjc (once). A non-NULL pcache with no
+ * disk entries means "no usable file", distinct from a parse failure. */
+static pcache *pcache_open(oah_image *img, int module)
+{
+    oah_module *m = &img->modules[module];
+    if (!jit_persist) {
+        return NULL;
+    }
+    if (m->jit_cache_tried) {
+        return m->jit_cache;
+    }
+    m->jit_cache_tried = true;
+    pcache *pc = calloc(1, sizeof(*pc));
+    m->jit_cache = pc;
+    char path[PATH_MAX];
+    pcache_path(m, path, sizeof(path));
+    FILE *f = path[0] ? fopen(path, "rb") : NULL;
+    if (!f && pcache_alt_path(m, path, sizeof(path))) {
+        f = fopen(path, "rb");
+    }
+    if (!f) {
+        return pc;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    u8 *blob = len > 0 ? malloc((size_t)len) : NULL;
+    if (!blob || fread(blob, 1, (size_t)len, f) != (size_t)len) {
+        fclose(f);
+        free(blob);
+        return pc;
+    }
+    fclose(f);
+    if (len < 24 || memcmp(blob, pcache_magic, 8) ||
+        ((const u32 *)blob)[2] != OAH_PCACHE_VERSION ||
+        ((const u32 *)blob)[5] != OAH_BUILD_KEY ||
+        ((const u64 *)blob)[2] != m->key) {
+        free(blob);
+        return pc;
+    }
+    u32 n = ((const u32 *)blob)[3];
+    if ((u64)n > (u64)len / 24) {
+        free(blob);
+        return pc;
+    }
+    const u8 *p = blob + 24, *end = blob + len;
+    pcache_ent *ents = calloc(n, sizeof(*ents));
+    if (!ents) {
+        free(blob);
+        return pc;
+    }
+    u32 count = 0;
+    for (u32 i = 0; i < n && p + 24 <= end; i++) {
+        pcache_ent *e = &ents[count];
+        e->off = ((const u64 *)p)[0];
+        e->code_len = ((const u32 *)p)[2];
+        e->nrel = ((const u32 *)p)[3];
+        e->insns = ((const u32 *)p)[4];
+        e->interp_next = ((const u32 *)p)[5];
+        p += 24;
+        if (e->code_len > (u32)(end - p)) {
+            break;
+        }
+        e->code = (u8 *)p;
+        p += e->code_len;
+        if (e->nrel > OAH_FRAG_MAX_RELOCS ||
+            e->nrel * sizeof(pcache_rel) > (size_t)(end - p)) {
+            break;
+        }
+        e->rel = (pcache_rel *)p;
+        p += e->nrel * sizeof(pcache_rel);
+        if (p + 32 > end) {
+            break;
+        }
+        e->nexits = ((const u32 *)p)[0];
+        if (e->nexits > 2) {
+            break;
+        }
+        e->exit_off[0] = ((const u32 *)p)[1];
+        e->exit_off[1] = ((const u32 *)p)[2];
+        e->exit_rip[0] = ((const u64 *)p)[2];
+        e->exit_rip[1] = ((const u64 *)p)[3];
+        p += 32;
+        count++;
+    }
+    pc->blob = blob;
+    pc->blob_size = (size_t)len;
+    pc->disk = ents;
+    pc->n_disk = count;
+    return pc;
+}
+
+static const pcache_ent *pcache_find(pcache *pc, u64 off)
+{
+    u32 lo = 0, hi = pc->n_disk;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+        if (pc->disk[mid].off < off) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < pc->n_disk && pc->disk[lo].off == off ? &pc->disk[lo] : NULL;
+}
+
+/* Re-emit the fixed 4-insn movz/movk materialization with a new value. */
+static void patch_imm64(u8 *dst, u8 rd, u64 val)
+{
+    u32 *p = (u32 *)dst;
+    p[0] = 0xd2800000u | ((u32)(val & 0xffff) << 5) | rd;
+    p[1] = 0xf2800000u | (1u << 21) | ((u32)((val >> 16) & 0xffff) << 5) | rd;
+    p[2] = 0xf2800000u | (2u << 21) | ((u32)((val >> 32) & 0xffff) << 5) | rd;
+    p[3] = 0xf2800000u | (3u << 21) | ((u32)((val >> 48) & 0xffff) << 5) | rd;
+}
+
+/* Record a freshly translated fragment for the module's cache file.
+ * Persists only when every GVA reloc resolves inside the same module.
+ * rip and reloc values stay absolute here; they become module-relative
+ * at flush (the module base may still shift while more segs are tagged). */
+static void pcache_pend(oah_image *img, int module, u64 rip,
+                        const u8 *code, size_t code_len,
+                        const oah_frag_info *info)
+{
+    if (info->reloc_overflow) {
+        return;
+    }
+    u64 base = img->modules[module].base;
+    for (u32 i = 0; i < info->nrelocs; i++) {
+        const oah_frag_reloc *r = &info->relocs[i];
+        if (r->kind == OAH_RELOC_GVA &&
+            (r->value < base || oah_image_module_at(img, r->value) != module)) {
+            return; /* cross-module target: cannot rebase — skip */
+        }
+    }
+    pcache *pc = pcache_open(img, module);
+    if (!pc || pcache_find(pc, rip - base)) {
+        return; /* already persisted */
+    }
+    if (pc->n_pend == pc->cap_pend) {
+        u32 cap = pc->cap_pend ? pc->cap_pend * 2 : 64;
+        pcache_ent *np = realloc(pc->pend, cap * sizeof(*np));
+        if (!np) {
+            return;
+        }
+        pc->pend = np;
+        pc->cap_pend = cap;
+    }
+    pcache_ent *e = &pc->pend[pc->n_pend];
+    e->off = rip;
+    e->code_len = (u32)code_len;
+    e->nrel = info->nrelocs;
+    e->insns = info->insns;
+    e->interp_next = info->interp_next;
+    e->nexits = info->nexits > 2 ? 0 : info->nexits;
+    for (u32 i = 0; i < e->nexits; i++) {
+        e->exit_off[i] = info->exit_off[i];
+        e->exit_rip[i] = info->exit_rip[i];
+    }
+    e->code = malloc(code_len ? code_len : 1);
+    e->rel = malloc(info->nrelocs ? info->nrelocs * sizeof(*e->rel) : 1);
+    if (!e->code || !e->rel) {
+        free(e->code);
+        free(e->rel);
+        return;
+    }
+    memcpy(e->code, code, code_len);
+    for (u32 i = 0; i < info->nrelocs; i++) {
+        e->rel[i].off = info->relocs[i].off;
+        e->rel[i].kind = info->relocs[i].kind;
+        e->rel[i].rd = info->relocs[i].rd;
+        e->rel[i].value = info->relocs[i].value;
+    }
+    pc->n_pend++;
+}
+
+static int pcache_ent_cmp(const void *a, const void *b)
+{
+    u64 x = ((const pcache_ent *)a)->off, y = ((const pcache_ent *)b)->off;
+    return x < y ? -1 : x > y;
+}
+
+/* Merge pending fragments over the disk set and rewrite the file. */
+static void pcache_flush_module(oah_module *m)
+{
+    pcache *pc = m->jit_cache;
+    if (!pc || !pc->n_pend) {
+        return;
+    }
+    u32 total = pc->n_disk + pc->n_pend;
+    pcache_ent *all = malloc(total * sizeof(*all));
+    if (!all) {
+        return;
+    }
+    memcpy(all, pc->disk, pc->n_disk * sizeof(*all));
+    memcpy(all + pc->n_disk, pc->pend, pc->n_pend * sizeof(*all));
+    char path[PATH_MAX], tmp[PATH_MAX];
+    pcache_path(m, path, sizeof(path));
+    if (!path[0]) {
+        free(all);
+        return;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        free(all);
+        return;
+    }
+    u8 hdr[24];
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, pcache_magic, 8);
+    ((u32 *)hdr)[2] = OAH_PCACHE_VERSION;
+    ((u32 *)hdr)[5] = OAH_BUILD_KEY;
+    ((u64 *)hdr)[2] = m->key;
+    fwrite(hdr, 1, sizeof(hdr), f);
+    /* Pending entries hold absolute addresses; disk entries are already
+     * module-relative. Normalize everything to module-relative, using the
+     * final base so late tags cannot skew earlier pending entries. */
+    u64 base = m->base;
+    for (u32 i = pc->n_disk; i < total; i++) {
+        all[i].off -= base;
+        for (u32 j = 0; j < all[i].nrel; j++) {
+            if (all[i].rel[j].kind == OAH_RELOC_GVA) {
+                all[i].rel[j].value -= base;
+            }
+        }
+        for (u32 j = 0; j < all[i].nexits; j++) {
+            all[i].exit_rip[j] -= base;
+        }
+    }
+    qsort(all, total, sizeof(*all), pcache_ent_cmp);
+    u32 out = 0;
+    for (u32 i = 0; i < total; i++) {
+        if (out && all[i].off == all[i - 1].off) {
+            continue; /* duplicate: first (sorted) copy wins */
+        }
+        u8 ent[24];
+        memset(ent, 0, sizeof(ent));
+        ((u64 *)ent)[0] = all[i].off;
+        ((u32 *)ent)[2] = all[i].code_len;
+        ((u32 *)ent)[3] = all[i].nrel;
+        ((u32 *)ent)[4] = all[i].insns;
+        ((u32 *)ent)[5] = all[i].interp_next;
+        fwrite(ent, 1, sizeof(ent), f);
+        fwrite(all[i].code, 1, all[i].code_len, f);
+        fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f);
+        u8 trailer[32];
+        memset(trailer, 0, sizeof(trailer));
+        ((u32 *)trailer)[0] = all[i].nexits;
+        ((u32 *)trailer)[1] = all[i].exit_off[0];
+        ((u32 *)trailer)[2] = all[i].exit_off[1];
+        ((u64 *)trailer)[2] = all[i].exit_rip[0];
+        ((u64 *)trailer)[3] = all[i].exit_rip[1];
+        fwrite(trailer, 1, sizeof(trailer), f);
+        out++;
+    }
+    fseek(f, 12, SEEK_SET);
+    fwrite(&out, 4, 1, f);
+    fclose(f);
+    rename(tmp, path);
+    free(all);
+}
+
+static void pcache_flush(oah_image *img)
+{
+    if (!jit_persist || !img) {
+        return;
+    }
+    for (unsigned i = 0; i < img->nmodule; i++) {
+        pcache_flush_module(&img->modules[i]);
+    }
+}
+
+/* Copy code into the executable arena and index it. Shared by translation,
+ * AOT prewarm, and persistent-cache materialization. */
+static const oah_frag_entry *jit_install(u64 rip, const oah_frag_info *info,
+                                         const u8 *code, size_t code_len)
+{
+    if (code_len > jit_arena_size - jit_arena_used) {
+        /* Arena full: drop everything and retranslate on demand. */
+        oah_jit_cache_flush();
+    }
+    if (code_len > jit_arena_size) {
+        return NULL;
+    }
+    oah_frag_entry e = {
+        .rip = rip,
+        .insns = info->insns,
+        .flags = info->interp_next ? OAH_FRAG_FALLBACK : 0,
+        .code_off = (u32)jit_arena_used,
+        .code_len = (u32)code_len,
+        .nexits = info->nexits > 2 ? 0 : info->nexits,
+    };
+    for (u32 i = 0; i < e.nexits; i++) {
+        e.exit_off[i] = info->exit_off[i];
+        e.exit_rip[i] = info->exit_rip[i];
+    }
+    pthread_jit_write_protect_np(0);
+    memcpy(jit_arena + jit_arena_used, code, code_len);
+    pthread_jit_write_protect_np(1);
+    sys_icache_invalidate(jit_arena + jit_arena_used, code_len);
+    jit_arena_used += code_len;
+    jit_insert(&e);
+    return jit_lookup(rip);
+}
+
+/* Materialize a persisted fragment: rebase relocations onto the module's
+ * current load address (and live FS/GS bases), then install. */
+static const oah_frag_entry *jit_materialize(oah_image *img,
+                                             const oah_guest *g, int module,
+                                             u64 rip, const pcache_ent *e)
+{
+    u8 *code = malloc(e->code_len);
+    if (!code) {
+        return NULL;
+    }
+    memcpy(code, e->code, e->code_len);
+    u64 base = img->modules[module].base;
+    for (u32 i = 0; i < e->nrel; i++) {
+        const pcache_rel *r = &e->rel[i];
+        if (r->off + 16 > e->code_len) {
+            free(code);
+            return NULL;
+        }
+        u64 val = r->kind == OAH_RELOC_GVA ? base + r->value
+                  : r->kind == OAH_RELOC_FS ? g->fs_base
+                  : r->kind == OAH_RELOC_GS ? g->gs_base : ~(u64)0;
+        if (val == ~(u64)0) {
+            free(code);
+            return NULL;
+        }
+        patch_imm64(code + r->off, r->rd, val);
+    }
+    oah_frag_info info = {.insns = e->insns ? e->insns : 1,
+                          .interp_next = e->interp_next};
+    for (u32 i = 0; i < e->nexits && i < 2; i++) {
+        if (e->exit_off[i] >= e->code_len) {
+            break;
+        }
+        info.exit_off[info.nexits] = e->exit_off[i];
+        info.exit_rip[info.nexits] = base + e->exit_rip[i];
+        info.nexits++;
+    }
+    const oah_frag_entry *res = jit_install(rip, &info, code, e->code_len);
+    free(code);
+    return res;
+}
+
+/* Translate one fragment at rip and install it. NULL when undecodable. */
+static const oah_frag_entry *jit_translate(oah_image *img, const oah_guest *g,
+                                           u64 rip)
+{
+    int module = oah_image_module_at(img, rip);
+    if (module >= 0) {
+        u64 off = rip - img->modules[module].base;
+        pcache *pc = pcache_open(img, module);
+        const pcache_ent *e = pc ? pcache_find(pc, off) : NULL;
+        if (e) {
+            const oah_frag_entry *frag = jit_materialize(img, g, module,
+                                                       rip, e);
+            if (frag) {
+                return frag;
+            }
+        }
+    }
+    oah_asm_buf buf;
+    oah_frag_info info;
+    oah_asm_buf_init(&buf);
+    if (!oah_translate_frag(&buf, img, g, rip, &info) || !buf.size) {
+        oah_asm_buf_destroy(&buf);
+        return NULL;
+    }
+    const char *trace = getenv("OAH_JIT_TRACE");
+    if (trace) {
+        u64 avail = 15;
+        const u8 *pc = oah_guest_span(img, rip, &avail);
+        if ((u64)(uintptr_t)pc != rip) {
+            fprintf(stderr, "SPAN NONIDENT rip=%llx pc=%p avail=%llu\n",
+                    (unsigned long long)rip, pc, (unsigned long long)avail);
+            for (unsigned i = 0; i < img->nseg; i++) {
+                const oah_load_seg *s = &img->segs[i];
+                if (rip >= s->gva && rip - s->gva < s->size) {
+                    fprintf(stderr, "  seg%u gva=%llx host=%p size=%llx prot=%d\n",
+                            i, (unsigned long long)s->gva, s->host,
+                            (unsigned long long)s->size, s->prot);
+                }
+            }
+        }
+        fprintf(stderr, "frag %llx insns=%u fallback=%u bytes:",
+                (unsigned long long)rip, info.insns, info.interp_next);
+        for (u64 i = 0; pc && i < avail && i < 8; i++) {
+            fprintf(stderr, " %02x", pc[i]);
+        }
+        fputc('\n', stderr);
+        if (trace[0] == '2') {
+            for (size_t i = 0; i < buf.size; i += 4) {
+                fprintf(stderr, "  %02zu: %02x%02x%02x%02x\n", i / 4,
+                        buf.data[i], buf.data[i + 1], buf.data[i + 2],
+                        buf.data[i + 3]);
+            }
+        }
+    }
+    const oah_frag_entry *frag = jit_install(rip, &info, buf.data, buf.size);
+    if (frag && module >= 0) {
+        pcache_pend(img, module, rip, buf.data, buf.size, &info);
+    }
+    oah_asm_buf_destroy(&buf);
+    return frag;
+}
+
+/* Length in bytes covered by a translated block (for the prewarm scan). */
+static u64 in_block_len(oah_image *img, u64 rip, u32 insns)
+{
+    u64 len = 0;
+    u64 cur = rip;
+    for (u32 i = 0; i < insns; i++) {
+        u64 avail = OAH_X86_MAX_INSN;
+        const u8 *pc = oah_guest_span(img, cur, &avail);
+        oah_insn in;
+        if (!pc || !oah_decode_insn(pc, pc + avail, &in)) {
+            break;
+        }
+        len += in.length;
+        cur += in.length;
+    }
+    return len ? len : 1;
+}
+
+/* AOT: scan each executable segment and pretranslate discovered blocks. */
+static void jit_prewarm(oah_image *img, const oah_guest *g)
+{
+    for (unsigned i = 0; i < img->nseg; i++) {
+        const oah_load_seg *seg = &img->segs[i];
+        if ((seg->prot & (PROT_EXEC | PROT_READ)) != (PROT_EXEC | PROT_READ)) {
+            continue;
+        }
+        for (u64 off = 0; off < seg->size;) {
+            u64 rip = seg->gva + off;
+            oah_asm_buf buf;
+            oah_frag_info info;
+            oah_asm_buf_init(&buf);
+            if (oah_translate_frag(&buf, img, g, rip, &info) && buf.size) {
+                if (buf.size <= jit_arena_size - jit_arena_used) {
+                    jit_install(rip, &info, buf.data, buf.size);
+                }
+                if (seg->module >= 0) {
+                    pcache_pend(img, seg->module, rip, buf.data, buf.size,
+                                &info);
+                }
+                /* advance by decoded bytes for coverage without re-decoding */
+                off += in_block_len(img, rip, info.insns);
+            } else {
+                off++;
+            }
+            oah_asm_buf_destroy(&buf);
+        }
+    }
+    sys_icache_invalidate(jit_arena, jit_arena_used);
+}
+
+static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
+                                              u64 max_insns, bool aot)
+{
+    oah_interp_result r = {.status = OAH_INTERP_OK, .exit_code = 0, .insns = 0};
+    u64 budget = max_insns ? max_insns : OAH_INTERP_MAX_INSNS;
+    u64 ctx[24];
+
+    if (!jit_arena_init()) {
+        return oah_jit_run_native(g, img, max_insns);
+    }
+    if (aot) {
+        jit_prewarm(img, g);
+    }
+
+    /* Differential debug: OAH_JIT_VERIFY runs a reference interpreter
+     * alongside and reports the first divergent instruction. */
+    oah_guest g_ref;
+    bool verify = getenv("OAH_JIT_VERIFY") != NULL;
+    bool chain = jit_chain && !getenv("OAH_JIT_NOCHAIN") && !verify;
+    if (verify) {
+        g_ref = *g;
+    }
+
+    while (r.insns < budget) {
+        u64 entry_rip = g->rip;
+        if (verify && g_ref.rip != g->rip) {
+            fprintf(stderr,
+                    "JIT drift before frag: jit=%llx ref=%llx\n",
+                    (unsigned long long)g->rip,
+                    (unsigned long long)g_ref.rip);
+        }
+        static u64 maxfrags = ~0ull, fragcount = 0;
+        if (maxfrags == ~0ull && getenv("OAH_JIT_MAXFRAGS")) {
+            maxfrags = strtoull(getenv("OAH_JIT_MAXFRAGS"), NULL, 0);
+            fprintf(stderr, "maxfrags=%llu\n", (unsigned long long)maxfrags);
+        }
+        const oah_frag_entry *frag = jit_lookup(g->rip);
+        if (!frag) {
+            frag = jit_translate(img, g, g->rip);
+            if (!frag) {
+                /* Undecodable: let the interpreter run it and report. */
+                oah_interp_result one = oah_interp_run(g, img, 1);
+                r.insns += one.insns;
+                if (verify) {
+                    (void)oah_interp_run(&g_ref, img, 1);
+                }
+                if (one.status != OAH_INTERP_LIMIT) {
+                    fprintf(stderr,
+                            "jit stop1 status=%d rip=%llx off=%llx\n"
+                            " rax=%llx rbx=%llx rcx=%llx rdx=%llx\n"
+                            " rsp=%llx rbp=%llx rsi=%llx rdi=%llx\n",
+                            one.status, (unsigned long long)g->rip,
+                            (unsigned long long)(g->rip - img->interp_base),
+                            (unsigned long long)g->gpr[OAH_X86_RAX],
+                            (unsigned long long)g->gpr[OAH_X86_RBX],
+                            (unsigned long long)g->gpr[OAH_X86_RCX],
+                            (unsigned long long)g->gpr[OAH_X86_RDX],
+                            (unsigned long long)g->gpr[OAH_X86_RSP],
+                            (unsigned long long)g->gpr[OAH_X86_RBP],
+                            (unsigned long long)g->gpr[OAH_X86_RSI],
+                            (unsigned long long)g->gpr[OAH_X86_RDI]);
+                    r.status = one.status;
+                    r.exit_code = one.exit_code;
+                    return r;
+                }
+                continue;
+            }
+        }
+        if (fragcount++ >= maxfrags) {
+            oah_interp_result one = oah_interp_run(g, img, 1);
+            r.insns += one.insns;
+            if (one.status != OAH_INTERP_LIMIT) {
+                r.status = one.status;
+                r.exit_code = one.exit_code;
+                return r;
+            }
+            continue;
+        }
+        if (chain && !verify && chain_prev) {
+            for (u32 i = 0; i < chain_prev->nexits; i++) {
+                if (chain_prev->exit_off[i] &&
+                    chain_prev->exit_rip[i] == frag->rip) {
+                    jit_chain_patch(chain_prev, i, frag->code_off);
+                }
+            }
+        }
+        chain_prev = (oah_frag_entry *)frag;
+        oah_pack_runtime_x(ctx, g);
+        ctx[16] = g->rflags;
+        ctx[17] = g->rip;
+        oah_jit_native_enter(ctx, jit_arena + frag->code_off);
+        oah_unpack_runtime_x(g, ctx);
+        g->rflags = ctx[16];
+        g->rip = ctx[17];
+        r.insns += frag->insns;
+
+#if defined(__APPLE__)
+        oah_darwin_guest_tick(g);
+        oah_sys_status signal_status = oah_guest_signal_poll(g, img);
+        if (signal_status != OAH_SYS_CONTINUE) {
+            fprintf(stderr,
+                    "jit sigstop status=%d rip=%llx off=%llx\n"
+                    " rax=%llx rbx=%llx rcx=%llx rdx=%llx\n"
+                    " rsp=%llx rbp=%llx rsi=%llx rdi=%llx\n",
+                    signal_status, (unsigned long long)g->rip,
+                    (unsigned long long)(g->rip - img->interp_base),
+                    (unsigned long long)g->gpr[OAH_X86_RAX],
+                    (unsigned long long)g->gpr[OAH_X86_RBX],
+                    (unsigned long long)g->gpr[OAH_X86_RCX],
+                    (unsigned long long)g->gpr[OAH_X86_RDX],
+                    (unsigned long long)g->gpr[OAH_X86_RSP],
+                    (unsigned long long)g->gpr[OAH_X86_RBP],
+                    (unsigned long long)g->gpr[OAH_X86_RSI],
+                    (unsigned long long)g->gpr[OAH_X86_RDI]);
+            r.status = signal_status == OAH_SYS_EXIT ? OAH_INTERP_EXIT
+                                                   : OAH_INTERP_FAULT;
+            r.exit_code = (int)(g->gpr[OAH_X86_RDI] & 0xff);
+            return r;
+        }
+#endif
+        u64 interp_rip = ctx[17];
+        if (frag->flags & OAH_FRAG_FALLBACK) {
+            oah_interp_result one = oah_interp_run(g, img, 1);
+            r.insns += one.insns;
+            if (one.status != OAH_INTERP_LIMIT) {
+                if (one.status != OAH_INTERP_EXIT || getenv("OAH_STOP_TRACE")) {
+                    fprintf(stderr,
+                        "jit stop2 status=%d rip=%llx off=%llx\n"
+                        " rax=%llx rbx=%llx rcx=%llx rdx=%llx\n"
+                        " rsp=%llx rbp=%llx rsi=%llx rdi=%llx\n",
+                        one.status, (unsigned long long)g->rip,
+                        (unsigned long long)(g->rip - img->interp_base),
+                        (unsigned long long)g->gpr[OAH_X86_RAX],
+                        (unsigned long long)g->gpr[OAH_X86_RBX],
+                        (unsigned long long)g->gpr[OAH_X86_RCX],
+                        (unsigned long long)g->gpr[OAH_X86_RDX],
+                        (unsigned long long)g->gpr[OAH_X86_RSP],
+                        (unsigned long long)g->gpr[OAH_X86_RBP],
+                        (unsigned long long)g->gpr[OAH_X86_RSI],
+                        (unsigned long long)g->gpr[OAH_X86_RDI]);
+                }
+                r.status = one.status;
+                r.exit_code = one.exit_code;
+                return r;
+            }
+        }
+
+        if (verify) {
+            /* RDTSC is non-deterministic — sync timestamp regs afterward. */
+            bool skip_tsc = false;
+            if (frag->flags & OAH_FRAG_FALLBACK) {
+                u64 avail = OAH_X86_MAX_INSN;
+                const u8 *pc = oah_guest_span(img, interp_rip, &avail);
+                oah_insn in;
+                if (pc && oah_decode_insn(pc, pc + avail, &in) &&
+                    in.op == OAH_OP_RDTSC) {
+                    skip_tsc = true;
+                }
+            }
+            /* Run the reference one insn at a time; compare each step. */
+            u64 steps = frag->insns + ((frag->flags & OAH_FRAG_FALLBACK) ? 1 : 0);
+            for (u64 s = 0; s < steps; s++) {
+                u64 ref_rip = g_ref.rip;
+                /* The jit side already executed boundary syscalls; replaying
+                 * them would double their side effects. Sync instead. */
+                u64 avail = OAH_X86_MAX_INSN;
+                const u8 *rpc = oah_guest_span(img, ref_rip, &avail);
+                oah_insn rin;
+                if (rpc && oah_decode_insn(rpc, rpc + avail, &rin) &&
+                    rin.op == OAH_OP_SYSCALL) {
+                    g_ref = *g;
+                    break;
+                }
+                oah_interp_result ref = oah_interp_run(&g_ref, img, 1);
+                if (ref.status != OAH_INTERP_LIMIT &&
+                    ref.status != OAH_INTERP_OK) {
+                    fprintf(stderr,
+                            "ref-side stop status=%d entry=%llx ref_rip=%llx jit_rip=%llx\n",
+                            ref.status, (unsigned long long)entry_rip,
+                            (unsigned long long)g_ref.rip,
+                            (unsigned long long)g->rip);
+                    fprintf(stderr,
+                            "ref: rax=%llx rcx=%llx rdi=%llx rsi=%llx\n",
+                            (unsigned long long)g_ref.gpr[0],
+                            (unsigned long long)g_ref.gpr[1],
+                            (unsigned long long)g_ref.gpr[7],
+                            (unsigned long long)g_ref.gpr[6]);
+                    fprintf(stderr,
+                            "jit: rax=%llx rcx=%llx rdi=%llx rsi=%llx\n",
+                            (unsigned long long)g->gpr[0],
+                            (unsigned long long)g->gpr[1],
+                            (unsigned long long)g->gpr[7],
+                            (unsigned long long)g->gpr[6]);
+                    r.status = ref.status;
+                    r.exit_code = ref.exit_code;
+                    return r;
+                }
+                (void)ref_rip;
+            }
+            if (skip_tsc) {
+                g_ref.gpr[OAH_X86_RAX] = g->gpr[OAH_X86_RAX];
+                g_ref.gpr[OAH_X86_RDX] = g->gpr[OAH_X86_RDX];
+            }
+            for (int i = 0; i < 16; i++) {
+                if (g->gpr[i] != g_ref.gpr[i] || g->rip != g_ref.rip ||
+                    g->rflags != g_ref.rflags) {
+                    fprintf(stderr,
+                            "JIT divergence @%llx: g%d jit=%llx ref=%llx "
+                            "rip jit=%llx ref=%llx flags jit=%llx ref=%llx\n",
+                            (unsigned long long)entry_rip, i,
+                            (unsigned long long)g->gpr[i],
+                            (unsigned long long)g_ref.gpr[i],
+                            (unsigned long long)g->rip,
+                            (unsigned long long)g_ref.rip,
+                            (unsigned long long)g->rflags,
+                            (unsigned long long)g_ref.rflags);
+                    *g = g_ref;
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+            }
+        }
+    }
+    r.status = OAH_INTERP_LIMIT;
+    return r;
+}
+
+oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
+                                     u64 max_insns, bool aot)
+{
+    static bool env_checked = false;
+    if (!env_checked) {
+        env_checked = true;
+        if (getenv("OAH_JIT_NOCACHE")) {
+            jit_persist = false;
+        }
+        if (getenv("OAH_JIT_CACHE_INFO")) {
+            char dir[PATH_MAX];
+            fprintf(stderr, "jit cache dir: %s\n",
+                    pcache_dir(dir, sizeof(dir)) ? dir : "(unavailable)");
+        }
+    }
+    oah_interp_result r = jit_run_cached_inner(g, img, max_insns, aot);
+    pcache_flush(img);
+    return r;
+}
+
+#else /* !(__APPLE__ && __aarch64__) */
+
+oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
+                                     u64 max_insns, bool aot)
+{
+    (void)aot;
+    return oah_jit_run_native(g, img, max_insns);
+}
+
+void oah_jit_cache_flush(void)
+{
+}
+
+#endif /* __APPLE__ && __aarch64__ */

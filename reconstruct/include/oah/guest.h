@@ -38,7 +38,24 @@ typedef struct {
     u64 thread_signals;
     u64 signal_stack_base;
     u64 signal_stack_size;
+#if defined(__APPLE__)
+    oah_guest_signal_action *shared_signal_actions;
+    u64 clear_tid;
+    u32 tid;
+    unsigned quantum;
+    bool thread_exit;
+#endif
 } oah_guest;
+
+static inline oah_guest_signal_action *oah_guest_actions(oah_guest *g)
+{
+#if defined(__APPLE__)
+    if (g->shared_signal_actions) {
+        return g->shared_signal_actions;
+    }
+#endif
+    return g->signal_actions;
+}
 
 /* Linux userspace default: bit 1 reserved-1, bit 9 IF. */
 #define OAH_RFLAGS_INIT 0x202ull

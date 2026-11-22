@@ -4,6 +4,8 @@
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -O2 -g
 CFLAGS  += -Iinclude
+GIT_SHA := $(shell git rev-parse --short=8 HEAD 2>/dev/null || echo 0)
+CFLAGS  += -DOAH_BUILD_KEY=0x$(GIT_SHA)u
 HOST_OS := $(shell uname -s)
 ifeq ($(HOST_OS),Darwin)
 CFLAGS  += -D_DARWIN_C_SOURCE
@@ -62,6 +64,11 @@ TESTS = \
     tests/test_arm_native
 
 CC_X86_64      ?= x86_64-linux-gnu-gcc
+
+# Debian guest fixtures ship in the app's runtime tree; auto-detect so
+# test-macos exercises the glibc and Python paths whenever they exist.
+DEBIAN_SYSROOT        ?= $(wildcard ../runtime/sysroots/debian-expanded)
+DEBIAN_PYTHON_SYSROOT ?= $(wildcard ../runtime/sysroots/debian-python)
 CC_AARCH64     ?= aarch64-linux-gnu-gcc
 QEMU_X86_64    ?= qemu-x86_64
 QEMU_AARCH64   ?= qemu-aarch64-static
@@ -112,7 +119,8 @@ test-macos: oah tests/hello.x86_64 tests/test_elf_map
 	python3 tools/test_macos.py --runner ./oah --hello tests/hello.x86_64 \
 	    $(if $(BUSYBOX_STATIC),--busybox "$(BUSYBOX_STATIC)") \
 	    $(if $(ALPINE_SYSROOT),--alpine-sysroot "$(ALPINE_SYSROOT)") \
-	    $(if $(DEBIAN_SYSROOT),--debian-sysroot "$(DEBIAN_SYSROOT)")
+	    $(if $(DEBIAN_SYSROOT),--debian-sysroot "$(DEBIAN_SYSROOT)") \
+	    $(if $(DEBIAN_PYTHON_SYSROOT),--debian-python-sysroot "$(DEBIAN_PYTHON_SYSROOT)")
 
 tests/branch_guest.x86_64: tests/branch_guest.c
 	$(CC_X86_64) -O2 -nostdlib -static -no-pie -fno-stack-protector -fno-pie \

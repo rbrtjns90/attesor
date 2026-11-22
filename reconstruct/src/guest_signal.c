@@ -185,7 +185,7 @@ static oah_sys_status deliver_ready(oah_guest *g, oah_image *img, u64 return_mas
     while (ready) {
         unsigned signum = (unsigned)__builtin_ctzll(ready) + 1;
         u64 bit = signal_bit(signum);
-        oah_guest_signal_action *action = &g->signal_actions[signum - 1];
+        oah_guest_signal_action *action = &oah_guest_actions(g)[signum - 1];
         g->pending_signals &= ~bit;
         if (action->handler == 1 || (!action->handler && default_ignore(signum))) {
             g->thread_signals &= ~bit;
@@ -214,7 +214,9 @@ static oah_sys_status deliver_ready(oah_guest *g, oah_image *img, u64 return_mas
 #if defined(__APPLE__)
 oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img)
 {
-    g->pending_signals |= oah_darwin_pending_signals();
+    if (!g->tid || g->tid == (u32)getpid()) {
+        g->pending_signals |= oah_darwin_pending_signals();
+    }
     if (!(g->pending_signals & ~g->signal_mask)) {
         return OAH_SYS_CONTINUE;
     }
@@ -223,6 +225,10 @@ oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img)
 
 static oah_sys_status signal_suspend(oah_guest *g, oah_image *img, u64 address, u64 size)
 {
+    if (g->tid && g->tid != (u32)getpid()) {
+        g->gpr[OAH_X86_RAX] = -X86_ENOSYS;
+        return OAH_SYS_CONTINUE;
+    }
     const void *input = size == 8 ? oah_guest_access(img, address, size, PROT_READ) : NULL;
     if (!input) {
         g->gpr[OAH_X86_RAX] = size == 8 ? -EFAULT : -EINVAL;
@@ -313,7 +319,7 @@ static s64 signal_action(oah_guest *g, oah_image *img, u64 signum,
         (new_address && (signum == 9 || signum == 19))) {
         return -EINVAL;
     }
-    oah_guest_signal_action *action = &g->signal_actions[signum - 1];
+    oah_guest_signal_action *action = &oah_guest_actions(g)[signum - 1];
     oah_guest_signal_action next;
     const void *input = oah_guest_access(img, new_address, sizeof(next), PROT_READ);
     void *output = oah_guest_access(img, old_address, sizeof(next), PROT_WRITE);
@@ -405,7 +411,13 @@ static s64 queue_self_signal(oah_guest *g, u64 number, int pid, int tid, bool th
     if (number > OAH_GUEST_SIGNAL_COUNT) {
         return -EINVAL;
     }
-    if (pid != getpid() || tid != getpid()) {
+    int own_tid = getpid();
+#if defined(__APPLE__)
+    if (g->tid) {
+        own_tid = (int)g->tid;
+    }
+#endif
+    if (pid != getpid() || tid != own_tid) {
         return -ESRCH;
     }
     if (!number) {
@@ -416,7 +428,7 @@ static s64 queue_self_signal(oah_guest *g, u64 number, int pid, int tid, bool th
     }
     unsigned signum = (unsigned)number;
     u64 bit = signal_bit(signum);
-    u64 handler = g->signal_actions[signum - 1].handler;
+    u64 handler = oah_guest_actions(g)[signum - 1].handler;
     if (!handler && default_stop(signum)) {
         return -X86_EOPNOTSUPP;
     }
@@ -463,7 +475,16 @@ oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img)
         break;
     case 62:
     case 200:
-        result = queue_self_signal(g, a1, (int)a0, (int)a0, nr == 200);
+        if (nr == 200) {
+            result = queue_self_signal(g, a1, getpid(), (int)a0, true);
+        } else {
+#if defined(__APPLE__)
+            int tid = g->tid ? (int)g->tid : getpid();
+#else
+            int tid = getpid();
+#endif
+            result = queue_self_signal(g, a1, (int)a0, tid, false);
+        }
         break;
     case 234:
         result = queue_self_signal(g, a2, (int)a0, (int)a1, true);

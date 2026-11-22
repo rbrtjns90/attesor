@@ -16,9 +16,9 @@ TIMEOUT_HASHES = {
 }
 
 
-def verify(runner, directory, title, command, expected, stdin=b""):
+def verify(runner, directory, title, command, expected, stdin=b"", *, extra_env=None):
     for mode, options in (("jit", []), ("interpret", ["--interpret"])):
-        actual = run([runner, *options, *command], directory, stdin)
+        actual = run([runner, *options, *command], directory, stdin, extra_env=extra_env)
         if actual != expected:
             raise ValueError(f"{mode} {title}: expected {expected!r}, got {actual!r}")
         print(f"PASS {mode}: {title}")
@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
+    parser.add_argument("--debian-python-sysroot", type=Path)
     args = parser.parse_args()
     runner = str(args.runner.resolve())
     try:
@@ -101,6 +102,18 @@ def main():
                     verify(runner, directory, "guest exec of a shebang script",
                            [*setup, str(shell), "-c", "exec ./check-script child"],
                            (0, b"child\n", b""))
+            if args.debian_python_sysroot:
+                root = args.debian_python_sysroot.resolve()
+                python = root / "usr/bin/python3"
+                fixtures = Path(__file__).resolve().parents[1] / "tests"
+                for fixture, expected in (
+                    ("python_threads.py", b"six workers joined\n"),
+                    ("python_readiness.py", b"epoll and eventfd readiness checks passed\n"),
+                ):
+                    verify(runner, directory, f"Debian {fixture}",
+                           ["--max-insns", "500000000", "--sysroot", str(root),
+                            str(python), "-S", str(fixtures / fixture)], (0, expected, b""),
+                           extra_env={"PYTHONHOME": str(root / "usr"), "PYTHONDONTWRITEBYTECODE": "1"})
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         parser.exit(1, f"{error}\n")
 

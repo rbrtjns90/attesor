@@ -35,8 +35,10 @@ def check_fixture(path, sysroot):
         raise ValueError("fixture ELF type does not match the requested test mode")
 
 
-def run(command, directory, stdin, *, trace=False):
+def run(command, directory, stdin, *, trace=False, extra_env=None):
     env = {"PATH": os.defpath, "LC_ALL": "C"}
+    if extra_env:
+        env.update(extra_env)
     if trace:
         env["OAH_TRACE_UNSUPPORTED"] = "1"
     result = subprocess.run(command, input=stdin, capture_output=True, cwd=directory,

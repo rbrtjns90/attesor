@@ -91,6 +91,100 @@ bool oah_emit_ret(oah_asm_buf *buf);
 /* Materialize a 64-bit constant with MOVZ/MOVK. */
 bool oah_emit_mov_u64(oah_asm_buf *buf, oah_gpr rd, u64 val);
 
+/*
+ * Extended emitters for the cached-fragment JIT. These follow the same
+ * decomp bit formulas; Rn/Rd/Rm are runtime host registers (0..31).
+ */
+
+/* Patch a 32-bit instruction already in the buffer (forward fixups). */
+void oah_asm_patch32(oah_asm_buf *buf, u64 offset, u32 insn);
+
+/* Add/subtract (shifted register): op bit30 (sub), S bit29 (flags).
+ * shift: 0=LSL 1=LSR 2=ASR. */
+bool oah_emit_add_sub_reg(oah_asm_buf *buf, bool is_64, bool is_sub,
+                          bool set_flags, oah_gpr rd, oah_gpr rn, oah_gpr rm,
+                          u32 shift, u32 amount);
+
+/* Logical (shifted register): op selects AND/ORR/EOR/ANDS. */
+typedef enum {
+    OAH_LOGIC_AND = 0,
+    OAH_LOGIC_ORR,
+    OAH_LOGIC_EOR,
+    OAH_LOGIC_ANDS
+} oah_logic_op;
+bool oah_emit_logic_reg(oah_asm_buf *buf, oah_logic_op op, bool is_64,
+                        oah_gpr rd, oah_gpr rn, oah_gpr rm, u32 shift,
+                        u32 amount);
+
+/* ADD/SUB immediate with optional flag update (S bit). */
+bool oah_emit_add_sub_imm_flags(oah_asm_buf *buf, bool is_64, bool is_sub,
+                                bool set_flags, oah_gpr rd, oah_gpr rn,
+                                u32 imm12, u32 sh);
+
+/* Bitfield moves: UBFM (uxtb/uxth/ubfx/lsl/lsr), SBFM (sxt, asr), BFM (bfi). */
+bool oah_emit_ubfm(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   u32 immr, u32 imms);
+bool oah_emit_sbfm(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   u32 immr, u32 imms);
+bool oah_emit_bfm(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                  u32 immr, u32 imms);
+
+/* Variable shifts: 0=LSL 1=LSR 2=ASR 3=ROR. */
+bool oah_emit_shift_var(oah_asm_buf *buf, bool is_64, u32 which,
+                        oah_gpr rd, oah_gpr rn, oah_gpr rm);
+
+/* MOVN (inverted move wide). */
+bool oah_emit_movn(oah_asm_buf *buf, bool is_64, oah_gpr rd, u32 hw, u32 imm16);
+
+/* NZCV system register access. */
+bool oah_emit_mrs_nzcv(oah_asm_buf *buf, oah_gpr rt);
+bool oah_emit_msr_nzcv(oah_asm_buf *buf, oah_gpr rn);
+
+/* Conditional compare: ANDS XZR (TST) / SUBS XZR (CMP), shifted register. */
+bool oah_emit_tst_reg(oah_asm_buf *buf, bool is_64, oah_gpr rn, oah_gpr rm,
+                      u32 shift, u32 amount);
+bool oah_emit_cmp_reg(oah_asm_buf *buf, bool is_64, oah_gpr rn, oah_gpr rm,
+                      u32 shift, u32 amount);
+
+/* B.cond / CBZ/CBNZ / TBZ/TBNZ. Offsets are signed byte offsets relative to
+ * the instruction; emitters validate range. */
+bool oah_emit_bcond(oah_asm_buf *buf, u32 cond, s32 imm19);
+bool oah_emit_cbz_cbnz(oah_asm_buf *buf, bool is_64, bool nz, oah_gpr rt,
+                       s32 imm19);
+bool oah_emit_tbz_tbnz(oah_asm_buf *buf, bool nz, u32 bit, oah_gpr rt,
+                       s32 imm14);
+
+/* CSEL / CSINC (conditional select; cset via rn=rm=XZR + inverted cond). */
+bool oah_emit_csel(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                   oah_gpr rm, u32 cond);
+bool oah_emit_csinc(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                    oah_gpr rm, u32 cond);
+
+/* Multiply: MUL (madd ra=31), SMULH, SMADDL (w->x). */
+bool oah_emit_mul(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                  oah_gpr rm);
+bool oah_emit_smulh(oah_asm_buf *buf, oah_gpr rd, oah_gpr rn, oah_gpr rm);
+bool oah_emit_smull(oah_asm_buf *buf, oah_gpr rd, oah_gpr rn, oah_gpr rm);
+
+/* REV (byte swap): 32 or 64 bit. */
+bool oah_emit_rev(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn);
+
+/* CLZ. */
+bool oah_emit_clz(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn);
+
+/*
+ * Sized guest-memory LDR/STR at [Rn + imm_bytes], unsigned offset.
+ * size_log2: 0=B 1=H 2=W 3=X. sign_extend selects LDRSB/LDRSH/LDRSW on loads;
+ * dst64 only matters for sign-extended loads.
+ */
+bool oah_emit_mem(oah_asm_buf *buf, u32 size_log2, bool is_store,
+                  bool sign_extend, bool dst64, oah_gpr rt, oah_gpr rn,
+                  u32 imm_bytes);
+
+/* ORN (bitwise OR NOT, shifted register) — used for MVN. */
+bool oah_emit_orn(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn,
+                  oah_gpr rm, u32 shift, u32 amount);
+
 #ifdef __cplusplus
 }
 #endif

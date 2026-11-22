@@ -57,7 +57,7 @@ static u64 setup_stack(oah_image *img, int argc, char **argv, char **envp)
     }
     img->segs[img->nseg++] = (oah_load_seg){
         .gva = (u64)(uintptr_t)stack, .size = stack_size,
-        .host = stack, .prot = PROT_READ | PROT_WRITE
+        .host = stack, .prot = PROT_READ | PROT_WRITE, .module = -1
     };
 
     u8 *strings = stack + stack_size - bytes;
@@ -107,17 +107,21 @@ int main(int argc, char **argv, char **envp)
     u64 rsp;
 
     bool interpret = false;
+    bool aot = false;
     const char *sysroot = NULL;
     const char *exec_path = NULL;
 #if defined(__APPLE__)
     size_t exec_env_count = 0;
 #endif
-    u64 instruction_limit = 100000000ull;
+    u64 instruction_limit = ~0ull;
     int guest_arg = 1;
     while (guest_arg < argc) {
         const char *option = argv[guest_arg];
         if (strcmp(option, "--interpret") == 0) {
             interpret = true;
+            guest_arg++;
+        } else if (strcmp(option, "--aot") == 0) {
+            aot = true;
             guest_arg++;
         } else if (strcmp(option, "--max-insns") == 0 && guest_arg + 1 < argc) {
             const char *value = argv[guest_arg + 1];
@@ -229,13 +233,27 @@ int main(int argc, char **argv, char **envp)
 
     oah_guest_init(&guest, img.interp_entry ? img.interp_entry : img.entry, rsp);
 #if defined(__APPLE__)
+    oah_darwin_guest_enter();
+    /* The cached fragment JIT needs identity-mapped guest memory (ET_DYN on
+     * Darwin). Everything else uses the per-block native path. */
+    bool jit_identity = img.load_gva == (u64)(uintptr_t)img.load_mapping;
     run = interpret ? oah_interp_run(&guest, &img, instruction_limit)
-                    : oah_jit_run_native(&guest, &img, instruction_limit);
+        : jit_identity ? oah_jit_run_cached(&guest, &img, instruction_limit, aot)
+                       : oah_jit_run_native(&guest, &img, instruction_limit);
 #else
     run = interpret ? oah_jit_run(&guest, &img, instruction_limit)
                     : oah_jit_run_native(&guest, &img, instruction_limit);
 #endif
 
+#if defined(__APPLE__)
+    bool has_workers = oah_darwin_has_workers();
+    if (has_workers && run.status == OAH_INTERP_EXIT) {
+        _Exit(run.exit_code);
+    }
+    if (!has_workers) {
+        oah_darwin_guest_leave();
+    }
+#endif
     if (run.status == OAH_INTERP_EXIT) {
         oah_unmap_elf(&img);
         return run.exit_code;
@@ -260,6 +278,11 @@ int main(int argc, char **argv, char **envp)
         }
     }
     fputc('\n', stderr);
+#if defined(__APPLE__)
+    if (has_workers) {
+        _Exit(126);
+    }
+#endif
     oah_unmap_elf(&img);
     return 126;
 }

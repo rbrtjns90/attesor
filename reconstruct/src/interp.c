@@ -91,14 +91,36 @@ static void store_reg(oah_guest *g, u8 reg, u8 width, bool rex, u64 value)
     }
 }
 
+static long double round_guest_integer(long double value, unsigned mode);
+
+static void shift_packed_integer(u8 *vector, unsigned lane, u64 count, unsigned operation)
+{
+    unsigned bits = lane * 8;
+    unsigned shift = count < bits ? (unsigned)count : bits - 1;
+    for (unsigned offset = 0; offset < 16; offset += lane) {
+        u64 value = 0;
+        memcpy(&value, vector + offset, lane);
+        if (operation == 4) {
+            s64 signed_value = lane == 2 ? (int16_t)value : (s32)value;
+            value = (u64)(signed_value >> shift);
+        } else if (count >= bits) {
+            value = 0;
+        } else {
+            value = operation == 2 ? value >> shift : value << shift;
+        }
+        memcpy(vector + offset, &value, lane);
+    }
+}
+
 static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 next)
 {
     u8 op = in->vector_opcode;
     bool fp_alu = op == 0x58 || op == 0x59 || op == 0x5c || op == 0x5d || op == 0x5e || op == 0x5f;
     bool fp_compare = op == 0x2e || op == 0x2f;
-    unsigned width = op == 0xc4 ? 2
+    unsigned width = (op == OAH_VECTOR_DUPLICATE_DOUBLE || op == OAH_VECTOR_CONVERT_SINGLES_TO_DOUBLES ||
+                      (op == OAH_VECTOR_CONVERT_PACKED_DOUBLES && !in->cc)) ? 8 : op == 0xc4 ? 2
                    : op == 0x2a ? in->src_width
-                   : (fp_alu || fp_compare || op == 0xc2 || op == 0x2c || op == 0x51 || op == 0x5a) ? in->opsize
+                   : (fp_alu || fp_compare || op == 0xc2 || op == 0x2c || op == 0x2d || op == 0x51 || op == 0x5a) ? in->opsize
                    : (op == 0x6e || op == 0x7e || op == OAH_VECTOR_SCALAR_LOAD || op == OAH_VECTOR_SCALAR_STORE) ? in->opsize
                    : ((op >= 0x12 && op <= 0x17) || op == 0x7a || op == 0xd6) ? 8 : 16;
     bool store = op == 0xe7 || op == OAH_VECTOR_SCALAR_STORE || op == 0x11 || op == 0x29 || op == 0x7f || op == 0x7e || op == 0xd6 ||
@@ -139,19 +161,99 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         break;
     }
-    case OAH_VECTOR_ADD_PACKED_FLOAT:
+    case OAH_VECTOR_CONVERT_PACKED_DOUBLES: {
+        u8 result[16] = {0};
+        if (!in->cc) {
+            for (unsigned i = 0; i < 2; i++) {
+                s32 source;
+                memcpy(&source, other + i * 4, sizeof(source));
+                double converted = source;
+                memcpy(result + i * 8, &converted, sizeof(converted));
+            }
+        } else {
+            u32 mxcsr;
+            memcpy(&mxcsr, g->legacy_fx + 24, sizeof(mxcsr));
+            unsigned rounding = in->cc == 1 ? 3 : (mxcsr >> 13) & 3;
+            for (unsigned i = 0; i < 2; i++) {
+                double source;
+                memcpy(&source, other + i * 8, sizeof(source));
+                long double rounded = round_guest_integer(source, rounding);
+                s32 converted = rounded >= -0x1p31L && rounded < 0x1p31L ?
+                                (s32)rounded : INT32_MIN;
+                memcpy(result + i * 4, &converted, sizeof(converted));
+            }
+        }
+        memcpy(xmm, result, sizeof(result));
+        break;
+    }
+    case OAH_VECTOR_CONVERT_PACKED_DWORDS: {
+        u32 mxcsr;
+        memcpy(&mxcsr, g->legacy_fx + 24, sizeof(mxcsr));
+        for (unsigned i = 0; i < 16; i += 4) {
+            if (in->cc) {
+                float source;
+                memcpy(&source, other + i, sizeof(source));
+                long double rounded = round_guest_integer(source, in->cc == 2 ? 3 : (mxcsr >> 13) & 3);
+                s32 converted = rounded >= -0x1p31L && rounded < 0x1p31L ?
+                                (s32)rounded : INT32_MIN;
+                memcpy(xmm + i, &converted, sizeof(converted));
+            } else {
+                s32 source;
+                memcpy(&source, other + i, sizeof(source));
+                float converted = (float)source;
+                memcpy(xmm + i, &converted, sizeof(converted));
+            }
+        }
+        break;
+    }
+    case OAH_VECTOR_CONVERT_DOUBLES_TO_SINGLES: {
+        u8 result[16] = {0};
+        for (unsigned i = 0; i < 2; i++) {
+            double source;
+            memcpy(&source, other + i * 8, sizeof(source));
+            float converted = (float)source;
+            memcpy(result + i * 4, &converted, sizeof(converted));
+        }
+        memcpy(xmm, result, sizeof(result));
+        break;
+    }
+    case OAH_VECTOR_CONVERT_SINGLES_TO_DOUBLES:
+        for (unsigned i = 0; i < 2; i++) {
+            float source;
+            memcpy(&source, other + i * 4, sizeof(source));
+            double converted = source;
+            memcpy(xmm + i * 8, &converted, sizeof(converted));
+        }
+        break;
+    case OAH_VECTOR_ARITH_PACKED_FLOAT:
         for (unsigned i = 0; i < 16; i += in->opsize) {
             if (in->opsize == 4) {
                 float lhs, rhs;
                 memcpy(&lhs, xmm + i, sizeof(lhs));
                 memcpy(&rhs, other + i, sizeof(rhs));
-                lhs += rhs;
+                switch (in->cc) {
+                case 0x51: lhs = sqrtf(lhs); break;
+                case 0x59: lhs *= rhs; break;
+                case 0x5c: lhs -= rhs; break;
+                case 0x5d: lhs = lhs < rhs ? lhs : rhs; break;
+                case 0x5e: lhs /= rhs; break;
+                case 0x5f: lhs = lhs > rhs ? lhs : rhs; break;
+                default: lhs += rhs; break;
+                }
                 memcpy(xmm + i, &lhs, sizeof(lhs));
             } else {
                 double lhs, rhs;
                 memcpy(&lhs, xmm + i, sizeof(lhs));
                 memcpy(&rhs, other + i, sizeof(rhs));
-                lhs += rhs;
+                switch (in->cc) {
+                case 0x51: lhs = sqrt(lhs); break;
+                case 0x59: lhs *= rhs; break;
+                case 0x5c: lhs -= rhs; break;
+                case 0x5d: lhs = lhs < rhs ? lhs : rhs; break;
+                case 0x5e: lhs /= rhs; break;
+                case 0x5f: lhs = lhs > rhs ? lhs : rhs; break;
+                default: lhs += rhs; break;
+                }
                 memcpy(xmm + i, &lhs, sizeof(lhs));
             }
         }
@@ -182,7 +284,8 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             memcpy(xmm, &converted, 4);
         }
         break;
-    case 0x2c: {
+    case 0x2c:
+    case 0x2d: {
         double value;
         if (width == 4) {
             float single;
@@ -190,6 +293,11 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             value = single;
         } else {
             memcpy(&value, other, 8);
+        }
+        if (op == 0x2d) {
+            u32 mxcsr;
+            memcpy(&mxcsr, g->legacy_fx + 24, sizeof(mxcsr));
+            value = (double)round_guest_integer(value, (mxcsr >> 13) & 3);
         }
         double bound = in->src_width == 8 ? 0x1p63 : 0x1p31;
         u64 result = value >= -bound && value < bound ? (u64)(s64)value
@@ -277,6 +385,15 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     case OAH_VECTOR_SCALAR_STORE:
         memmove(other, xmm, width);
         break;
+    case 0xd5:
+        for (unsigned offset = 0; offset < 16; offset += 2) {
+            uint16_t lhs, rhs;
+            memcpy(&lhs, xmm + offset, sizeof(lhs));
+            memcpy(&rhs, other + offset, sizeof(rhs));
+            uint16_t product = (u32)lhs * rhs;
+            memcpy(xmm + offset, &product, sizeof(product));
+        }
+        break;
     case 0xf4:
         for (unsigned offset = 0; offset < 16; offset += 8) {
             u32 lhs, rhs;
@@ -287,13 +404,18 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         break;
     case 0xd4:
+    case 0xf9:
+    case 0xfa:
+    case 0xfb:
+    case 0xfd:
     case 0xfe: {
-        unsigned lane = op == 0xd4 ? 8 : 4;
+        unsigned lane = op == 0xfd || op == 0xf9 ? 2 :
+                        op == 0xfe || op == 0xfa ? 4 : 8;
         for (unsigned i = 0; i < 16; i += lane) {
             u64 lhs = 0, rhs = 0;
             memcpy(&lhs, xmm + i, lane);
             memcpy(&rhs, other + i, lane);
-            lhs += rhs;
+            lhs = op >= 0xf9 && op <= 0xfb ? lhs - rhs : lhs + rhs;
             memcpy(xmm + i, &lhs, lane);
         }
         break;
@@ -325,6 +447,13 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         }
         memset(xmm + 8, 0, 8);
         break;
+    case OAH_VECTOR_DUPLICATE_DOUBLE: {
+        u64 value;
+        memcpy(&value, other, sizeof(value));
+        memcpy(xmm, &value, sizeof(value));
+        memcpy(xmm + 8, &value, sizeof(value));
+        break;
+    }
     case 0x12:
         if (in->memory || other != xmm) {
             memcpy(xmm, other + (in->memory ? 0 : 8), 8);
@@ -362,6 +491,12 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             memcpy(values + 2 * offset + lane, other + start + offset, lane);
         }
         memcpy(xmm, values, sizeof(values));
+        break;
+    }
+    case 0xc5: {
+        u16 value;
+        memcpy(&value, other + (in->imm & 7) * 2, sizeof(value));
+        write_gpr(g, in->src, 4, value);
         break;
     }
     case 0xc4: {
@@ -408,24 +543,21 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         memcpy(xmm, values, sizeof(values));
         break;
     }
+    case 0xd1: case 0xd2: case 0xd3:
+    case 0xe1: case 0xe2:
+    case 0xf1: case 0xf2: case 0xf3: {
+        u64 count;
+        memcpy(&count, other, sizeof(count));
+        unsigned lane = 1u << (op & 0xf);
+        unsigned operation = op < 0xe0 ? 2 : op < 0xf0 ? 4 : 6;
+        shift_packed_integer(xmm, lane, count, operation);
+        break;
+    }
     case 0x71:
     case 0x72:
     case 0x73: {
         if (in->cc == 2 || in->cc == 4 || in->cc == 6) {
-            unsigned lane = 2u << (op - 0x71);
-            unsigned bits = lane * 8;
-            unsigned count = in->imm < bits ? (unsigned)in->imm : bits;
-            for (unsigned offset = 0; offset < 16; offset += lane) {
-                u64 value = 0;
-                memcpy(&value, other + offset, lane);
-                if (in->cc == 4) {
-                    s64 signed_value = lane == 2 ? (int16_t)value : (s32)value;
-                    value = (u64)(signed_value >> (count < bits ? count : bits - 1));
-                } else {
-                    value = count == bits ? 0 : in->cc == 2 ? value >> count : value << count;
-                }
-                memcpy(other + offset, &value, lane);
-            }
+            shift_packed_integer(other, 2u << (op - 0x71), in->imm, in->cc);
             break;
         }
         unsigned count = in->imm < 16 ? (unsigned)in->imm : 16;
@@ -548,6 +680,15 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             write_gpr(g, in->src, width, address);
             g->rip = next;
             return true;
+        }
+        if (!in->immediate && (op == OAH_SC_BT || op == OAH_SC_BTS ||
+            op == OAH_SC_BTR || op == OAH_SC_BTC)) {
+            s64 bit = signed_operand(read_reg(g, in->src, width, in->rex_present), width);
+            s64 offset = (bit >> (width == 8 ? 6 : width == 4 ? 5 : 4)) * width;
+            address += (u64)offset;
+            if (in->address.address32) {
+                address = (u32)address;
+            }
         }
         if (in->address.segment == 0x64) {
             address += g->fs_base;
@@ -673,7 +814,7 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             write = false;
         }
     } else if (op == OAH_SC_CMPXCHG) {
-        /* The runtime dispatches one guest thread, including LOCK forms. */
+        /* Darwin serializes guest instruction dispatch, including LOCK forms. */
         u64 expected = read_reg(g, OAH_X86_RAX, width, true);
         g->rflags = oah_cmp_rflags(g->rflags, expected, rm, width);
         if (expected != rm) {
@@ -913,7 +1054,7 @@ static long double x87_arithmetic(unsigned operation, long double a, long double
     }
 }
 
-static long double x87_round_to_integer(long double value, unsigned mode)
+static long double round_guest_integer(long double value, unsigned mode)
 {
     switch (mode) {
     case 1: return floorl(value);
@@ -971,7 +1112,7 @@ static bool run_x87_data(oah_guest *g, oah_image *img, const oah_insn *in, u64 n
             if (extended) {
                 memcpy(slot, st, 10);
             } else if (integer) {
-                long double rounded = x87_round_to_integer(x87_to_host(st), state[1] >> 2 & 3);
+                long double rounded = round_guest_integer(x87_to_host(st), state[1] >> 2 & 3);
                 long double bound = ldexpl(1.0L, width * 8 - 1);
                 u64 converted = rounded >= -bound && rounded < bound ?
                     (u64)(s64)rounded : 1ull << (width * 8 - 1);
@@ -1136,6 +1277,7 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
 
     while (r.insns < max_insns) {
 #if defined(__APPLE__)
+        oah_darwin_guest_tick(g);
         oah_sys_status signal_status = oah_guest_signal_poll(g, img);
         if (signal_status != OAH_SYS_CONTINUE) {
             r.status = signal_status == OAH_SYS_EXIT ? OAH_INTERP_EXIT : OAH_INTERP_FAULT;
@@ -1265,6 +1407,40 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
                 r.status = OAH_INTERP_FAULT;
                 return r;
             }
+            break;
+        case OAH_OP_EMPTY_MMX:
+            g->legacy_fx[4] = 0;
+            g->rip = next;
+            break;
+        case OAH_OP_FLAGS_STACK: {
+            u64 *stack = &g->gpr[OAH_X86_RSP];
+            u64 address = insn.rm_dest ? *stack - insn.opsize : *stack;
+            void *slot = oah_guest_access(img, address, insn.opsize,
+                                          insn.rm_dest ? PROT_WRITE : PROT_READ);
+            if (!slot) {
+                r.status = OAH_INTERP_FAULT;
+                return r;
+            }
+            if (insn.rm_dest) {
+                u64 flags = g->rflags & ~((1ull << 16) | (1ull << 17));
+                memcpy(slot, &flags, insn.opsize);
+                *stack = address;
+            } else {
+                u64 flags = 0;
+                memcpy(&flags, slot, insn.opsize);
+                u64 mask = 0x00000dd5ull | (1ull << 8);
+                if (insn.opsize == 8) {
+                    mask |= (1ull << 18) | (1ull << 21);
+                }
+                g->rflags = (g->rflags & ~mask) | (flags & mask) | 2;
+                *stack += insn.opsize;
+            }
+            g->rip = next;
+            break;
+        }
+        case OAH_OP_SET_DIRECTION:
+            g->rflags = (g->rflags & ~OAH_RFLAGS_DF) | (insn.imm ? OAH_RFLAGS_DF : 0);
+            g->rip = next;
             break;
         case OAH_OP_STORE_FENCE:
             atomic_thread_fence(memory_order_release);

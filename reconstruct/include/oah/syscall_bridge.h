@@ -42,6 +42,10 @@ typedef enum {
 /* Signal frames, masks, and self-directed signals use the guest Linux ABI. */
 oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img);
 #if defined(__APPLE__)
+void oah_darwin_guest_enter(void);
+void oah_darwin_guest_leave(void);
+void oah_darwin_guest_tick(oah_guest *g);
+bool oah_darwin_has_workers(void);
 oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img);
 u64 oah_darwin_pending_signals(void);
 s64 oah_darwin_wait_signal(void);

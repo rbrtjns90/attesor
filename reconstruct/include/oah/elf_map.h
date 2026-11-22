@@ -3,16 +3,25 @@
 
 #include "oah/types.h"
 
-#if defined(__APPLE__)
 #include <limits.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define OAH_MAX_LOAD_SEGS 128
+#define OAH_MAX_LOAD_SEGS 1024
+#define OAH_MAX_MODULES 64
 #define OAH_X86_PAGE_SIZE 4096u
+
+/* A mapped guest ELF (executable, interpreter, or guest-mmapped library).
+ * Gives persisted JIT fragments a stable identity across runs. */
+typedef struct {
+    char path[PATH_MAX];  /* host path actually mapped */
+    u64 key;              /* stat-based identity hash for cache file naming */
+    u64 base;             /* lowest guest VA of the module's segments */
+    void *jit_cache;      /* opaque per-module disk-cache index (jit.c) */
+    bool jit_cache_tried;
+} oah_module;
 
 typedef struct {
     u64 gva;     /* guest virtual address of mapping */
@@ -20,6 +29,7 @@ typedef struct {
     u8 *host;    /* host pointer; identity when MAP_FIXED at gva */
     u32 prot;    /* PROT_* */
     bool file_mapping; /* guest MAP_PRIVATE reservation, replaceable by the loader */
+    int module;  /* oah_module index, -1 for anonymous mappings */
 #if defined(__APPLE__)
     u8 *allocation; /* One host reservation can back several 4 KiB guest ranges. */
     u64 allocation_size;
@@ -29,6 +39,8 @@ typedef struct {
 typedef struct {
     oah_load_seg segs[OAH_MAX_LOAD_SEGS];
     unsigned nseg;
+    oah_module modules[OAH_MAX_MODULES];
+    unsigned nmodule;
     u64 entry;
     u64 phdr;        /* guest VA of program headers */
     u16 phnum;
@@ -53,13 +65,31 @@ typedef struct {
     u8 *heap_mapping;
     u64 heap_capacity;
     u64 heap_guard;
+    /* Fake root state for writable sysroots: set*id syscalls record the
+     * ids the guest asked for so get*id reports the drop took effect. */
+    u32 guest_uid[3];   /* real, effective, saved */
+    u32 guest_gid[3];
+    u32 guest_groups[64];
+    int guest_ngroups;
 } oah_image;
 
 /* Load a little-endian x86-64 static ELF and populate its guest mappings.
  * ET_EXEC keeps its linked address; ET_DYN is slid as a single span. */
 bool oah_map_elf(oah_image *img, const char *path);
 bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot);
+
+/* Module identity for the persistent translation cache. Returns the module
+ * index for host_path (registering it on first use) or -1. */
+int oah_image_module_register(oah_image *img, const char *host_path);
+/* Set .module on all segs overlapping [gva, gva+size). */
+void oah_image_tag_module(oah_image *img, u64 gva, u64 size, int module);
+/* Module index of the seg containing gva, or -1 for anonymous/none. */
+int oah_image_module_at(const oah_image *img, u64 gva);
+/* Guest VA of a module-relative offset (base + off). */
+u64 oah_module_gva(const oah_image *img, int module, u64 off);
 int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode);
+bool oah_sysroot_hostpath(const char *sysroot, const char *path,
+                          char *resolved, size_t capacity);
 #if defined(__APPLE__)
 #define OAH_SCRIPT_DEPTH 4
 #define OAH_SCRIPT_PREFIX (2 * OAH_SCRIPT_DEPTH + 1)

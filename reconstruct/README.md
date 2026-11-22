@@ -62,6 +62,37 @@ On ARM64 Linux the runner executes translated AArch64 fragments in an RX mapping
 
 The runner supports the tested single-process static, musl-linked, and Debian glibc-linked Linux tools. Dynamically linked programs require a guest x86-64 sysroot. Attesor maps the ELF interpreter and transfers control to it with the executable’s auxiliary vector. The guest loader performs relocation and opens its own shared objects. Guest memory syscalls cover the tested anonymous and private file-backed mappings, including loader replacements within guest-owned file reservations. File-backed mappings are copied into anonymous storage. Threads, asynchronous host signal delivery, broader glibc workloads, and complete x86 floating-point and SIMD coverage remain future work. This runner is intended for trusted test executables.
 
+### macOS cached JIT
+
+On Apple Silicon the default mode is a cached fragment JIT (`src/jit.c` + `src/translate.c`). Translated ARM64 blocks live in a 32 MiB `MAP_JIT` arena and are indexed by guest RIP in an open-addressed table. A native trampoline (`oah_jit_native_enter`) packs guest GPRs into `x0`–`x15`, RFLAGS into `x19`, and the next guest RIP into `x20`; fragments return through `ret`. Unsupported instructions mark a fragment `OAH_FRAG_FALLBACK` and re-execute through the checked interpreter, so translation stays conservative.
+
+An optional AOT prewarm (`jit_prewarm`, enabled via the runner's AOT path) scans executable segments and translates discovered blocks before execution.
+
+#### Persistent translation cache
+
+Translated fragments also persist on disk so translation cost is paid once per program rather than once per run. Every mapped guest ELF (executable, interpreter, and each `mmap`'d library) is registered as a *module* keyed by `dev`/`ino`/`size`/`mtime`; its segments carry the module index. Guest-absolute immediates in emitted code (fragment exits, RIP-relative addresses, call return pushes, FS/GS bases) are materialized as fixed-length `movz`/`movk` sequences and recorded as relocations, so a cached fragment rebinds to the module's new load address when materialized.
+
+Each module gets a `<name>-<key>.oahjc` file under the cache directory (`$OAH_CACHE_DIR`, default `~/Library/Caches/Attesor/jit`). Lookups are lazy: on a translation miss the fragment's module-offset is searched in the on-disk index; a hit is relocated and installed, a miss translates and is appended to the file at exit. Fragments whose relocations target a different module simply aren't persisted. Bumping `OAH_PCACHE_VERSION` retires stale files automatically.
+
+Diagnostics, all off by default:
+
+| Variable | Effect |
+| --- | --- |
+| `OAH_CACHE_DIR` | override the persistent-cache directory |
+| `OAH_JIT_NOCACHE` | disable the persistent cache entirely |
+| `OAH_JIT_CACHE_INFO` | print the resolved cache directory |
+
+| Variable | Effect |
+| --- | --- |
+| `OAH_JIT_TRACE` | print each translated fragment's guest RIP and bytes |
+| `OAH_JIT_FRAGLEN` | cap instructions per fragment |
+| `OAH_JIT_MAXFRAGS` | run at most N native fragments, then fall back |
+| `OAH_JIT_VERIFY` | run a reference interpreter alongside and report the first divergent instruction |
+| `OAH_JIT_NOALL` / `NOLOAD` / `NOSTORE` / `NOALU` / `NOCTRL` / `NOJCC` / `NOCALL` / `NORMW` | force instruction classes through the interpreter (bisection) |
+| `OAH_SEG_DEBUG` | dump the guest segment table on a permission miss |
+
+Measured on `freeciv-server --version` (dynamic glibc guest): cached JIT ≈0.41 s vs interpreter ≈1.09 s.
+
 ## Build and verify
 
 Needs: `gcc`, `make`, `python3`. Optional original ELF is **not** required.
@@ -88,6 +119,34 @@ make test-macos BUSYBOX_STATIC=/path/to/busybox.static \
 ```
 
 This command executes the fixtures directly on macOS. Dynamic guests require matching x86-64 libraries. Use a trusted sysroot and trusted executables. The Darwin implementation covers the tested syscall subset, including private library mappings. Guest threads, general host signal delivery, and broad Linux application compatibility remain open.
+
+### macOS dependencies and Linux syscall coverage
+
+```sh
+./reconstruct/tools/setup_macos.sh --gui --sysroot ./debian-root
+python3 reconstruct/tools/syscall_coverage.py --summary
+make
+./reconstruct/oah --sysroot ./debian-root ./debian-root/usr/bin/echo hello
+```
+
+The setup script checks for the Xcode command-line tools. The optional
+`--gui` flag installs XQuartz with Homebrew. The optional `--sysroot` flag
+uses the Homebrew `crane` tool to download and unpack stock Debian Bookworm
+amd64. Attesor has no Docker daemon or VM dependency. The base Debian sysroot
+includes glibc and core tools. Other programs need their matching Linux
+packages and libraries in the sysroot.
+
+The inventory is based on the [Linux v6.1 x86-64 syscall table](https://github.com/torvalds/linux/blob/v6.1/arch/x86/entry/syscalls/syscall_64.tbl).
+A `partial` entry has a Darwin handler with incomplete or unaudited ABI
+coverage. `unsupported` marks a missing handler or known stub. Run without
+`--summary` for individual syscall names and statuses.
+
+The readiness tests cover pipes, `epoll` registration and waiting, one-shot
+rearming, descriptor aliases, and `eventfd` counters. Add
+`DEBIAN_PYTHON_SYSROOT=/path/to/python-sysroot` to `make test-macos` to run
+them with stock Debian Python. Masked epoll waits, nested epoll instances,
+readiness descriptor inheritance across fork, and `timerfd` remain outside
+this implementation.
 
 ### 1. Interpreter path (any x86_64 or aarch64 Linux host)
 

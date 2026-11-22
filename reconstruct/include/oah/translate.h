@@ -36,6 +36,46 @@ bool oah_emit_runtime_syscall(oah_asm_buf *buf);
 /* Same shuffle, then x86 NR → aarch64 NR compares before `svc #0`. */
 bool oah_emit_runtime_syscall_host(oah_asm_buf *buf);
 
+/*
+ * Cached-fragment translator (the "real" JIT path).
+ *
+ * Fragments run under a different register contract than oah_translate_block:
+ *   host x0–x15  guest GPRs (oah_host_xn_for_x86_gpr)
+ *   host x19     guest RFLAGS — full x86 status flags, eagerly maintained
+ *   host x20     next guest RIP — every fragment sets it, then RET
+ *   host x16,x17,x21–x28  scratch
+ *
+ * Guest memory is accessed at its guest virtual address directly
+ * (identity mappings on this host). FS/GS bases are baked in as constants;
+ * the caller must invalidate the cache if they change.
+ */
+/* Site of a fixed 4-instruction movz/movk materialization in emitted code
+ * whose value must be patched when a cached fragment is reused at a
+ * different guest load address. */
+typedef struct {
+    u32 off;   /* byte offset into the fragment's code */
+    u32 kind;  /* OAH_RELOC_* */
+    u8 rd;     /* host register the materialization writes */
+    u64 value; /* GVA: guest absolute address emitted */
+} oah_frag_reloc;
+
+enum { OAH_RELOC_GVA = 0, OAH_RELOC_FS = 1, OAH_RELOC_GS = 2 };
+#define OAH_FRAG_MAX_RELOCS 24
+
+typedef struct {
+    u32 insns;       /* guest instructions emitted */
+    u32 interp_next; /* nonzero: run one interpreter step at the exit RIP */
+    u32 nrelocs;     /* relocatable immediates recorded */
+    u32 reloc_overflow; /* nonzero: too many relocs — do not persist */
+    u32 nexits;      /* chainable constant-RIP exits recorded */
+    u32 exit_off[2]; /* byte offset of each exit's ret insn */
+    u64 exit_rip[2]; /* constant guest target of each exit */
+    oah_frag_reloc relocs[OAH_FRAG_MAX_RELOCS];
+} oah_frag_info;
+
+bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
+                        u64 rip, oah_frag_info *info);
+
 /* Dispatcher: pack GPRs, translate+interpret fragments until guest exit. */
 oah_interp_result oah_jit_run(oah_guest *g, oah_image *img, u64 max_insns);
 
@@ -44,6 +84,16 @@ oah_interp_result oah_jit_run(oah_guest *g, oah_image *img, u64 max_insns);
  * (including exit). On other hosts this is the interpreter path.
  */
 oah_interp_result oah_jit_run_native(oah_guest *g, oah_image *img, u64 max_insns);
+
+/*
+ * Caching fragment JIT (MAP_JIT arena + RIP->code hash table).
+ * aot=true pretranslates all PROT_EXEC segments before running.
+ */
+oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
+                                     u64 max_insns, bool aot);
+
+/* Drop all cached fragments (guest memory/protection changed). */
+void oah_jit_cache_flush(void);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+base="$(cd "$(dirname "$0")/../../../.." && pwd -P)"
+exec >>"$base/var/Debian Eyes-finder.log" 2>&1
+runner="$base/../reconstruct/oah"
+root="$base/sysroots/debian-x11"
+program="$root/usr/bin/xeyes"
+display=:0
+ready() {
+    /opt/X11/bin/xdpyinfo -display "$display" >/dev/null 2>&1
+}
+if ! ready; then
+    /usr/bin/open -a XQuartz
+    attempts=0
+    until ready; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 30 ] || exit 1
+        /bin/sleep 1
+    done
+fi
+export DISPLAY="$display" LC_ALL=C XFILESEARCHPATH="$root/etc/X11/app-defaults/%N"
+exec "$runner" --interpret --max-insns 500000000 --sysroot "$root" "$program" -title 'Debian Eyes'

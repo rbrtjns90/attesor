@@ -47,3 +47,9 @@ reconstruct/tests/branch_guest.got
 reconstruct/tests/hello.qemu.got
 reconstruct/oah
 reconstruct/oah-aarch64
+
+# macOS
+.DS_Store
+
+# Freeciv autosaves
+freeciv-*.sav*

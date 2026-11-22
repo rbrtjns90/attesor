@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+base="$(cd "$(dirname "$0")/../../../.." && pwd -P)"
+root="$base/sysroots/freeciv"
+exec >>"$base/var/freeciv/Freeciv.log" 2>&1
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+export HOME="$base/var/freeciv/home" LC_ALL=C DISPLAY=:0
+export OAH_CACHE_DIR="$base/var/cache/jit"
+export FREECIV_DATA_PATH="$root/usr/share/games/freeciv-attesor"
+export SDL_VIDEODRIVER=x11 SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=dummy
+export PATH="$root/usr/games:/usr/bin:/bin"
+mkdir -p "$OAH_CACHE_DIR" "$base/var"
+echo "translation cache: $(du -sh "$OAH_CACHE_DIR" 2>/dev/null | cut -f1 || echo empty)"
+# History is best-effort: macl xattrs can tie the file to another app.
+hist="$base/var/launcher-history.tsv"
+xattr -c "$hist" 2>/dev/null || true
+printf '%s\t%s\n' "$(cd "$(dirname "$0")/../.." && pwd -P)" "$(date +%s)" >> "$hist" 2>/dev/null || true
+if ! /opt/X11/bin/xdpyinfo -display :0 >/dev/null 2>&1; then
+    /usr/bin/open -a XQuartz
+    attempts=0
+    until /opt/X11/bin/xdpyinfo -display :0 >/dev/null 2>&1; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 30 ] || exit 1
+        /bin/sleep 1
+    done
+fi
+cd "$base/var/freeciv"
+
+# The client writes an empty default_tileset_hex_name on exit, which makes
+# the next boot try to load ".tilespec" and abort. Seed it on every launch.
+rc="$base/var/freeciv/home/.freeciv/freeciv-client-rc-3.0"
+if [ -f "$rc" ] && grep -q 'default_tileset_hex_name=""' "$rc"; then
+    sed -i '' 's/default_tileset_hex_name=""/default_tileset_hex_name="hexemplio"/' "$rc" || true
+fi
+
+# -r feeds the spawned server a startup script (server reads <name>.serv):
+# relaxed ping timeouts so an emulated client that stalls on rendering work
+# isn't kicked as a "lagging connection" mid-game.
+exec "$base/../reconstruct/oah" --max-insns 18446744073709551615 \
+    --sysroot "$root" "$root/usr/games/freeciv-sdl2" -P none --debug v \
+    -r "$base/var/freeciv/startgame" \
+    -l "$base/var/freeciv/FreecivServer.log"
