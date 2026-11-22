@@ -613,3 +613,55 @@ bool oah_emit_umov_gpr(oah_asm_buf *buf, bool is_64, oah_gpr rd,
                             (imm5 & 0x1f) << 16 | (u32)vn << 5 | d);
     return true;
 }
+
+static bool emit_vshift_imm(oah_asm_buf *buf, u32 base,
+                            u32 elem_size_log2, u8 vd, u8 vn, u32 imm7)
+{
+    /* immh must be nonzero, i.e. imm7 >= 8. */
+    if (vd > 31 || vn > 31 || elem_size_log2 > 3 || imm7 < 8 ||
+        imm7 > 0x7f) {
+        return false;
+    }
+    oah_asm_emit32(buf, base | imm7 << 16 | (u32)vn << 5 | vd);
+    return true;
+}
+
+bool oah_emit_vushr_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                        u8 vd, u8 vn, u32 shift)
+{
+    return emit_vshift_imm(buf, 0x6f000400u, elem_size_log2, vd, vn,
+                           (16u << elem_size_log2) - shift);
+}
+
+bool oah_emit_vsshr_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                        u8 vd, u8 vn, u32 shift)
+{
+    return emit_vshift_imm(buf, 0x4f000400u, elem_size_log2, vd, vn,
+                           (16u << elem_size_log2) - shift);
+}
+
+bool oah_emit_vshl_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                       u8 vd, u8 vn, u32 shift)
+{
+    return emit_vshift_imm(buf, 0x4f005400u, elem_size_log2, vd, vn,
+                           (8u << elem_size_log2) + shift);
+}
+
+bool oah_emit_ins_elem(oah_asm_buf *buf, u32 elem_size_log2, u8 vd,
+                       u8 i, u8 vn, u8 j)
+{
+    u32 lanes;
+    u32 imm5, imm4;
+    if (vd > 31 || vn > 31 || elem_size_log2 > 3) {
+        return false;
+    }
+    lanes = 16u >> elem_size_log2;
+    if (i >= lanes || j >= lanes) {
+        return false;
+    }
+    imm5 = ((u32)i << (elem_size_log2 + 1)) | (1u << elem_size_log2);
+    imm4 = (u32)j << elem_size_log2;
+    oah_asm_emit32(buf, 0x6e000400u | imm4 << 11 | imm5 << 16 |
+                            (u32)vn << 5 | vd);
+    return true;
+}

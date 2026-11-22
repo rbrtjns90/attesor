@@ -213,3 +213,16 @@ bool oah_emit_ins_gpr(oah_asm_buf *buf, u8 vd, u32 imm5, oah_gpr rn);
 /* UMOV (vector element to general register). imm5 as above. */
 bool oah_emit_umov_gpr(oah_asm_buf *buf, bool is_64, oah_gpr rd,
                        u8 vn, u32 imm5);
+
+/* Vector shifts by immediate. elem_size_log2: 0=b 1=h 2=s 3=d.
+ * shift must be in 1..esize-1 (callers apply x86 count clamps). */
+bool oah_emit_vushr_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                        u8 vd, u8 vn, u32 shift);
+bool oah_emit_vsshr_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                        u8 vd, u8 vn, u32 shift);
+bool oah_emit_vshl_imm(oah_asm_buf *buf, u32 elem_size_log2,
+                       u8 vd, u8 vn, u32 shift);
+
+/* INS (vector element to element): vd[i] = vn[j]. */
+bool oah_emit_ins_elem(oah_asm_buf *buf, u32 elem_size_log2, u8 vd,
+                       u8 i, u8 vn, u8 j);
