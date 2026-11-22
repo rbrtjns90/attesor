@@ -509,6 +509,16 @@ bool oah_emit_rev(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn)
     return true;
 }
 
+bool oah_emit_rbit(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn)
+{
+    u8 d, n;
+    if (!oah_gpr_to_num(rd, &d) || !oah_gpr_to_num(rn, &n)) {
+        return false;
+    }
+    oah_asm_emit32(buf, (is_64 ? 0xdac00000u : 0x5ac00000u) | (u32)n << 5 | d);
+    return true;
+}
+
 bool oah_emit_clz(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn)
 {
     u8 d, n;

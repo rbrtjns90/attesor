@@ -568,6 +568,7 @@ static bool frag_scalar_supported(const oah_insn *in)
     case OAH_SC_JMP: case OAH_SC_CALL: case OAH_SC_CMOV: case OAH_SC_SETCC:
     case OAH_SC_IMUL: case OAH_SC_NEG: case OAH_SC_NOT:
     case OAH_SC_INC: case OAH_SC_DEC: case OAH_SC_BSWAP: case OAH_SC_PUSH:
+    case OAH_SC_BSF: case OAH_SC_BSR: case OAH_SC_XCHG:
         return true;
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
         return true;
@@ -916,6 +917,49 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
         }
         return emit_store_result(buf, in, res, T0);
     }
+    case OAH_SC_BSF: case OAH_SC_BSR: {
+        /* Input is the rm operand (T1); dest is in->src. Zero input:
+         * ZF=1 and dest unchanged; else ZF=0 and res = lowest/highest
+         * set-bit index. Other flags are undefined on x86 — untouched. */
+        bool is64 = width == 8;
+        if (!oah_emit_add_sub_imm_flags(buf, is64, true, true, 31, T1, 0, 0) ||
+            !oah_emit_csinc(buf, false, T4, 31, 31, OAH_ARM_NE) ||
+            !frag_bfi(buf, F_RF, T4, 6, 1)) {
+            return false;
+        }
+        u64 skip_store = buf->size;
+        if (!oah_emit_cbz_cbnz(buf, is64, false, T1, 0)) {
+            return false;
+        }
+        if (in->scalar == OAH_SC_BSF) {
+            /* ctz = clz(rbit(x)) — operand is zero-extended so the
+             * lowest set bit always sits inside the operand width. */
+            if (!oah_emit_rbit(buf, is64, T5, T1) ||
+                !oah_emit_clz(buf, is64, res, T5)) {
+                return false;
+            }
+        } else {
+            /* index = (bits-1) - clz(x); for width<8 the padded upper
+             * zeros keep 31-clz32 inside the operand's range. */
+            if (!oah_emit_clz(buf, is64, T5, T1) ||
+                !frag_movi(buf, T4, is64 ? 63 : 31) ||
+                !oah_emit_add_sub_reg(buf, is64, true, false, res, T4,
+                                      T5, 0, 0)) {
+                return false;
+            }
+        }
+        if (!emit_store_result(buf, in, res, T0)) {
+            return false;
+        }
+        oah_asm_patch32(buf, skip_store,
+                        0x34000000u | ((u32)is64 << 31) |
+                        (((u32)(buf->size - skip_store) >> 2) << 5) | T1);
+        return true;
+    }
+    case OAH_SC_XCHG:
+        /* rm <- reg, reg <- rm; no flags. */
+        return emit_store_result(buf, in, T2, T0) &&
+               emit_store_gpr(buf, in->src, T1, width, in->rex_present);
     case OAH_SC_BSWAP:
         return oah_emit_rev(buf, width == 8, res, lhs) &&
                emit_store_result(buf, in, res, T0);

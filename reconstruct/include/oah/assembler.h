@@ -169,6 +169,9 @@ bool oah_emit_smull(oah_asm_buf *buf, oah_gpr rd, oah_gpr rn, oah_gpr rm);
 /* REV (byte swap): 32 or 64 bit. */
 bool oah_emit_rev(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn);
 
+/* RBIT (bit reversal). */
+bool oah_emit_rbit(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn);
+
 /* CLZ. */
 bool oah_emit_clz(oah_asm_buf *buf, bool is_64, oah_gpr rd, oah_gpr rn);
 
