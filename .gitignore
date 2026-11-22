@@ -17,6 +17,7 @@ librosetta.a
 !reconstruct/**/*.md
 !legacy/docs/**/*.md
 !research/**/*.md
+!runtime-src/**/*.md
 
 # Python bytecode and caches
 __pycache__/

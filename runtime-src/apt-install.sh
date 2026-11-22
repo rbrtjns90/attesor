@@ -1,0 +1,87 @@
+#!/bin/bash
+# apt-install.sh — install Debian packages into the Attesor sysroot.
+# Usage: apt-install.sh [-u|--update] [-f|--force] <package> [<package>...]
+#
+# How it works:
+#   1. guest apt-get resolves dependencies under the translator and prints
+#      the exact .deb URLs it would download (--print-uris downloads nothing)
+#   2. native macOS curl fetches those URLs at full link speed
+#   3. native-deb-install.sh unpacks each .deb into the sysroot and runs
+#      `dpkg --configure -a` under the translator for maintainer scripts
+#
+# This keeps the two slow/crash-prone translated phases (apt's HTTP event
+# loop and dpkg-deb/xz decompression) entirely in native code.
+#
+# Options:
+#   -u, --update   run `apt-get update` in the guest first (translated; only
+#                  needed when the package index is stale or empty)
+#   -f, --force    reinstall packages already marked installed (repair mode)
+
+set -uo pipefail
+
+A=/Users/rob/Documents/GitHub/attesor
+S="$A/runtime/sysroots/debian-expanded"
+OAH="$A/reconstruct/oah"
+INSTALLER="$A/runtime-src/native-deb-install.sh"
+
+update=0
+force=0
+pkgs=()
+for arg in "$@"; do
+    case "$arg" in
+        -u|--update) update=1 ;;
+        -f|--force) force=1 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        --) ;;
+        *) pkgs+=("$arg") ;;
+    esac
+done
+if [ "${#pkgs[@]}" -eq 0 ]; then
+    echo "usage: $0 [-u|--update] [-f|--force] <package> [<package>...]" >&2
+    exit 2
+fi
+
+run_guest() {
+    env DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
+        "$OAH" --sysroot "$S" "$@"
+}
+
+if [ "$update" = 1 ]; then
+    echo "== apt-get update (translated index fetch)"
+    run_guest "$S/usr/bin/apt-get" update || {
+        echo "!! apt-get update failed" >&2
+        exit 1
+    }
+fi
+
+echo "== resolving: ${pkgs[*]}"
+resolved=$(run_guest "$S/usr/bin/apt-get" install --print-uris -y "${pkgs[@]}") || {
+    echo "!! apt could not resolve: ${pkgs[*]}" >&2
+    exit 1
+}
+# --print-uris output lines: '<url>' <filename> <size> <hash>
+uris=$(printf '%s\n' "$resolved" | sed -n "s/^'\([^']*\)'.*/\1/p")
+if [ -z "$uris" ]; then
+    echo "== nothing to download (already installed, or run with -f to repair)"
+    exit 0
+fi
+
+dir=$(mktemp -d /tmp/oah-debs.XXXXXX)
+trap 'rm -rf "$dir"' EXIT
+
+n=0
+for url in $uris; do
+    n=$((n + 1))
+    echo "== fetch $(basename "$url")"
+    curl -fsSL -o "$dir/$(basename "$url")" "$url" || {
+        echo "!! download failed: $url" >&2
+        exit 1
+    }
+done
+echo "== $n archive(s) downloaded to $dir"
+
+FORCE="$force" "$INSTALLER" "$S" "$dir"/*.deb || {
+    echo "!! native install failed" >&2
+    exit 1
+}
+echo "== installed: ${pkgs[*]}"
