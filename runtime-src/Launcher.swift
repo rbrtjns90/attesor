@@ -61,11 +61,14 @@ func launch(_ file: URL, requested: Mode) throws {
         throw LaunchError(message: "Attesor or its Debian sysroot was moved. Keep the Apps and sysroots folders together under Attesor.")
     }
     recordLaunch(executable)
-    let args = ["--max-insns", "1500000000", "--sysroot", root, executable.path]
+    let args = ["--max-insns", "18446744073709551615", "--sysroot", root, executable.path]
     var env = ProcessInfo.processInfo.environment
     env["LC_ALL"] = "C"
     env["HOME"] = "/root"
     env["XAUTHORITY"] = NSHomeDirectory() + "/.Xauthority"
+    // Route SDL2/libasound audio to the emulated card (CoreAudio).
+    env["SDL_AUDIODRIVER"] = "alsa"
+    env["AUDIODEV"] = "hw:0,0"
     if mode == .window {
         env["DISPLAY"] = ":0"
         env["XFILESEARCHPATH"] = root + "/etc/X11/app-defaults/%N"
