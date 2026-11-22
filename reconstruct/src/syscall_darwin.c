@@ -407,6 +407,7 @@ static pthread_mutex_t guest_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t workers_exited = PTHREAD_COND_INITIALIZER;
 static unsigned workers;
 static u32 next_thread_id = 0x10000000;
+static u64 next_jit_owner = 1; /* 0 = main thread (guest_init zeroes it) */
 
 void oah_darwin_guest_enter(void)
 {
@@ -423,12 +424,16 @@ bool oah_darwin_has_workers(void)
     return workers != 0;
 }
 
-void oah_darwin_guest_tick(oah_guest *g)
+void oah_darwin_guest_tick(oah_guest *g, u64 insns)
 {
-    if (workers && ++g->quantum >= 1024) {
+    if (workers && (g->quantum += (unsigned)insns) >= (64u << 10)) {
         g->quantum = 0;
         oah_darwin_guest_leave();
-        sched_yield();
+        /* A bare unlock/relock beats a psynch waiter every time: the
+         * woken thread needs a real scheduling window to take the lock.
+         * usleep(1) yields long enough for the handoff to actually land,
+         * so a hot loop cannot starve a worker that only needs the lock. */
+        usleep(1);
         oah_darwin_guest_enter();
     }
 }
@@ -695,8 +700,22 @@ static void *run_guest_thread(void *opaque)
     bridged_signal_set(&blocked);
     pthread_sigmask(SIG_BLOCK, &blocked, NULL);
     oah_darwin_guest_enter();
-    oah_interp_result result = oah_interp_run(&thread->guest, thread->image,
-                                              thread->image->instruction_limit);
+    if (getenv("OAH_TRACE_THREADS")) {
+        fprintf(stderr, "oah: worker %u started rip=%llx\n",
+                thread->guest.tid, (unsigned long long)thread->guest.rip);
+    }
+    /* OAH_WORKER_JIT opts worker threads into the cached fragment JIT.
+     * The interpreter remains the default until worker JIT is proven. */
+    static int worker_jit = -1;
+    if (worker_jit < 0) {
+        worker_jit = getenv("OAH_WORKER_JIT") != NULL;
+    }
+    oah_interp_result result =
+        worker_jit
+            ? oah_jit_run_worker(&thread->guest, thread->image,
+                                 thread->image->instruction_limit)
+            : oah_interp_run(&thread->guest, thread->image,
+                             thread->image->instruction_limit);
     if (result.status != OAH_INTERP_EXIT) {
         fprintf(stderr, "oah: guest thread %u stopped (%d) at rip=%llx",
                 thread->guest.tid, result.status, (unsigned long long)thread->guest.rip);
@@ -761,6 +780,7 @@ static s64 guest_clone_thread(oah_guest *g, oah_image *img, u64 flags, u64 stack
     thread->guest.clear_tid = flags & X86_CLONE_CHILD_CLEARTID ? child_tid : 0;
     thread->guest.tid = tid;
     thread->guest.quantum = 0;
+    thread->guest.jit_owner = next_jit_owner++;
     thread->guest.thread_exit = false;
     if (flags & X86_CLONE_SETTLS) {
         thread->guest.fs_base = tls;

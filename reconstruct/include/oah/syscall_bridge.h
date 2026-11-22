@@ -44,7 +44,9 @@ oah_sys_status oah_guest_signal_syscall(oah_guest *g, oah_image *img);
 #if defined(__APPLE__)
 void oah_darwin_guest_enter(void);
 void oah_darwin_guest_leave(void);
-void oah_darwin_guest_tick(oah_guest *g);
+/* Charge insns of guest work toward the scheduling quantum; yields the
+ * guest lock when the quantum is exhausted so other workers can run. */
+void oah_darwin_guest_tick(oah_guest *g, u64 insns);
 bool oah_darwin_has_workers(void);
 oah_sys_status oah_guest_signal_poll(oah_guest *g, oah_image *img);
 u64 oah_darwin_pending_signals(void);

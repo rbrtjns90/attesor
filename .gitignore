@@ -47,6 +47,7 @@ reconstruct/tests/sse_guest.x86_64
 reconstruct/tests/sse_guest.x86_64.expected
 reconstruct/tests/branch_guest.x86_64
 reconstruct/tests/branch_guest-pie.x86_64
+reconstruct/tests/thread_guest.x86_64
 reconstruct/tests/branch_guest.got
 reconstruct/tests/hello.qemu.got
 reconstruct/oah

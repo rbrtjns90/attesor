@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--hello", type=Path, required=True)
     parser.add_argument("--sse", type=Path)
+    parser.add_argument("--thread", type=Path,
+                        help="two-worker TLS/XMM isolation fixture")
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -99,6 +101,16 @@ def main():
                        [str(args.sse.resolve())], sse_expected)
                 cache_matrix(runner, directory, "SSE guest vector ops",
                              [str(args.sse.resolve())], sse_expected)
+            if args.thread:
+                thread_expected = (0, b"workerjit ok\n", b"")
+                verify(runner, directory, "worker TLS/XMM isolation",
+                       [str(args.thread.resolve())], thread_expected)
+                actual = run([runner, str(args.thread.resolve())], directory,
+                             b"", extra_env={"OAH_WORKER_JIT": "1"})
+                if actual != thread_expected:
+                    raise ValueError(f"workerjit thread isolation: "
+                                     f"expected {thread_expected!r}, got {actual!r}")
+                print("PASS workerjit: worker TLS/XMM isolation")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,

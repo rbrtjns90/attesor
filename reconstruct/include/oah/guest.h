@@ -43,6 +43,7 @@ typedef struct {
     u64 clear_tid;
     u32 tid;
     unsigned quantum;
+    u64 jit_owner; /* serial: fragments bake per-thread bases, keyed by this */
     bool thread_exit;
 #endif
 } oah_guest;

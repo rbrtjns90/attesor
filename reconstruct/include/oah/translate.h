@@ -100,6 +100,13 @@ oah_interp_result oah_jit_run_native(oah_guest *g, oah_image *img, u64 max_insns
 oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
                                      u64 max_insns, bool aot);
 
+/* Worker-thread JIT entry. Identity-mapped images (ET_DYN on Darwin) use
+ * the cached fragment dispatch keyed by the thread's jit_owner serial;
+ * non-identity images use the per-block native path. Unsupported
+ * instructions always fall back to the interpreter. */
+oah_interp_result oah_jit_run_worker(oah_guest *g, oah_image *img,
+                                     u64 max_insns);
+
 /* Drop all cached fragments (guest memory/protection changed). */
 void oah_jit_cache_flush(void);
 

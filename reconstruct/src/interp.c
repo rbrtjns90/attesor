@@ -1348,7 +1348,7 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
 
     while (r.insns < max_insns) {
 #if defined(__APPLE__)
-        oah_darwin_guest_tick(g);
+        oah_darwin_guest_tick(g, 1);
         oah_sys_status signal_status = oah_guest_signal_poll(g, img);
         if (signal_status != OAH_SYS_CONTINUE) {
             r.status = signal_status == OAH_SYS_EXIT ? OAH_INTERP_EXIT : OAH_INTERP_FAULT;
