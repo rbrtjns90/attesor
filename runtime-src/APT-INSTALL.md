@@ -27,10 +27,32 @@ Options:
 
 | Flag | Meaning |
 |---|---|
-| `-u`, `--update` | run `apt-get update` in the guest first — needed when the package index is stale or empty |
+| `-u`, `--update` | refresh the package index first via `apt-update.sh` — needed when the index is stale or empty |
 | `-f`, `--force` | reinstall packages already marked installed (repair mode) |
 
-### What the script does
+### Refreshing the index: `apt-update.sh`
+
+```sh
+runtime-src/apt-update.sh
+```
+
+This is a native replacement for translated `apt-get update`. For every
+entry in `/etc/apt/sources.list` and `sources.list.d/` (both legacy
+`deb ...` lines and deb822 `*.sources` files), it:
+
+1. fetches `dists/<suite>/InRelease` (or `Release` + `Release.gpg`)
+2. verifies the signature with the **guest** `gpgv` under the translator
+   and the repo's `Signed-By` keyring — a tiny file, so fast even
+   translated; falls back to checksum-only with a warning if gpgv or the
+   keyring is missing
+3. reads the Release's SHA256 table and downloads each component's
+   `Packages` index (preferring `.lz4`, falling back to `.xz`/`.gz`) plus
+   `Translation-en`, verifying size and sha256
+4. installs files into `var/lib/apt/lists/` under the same mangled names
+   apt itself uses, retiring stale compressions of the same index
+5. drops `pkgcache.bin`/`srcpkgcache.bin` so apt regenerates them
+
+### What the install script does
 
 1. Runs `apt-get install --print-uris -y <pkgs>` under the translator —
    apt's solver resolves the full dependency set and prints the exact
@@ -55,9 +77,8 @@ apt install <package>
 This is real Debian `apt` running under the translator. It works
 end-to-end, but translated HTTP runs ~600 KB/s and unpack is also
 translated, so large packages take minutes and occasionally hit the
-intermittent decompressor crash. Use it when the native path misbehaves;
-it is also the only way `apt update` currently works (there is no native
-index fetcher yet).
+intermittent decompressor crash. The native path (`apt-update.sh` +
+`apt-install.sh`) is preferred for everything.
 
 ## After installing
 
@@ -77,7 +98,7 @@ index fetcher yet).
 
 | Symptom | Fix |
 |---|---|
-| `apt` says package not found | run `apt-install.sh -u <pkg>` (or `apt update` in the Debian shell) to refresh the index |
+| `apt` says package not found | run `apt-install.sh -u <pkg>` or `apt-update.sh` to refresh the index |
 | package marked installed but files missing | `apt-install.sh -f <pkg>` |
 | `dpkg` errors at configure time | run `dpkg --configure -a` in the Debian shell, then retry |
 | `--print-uris` prints nothing for a needed package | the archive may already sit in `var/cache/apt/archives/`; remove it or pass `-f` |
@@ -85,9 +106,6 @@ index fetcher yet).
 
 ## Known gaps
 
-- `apt-get update` is still translated — the index files are small enough
-  to tolerate it, but a native index fetcher is future work (it would
-  belong in the planned GUI package manager).
 - Some maintainer scripts assume a running system (init, udev, D-Bus).
   Most degrade gracefully under `DEBIAN_FRONTEND=noninteractive`; ones
   that don't usually leave the package half-configured — fix the

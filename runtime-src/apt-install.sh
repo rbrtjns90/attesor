@@ -13,8 +13,8 @@
 # loop and dpkg-deb/xz decompression) entirely in native code.
 #
 # Options:
-#   -u, --update   run `apt-get update` in the guest first (translated; only
-#                  needed when the package index is stale or empty)
+#   -u, --update   refresh the package index first via apt-update.sh
+#                  (native fetch — fast; use when the index is stale)
 #   -f, --force    reinstall packages already marked installed (repair mode)
 
 set -uo pipefail
@@ -23,6 +23,7 @@ A=/Users/rob/Documents/GitHub/attesor
 S="$A/runtime/sysroots/debian-expanded"
 OAH="$A/reconstruct/oah"
 INSTALLER="$A/runtime-src/native-deb-install.sh"
+UPDATER="$A/runtime-src/apt-update.sh"
 
 update=0
 force=0
@@ -47,9 +48,8 @@ run_guest() {
 }
 
 if [ "$update" = 1 ]; then
-    echo "== apt-get update (translated index fetch)"
-    run_guest "$S/usr/bin/apt-get" update || {
-        echo "!! apt-get update failed" >&2
+    "$UPDATER" || {
+        echo "!! apt index refresh failed" >&2
         exit 1
     }
 fi
