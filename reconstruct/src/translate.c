@@ -570,7 +570,7 @@ static bool frag_scalar_supported(const oah_insn *in)
     case OAH_SC_INC: case OAH_SC_DEC: case OAH_SC_BSWAP: case OAH_SC_PUSH:
         return true;
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
-        return in->immediate != 0;
+        return true;
     default:
         return false;
     }
@@ -752,12 +752,105 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                emit_store_result(buf, in, res, T0);
     }
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR: {
+        u32 bits = width * 8;
+        u8 kind = in->scalar == OAH_SC_SHL ? 0 : in->scalar == OAH_SC_SHR ? 1 : 2;
+        if (!in->immediate) {
+            /* Shift by CL: count masked to 6 bits (64-bit operand) or
+             * 5 bits. A masked count of 0 changes no state at all, so
+             * the whole sequence sits behind a patched forward cbz. */
+            if (!frag_ubfx(buf, T4, xn(OAH_X86_RCX), 0,
+                           width == 8 ? 6 : 5)) {
+                return false;
+            }
+            u64 skip_all = buf->size;
+            if (!oah_emit_cbz_cbnz(buf, false, false, T4, 0)) {
+                return false;
+            }
+            u8 op = lhs;
+            if (kind == 2 && width < 8) {
+                if (!oah_emit_sbfm(buf, false, T5, lhs, 0, bits - 1)) {
+                    return false;
+                }
+                op = T5;
+            }
+            if (!oah_emit_shift_var(buf, width == 8, kind, res, op, T4) ||
+                !emit_merge_logic(buf, res, width)) {
+                return false;
+            }
+            /* CF = bit(bits-cnt) [SHL] or bit(cnt-1) [SHR/SAR] of lhs;
+             * defined only when cnt <= bits (undefined otherwise). */
+            u64 skip_cf = 0;
+            if (bits < 32) {
+                if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
+                                                T4, bits, 0)) {
+                    return false;
+                }
+                skip_cf = buf->size;
+                if (!oah_emit_bcond(buf, OAH_ARM_HI, 0)) {
+                    return false;
+                }
+            }
+            if (kind == 0) {
+                if (!frag_movi(buf, T5, bits) ||
+                    !oah_emit_add_sub_reg(buf, false, true, false, T5, T5,
+                                          T4, 0, 0)) {
+                    return false;
+                }
+            } else if (!oah_emit_add_sub_imm(buf, false, true, T5, T4, 1)) {
+                return false;
+            }
+            if (!oah_emit_shift_var(buf, width == 8, 1, T7, lhs, T5) ||
+                !frag_bfi(buf, F_RF, T7, 0, 1)) {
+                return false;
+            }
+            if (skip_cf) {
+                oah_asm_patch32(buf, skip_cf,
+                                0x54000000u |
+                                (((u32)(buf->size - skip_cf) >> 2) << 5) |
+                                OAH_ARM_HI);
+            }
+            /* OF on cnt==1: SHR = sign(lhs); SHL = sign(res)^CF. */
+            if (kind != 2) {
+                if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
+                                                T4, 1, 0)) {
+                    return false;
+                }
+                u64 skip_of = buf->size;
+                if (!oah_emit_bcond(buf, OAH_ARM_NE, 0)) {
+                    return false;
+                }
+                if (kind == 1) {
+                    if (!oah_emit_ubfm(buf, width == 8, T7, lhs,
+                                       bits - 1, bits - 1) ||
+                        !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                        return false;
+                    }
+                } else if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                          bits - 1, bits - 1) ||
+                           !frag_ubfx(buf, T5, F_RF, 0, 1) ||
+                           !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false,
+                                               T7, T7, T5, 0, 0) ||
+                           !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                    return false;
+                }
+                oah_asm_patch32(buf, skip_of,
+                                0x54000000u |
+                                (((u32)(buf->size - skip_of) >> 2) << 5) |
+                                OAH_ARM_NE);
+            }
+            if (!emit_store_result(buf, in, res, T0)) {
+                return false;
+            }
+            oah_asm_patch32(buf, skip_all,
+                            0x34000000u |
+                            (((u32)(buf->size - skip_all) >> 2) << 5) |
+                            T4);
+            return true;
+        }
         u32 raw_count = (u32)(in->imm & (width == 8 ? 63 : 31));
         if (!raw_count) {
             return true; /* x86: no state change at all */
         }
-        u32 bits = width * 8;
-        u8 kind = in->scalar == OAH_SC_SHL ? 0 : in->scalar == OAH_SC_SHR ? 1 : 2;
         u32 count = raw_count;
         if (kind == 0) { /* SHL */
             if (width == 8) {
@@ -798,7 +891,7 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
          * only when the masked count doesn't exceed the operand width. */
         if (raw_count <= bits) {
             u32 bit = kind == 0 ? bits - raw_count : raw_count - 1;
-            if (!frag_ubfx(buf, T4, lhs, bit, 1) ||
+            if (!oah_emit_ubfm(buf, width == 8, T4, lhs, bit, bit) ||
                 !frag_bfi(buf, F_RF, T4, 0, 1)) {
                 return false;
             }
@@ -806,12 +899,14 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
         /* OF on count==1: SHR = sign(lhs); SHL = sign(res)^CF; SAR unchanged. */
         if (raw_count == 1 && kind != 2) {
             if (kind == 1) {
-                if (!frag_ubfx(buf, T4, lhs, bits - 1, 1) ||
+                if (!oah_emit_ubfm(buf, width == 8, T4, lhs,
+                                   bits - 1, bits - 1) ||
                     !frag_bfi(buf, F_RF, T4, 11, 1)) {
                     return false;
                 }
             } else {
-                if (!frag_ubfx(buf, T4, res, bits - 1, 1) ||
+                if (!oah_emit_ubfm(buf, width == 8, T4, res,
+                                   bits - 1, bits - 1) ||
                     !frag_ubfx(buf, T5, F_RF, 0, 1) ||
                     !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T4, T4, T5, 0, 0) ||
                     !frag_bfi(buf, F_RF, T4, 11, 1)) {
@@ -1141,9 +1236,10 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
              * Drop whatever the aborted case body emitted. */
             buf->size = insn_start;
             if (getenv("OAH_JIT_TRACE")) {
-                fprintf(stderr, "  boundary %llx op=%d sc=%d w=%d imm=%d b0=%02x\n",
+                fprintf(stderr, "  boundary %llx op=%d sc=%d w=%d imm=%d b0=%02x b1=%02x b2=%02x mem=%d\n",
                         (unsigned long long)cur, in.op, in.scalar,
-                        in.opsize, in.immediate, pc[0]);
+                        in.opsize, in.immediate, pc[0], pc[1], pc[2],
+                        in.memory);
             }
             if (!frag_exit_imm(buf, cur)) {
                 return false;

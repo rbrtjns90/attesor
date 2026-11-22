@@ -10,6 +10,7 @@ reconstruct/bin/
 *.o
 reconstruct/src/*.d
 librosetta.a
+reconstruct/src/build_key.c
 
 # Intermediate Markdown files except README.md
 *.md

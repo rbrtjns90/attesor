@@ -6,13 +6,14 @@ CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -O2 -g
 CFLAGS  += -Iinclude
 # Cache identity must change whenever the translator inputs change, not
 # only when HEAD moves: hash HEAD + uncommitted diffs + file status +
-# compiler/flags so stale .oahjc files are invalidated.
+# compiler/flags so stale .oahjc files are invalidated. The value is
+# generated into src/build_key.c so every object shares ONE key — a
+# per-TU -D would let incremental builds mix keys and poison the cache.
 BUILD_KEY := $(shell { git rev-parse HEAD 2>/dev/null; \
                        git diff HEAD -- src include Makefile 2>/dev/null; \
                        git status --porcelain src include Makefile 2>/dev/null; \
                        $(CC) --version 2>/dev/null | head -1; \
                        echo "$(CFLAGS)"; } | cksum | cut -d' ' -f1)
-CFLAGS  += -DOAH_BUILD_KEY=$(BUILD_KEY)u
 HOST_OS := $(shell uname -s)
 ifeq ($(HOST_OS),Darwin)
 CFLAGS  += -D_DARWIN_C_SOURCE
@@ -23,6 +24,7 @@ HOST_LDFLAGS = -pie
 endif
 
 SRC = \
+    src/build_key.c \
     src/register.c \
     src/result.c \
     src/assembler_buffer.c \
@@ -85,6 +87,12 @@ AARCH64_LDFLAGS ?= -static -Wl,-Ttext-segment=0x2000000000
 .PHONY: all test test-unit test-macos test-macos-gate test-branch-guest test-linux-static test-linux-dynamic test-linux-glibc test-qemu clean inventory inventory-binary oah oah-aarch64
 
 all: $(OBJ) oah
+
+src/build_key.c: FORCE
+	@printf 'unsigned oah_build_key(void){return %uu;}\n' '$(BUILD_KEY)' >$@.tmp; \
+	 cmp -s $@.tmp $@ || mv $@.tmp $@; rm -f $@.tmp
+
+FORCE:
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -fPIE -MMD -MP -c -o $@ $<
@@ -190,7 +198,7 @@ inventory-binary:
 -include $(OBJ:.o=.d) src/oah_main.d
 
 clean:
-	rm -f $(OBJ) $(OBJ:.o=.d) src/oah_main.o src/oah_main.d $(TESTS) oah oah-aarch64 \
+	rm -f $(OBJ) $(OBJ:.o=.d) src/oah_main.o src/oah_main.d src/build_key.c $(TESTS) oah oah-aarch64 \
 	    tests/test_arm_native-aarch64 tests/hello.x86_64 tests/hello.got \
 	    tests/branch_guest.x86_64 tests/branch_guest-pie.x86_64 tests/branch_guest.got \
 	    tests/hello.qemu.got

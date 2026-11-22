@@ -129,6 +129,7 @@ oah_interp_result oah_jit_run_native(oah_guest *g, oah_image *img, u64 max_insns
 
 #include <libkern/OSCacheControl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -210,6 +211,45 @@ static void jit_insert(const oah_frag_entry *entry)
  * translated (Rosetta-style block repatching). */
 static oah_frag_entry *chain_prev;
 static bool jit_chain = true;
+static u64 fallback_steps; /* interpreter steps at fragment boundaries */
+static u64 stats_insns;
+static u64 stats_ops[64]; /* decoded op of each boundary insn */
+static u64 stats_scalar[64]; /* OAH_SC_* subtype within OAH_OP_SCALAR */
+static bool jit_stats;
+static int stats_fd = -1; /* dup'd stderr: guests close fd 2 during cleanup */
+
+static void jit_stats_print(void)
+{
+    static bool printed;
+    if (printed) {
+        return;
+    }
+    printed = true;
+    int out = stats_fd >= 0 ? stats_fd : STDERR_FILENO;
+    dprintf(out,
+            "jit stats: insns=%llu boundary_interp_steps=%llu (%.1f%%)\n",
+            (unsigned long long)stats_insns,
+            (unsigned long long)fallback_steps,
+            stats_insns ? 100.0 * (double)fallback_steps / (double)stats_insns
+                        : 0.0);
+    if (getenv("OAH_JIT_STATS_OPS")) {
+        for (int i = 0; i < 64; i++) {
+            if (stats_ops[i]) {
+                dprintf(out, "  op %-4d %llu (%.1f%%)\n", i,
+                        (unsigned long long)stats_ops[i],
+                        100.0 * (double)stats_ops[i] / (double)fallback_steps);
+            }
+        }
+        for (int i = 0; i < 64; i++) {
+            if (stats_scalar[i]) {
+                dprintf(out, "  scalar %-4d %llu (%.1f%%)\n", i,
+                        (unsigned long long)stats_scalar[i],
+                        100.0 * (double)stats_scalar[i] /
+                            (double)fallback_steps);
+            }
+        }
+    }
+}
 
 /* Rewrite an exit's `ret` into `b <target>` when it is in range. */
 static void jit_chain_patch(oah_frag_entry *e, u32 slot, u32 target_off)
@@ -262,10 +302,10 @@ static bool jit_arena_init(void)
 #define OAH_PCACHE_VERSION 4u
 /* Cache files are tied to the translator build: a rebuilt binary may emit
  * different code for the same guest, so old files must not be reused.
- * OAH_BUILD_KEY comes from the Makefile (git commit hash). */
-#ifndef OAH_BUILD_KEY
-#define OAH_BUILD_KEY 0u
-#endif
+ * oah_build_key() is generated into src/build_key.c each build so every
+ * object shares one identity (a per-TU define would let incremental
+ * builds mix stale keys). */
+unsigned oah_build_key(void);
 static const u8 pcache_magic[8] = {'O', 'A', 'H', 'J', 'C', '0', '0', '1'};
 
 typedef struct {
@@ -391,7 +431,7 @@ static pcache *pcache_open(oah_image *img, int module)
     fclose(f);
     if (len < 32 || memcmp(blob, pcache_magic, 8) ||
         ((const u32 *)blob)[2] != OAH_PCACHE_VERSION ||
-        ((const u32 *)blob)[6] != OAH_BUILD_KEY ||
+        ((const u32 *)blob)[6] != oah_build_key() ||
         ((const u64 *)blob)[2] != m->key) {
         free(blob);
         return pc;
@@ -568,7 +608,7 @@ static void pcache_flush_module(oah_module *m)
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, pcache_magic, 8);
     ((u32 *)hdr)[2] = OAH_PCACHE_VERSION;
-    ((u32 *)hdr)[6] = OAH_BUILD_KEY;
+    ((u32 *)hdr)[6] = oah_build_key();
     ((u64 *)hdr)[2] = m->key;
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
@@ -1002,6 +1042,19 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
 #endif
         u64 interp_rip = ctx[17];
         if (frag->flags & OAH_FRAG_FALLBACK) {
+            fallback_steps++;
+            if (jit_stats) {
+                u64 avail = OAH_X86_MAX_INSN;
+                const u8 *opc = oah_guest_span(img, interp_rip, &avail);
+                oah_insn oin;
+                if (opc && oah_decode_insn(opc, opc + avail, &oin) &&
+                    oin.op < 64) {
+                    stats_ops[oin.op]++;
+                    if (oin.op == OAH_OP_SCALAR && oin.scalar < 64) {
+                        stats_scalar[oin.scalar]++;
+                    }
+                }
+            }
             oah_interp_result one = oah_interp_run(g, img, 1);
             r.insns += one.insns;
             if (one.status != OAH_INTERP_LIMIT) {
@@ -1112,6 +1165,11 @@ oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
 {
     static bool env_checked = false;
     if (!env_checked) {
+        jit_stats = getenv("OAH_JIT_STATS") != NULL;
+        if (jit_stats) {
+            stats_fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 64);
+            atexit(jit_stats_print);
+        }
         env_checked = true;
         if (getenv("OAH_JIT_NOCACHE")) {
             jit_persist = false;
@@ -1123,7 +1181,13 @@ oah_interp_result oah_jit_run_cached(oah_guest *g, oah_image *img,
         }
     }
     oah_interp_result r = jit_run_cached_inner(g, img, max_insns, aot);
+    stats_insns += r.insns;
     pcache_flush(img);
+    /* Worker-bearing guests exit via _Exit in oah_main (skips atexit),
+     * so print on terminal status here as well as at normal exit. */
+    if (jit_stats && r.status != OAH_INTERP_LIMIT && r.status != OAH_INTERP_OK) {
+        jit_stats_print();
+    }
     return r;
 }
 
