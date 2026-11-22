@@ -429,6 +429,13 @@ static unsigned sched_waiting;
 static unsigned guest_lock_waiters;
 static u64 sched_generation;
 
+/* Max contiguous wall time a thread may hold guest_lock before handing
+ * off to a waiter. Short enough that a thread returning from a blocking
+ * syscall isn't stalled behind a busy worker's slice — the SDL audio
+ * worker is CPU-bound and would otherwise add ~4ms latency to every
+ * reacquire the main thread makes, which stalls interactive drawing. */
+#define OAH_GUEST_SLICE_NS 300000ull /* ~0.3ms */
+
 void oah_darwin_guest_enter(void)
 {
     __atomic_fetch_add(&guest_lock_waiters, 1, __ATOMIC_RELAXED);
@@ -440,9 +447,16 @@ void oah_darwin_guest_enter(void)
         pthread_cond_broadcast(&sched_cv);
         pthread_mutex_unlock(&sched_mu);
     }
+    /* Refresh the slice stamp only after a real gap off the lock. A thread
+     * that bounces out and back in under OAH_GUEST_SLICE_NS (the SDL audio
+     * worker does a blocking writei every few ms) would otherwise restart
+     * its slice on every reacquire and starve waiters indefinitely. */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    lock_hold_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    u64 now_ns = (u64)now.tv_sec * 1000000000ull + (u64)now.tv_nsec;
+    if (!lock_hold_ns || now_ns - lock_hold_ns >= OAH_GUEST_SLICE_NS) {
+        lock_hold_ns = now_ns;
+    }
 }
 
 void oah_darwin_guest_leave(void)
@@ -465,7 +479,6 @@ bool oah_darwin_has_workers(void)
  * acquiring it (guest_lock_waiters); workers parked in futex or blocking
  * syscalls don't need a slice, and yielding to nobody just stalls the
  * only runnable thread. */
-#define OAH_GUEST_SLICE_NS 4000000ull /* ~4ms contiguous hold */
 #define OAH_GUEST_CHECK_INSNS (8u << 10) /* insns between clock checks */
 
 void oah_darwin_guest_tick(oah_guest *g, u64 insns)
@@ -496,12 +509,15 @@ void oah_darwin_guest_tick(oah_guest *g, u64 insns)
         fprintf(stderr, "sched yield tid=%u hold=%llums\n", g->tid,
                 (unsigned long long)((now_ns - lock_hold_ns) / 1000000ull));
     }
-    /* Park until a peer reports a guest_lock acquisition so the handoff
-     * is guaranteed, not a sleep race. The timeout covers the case where
-     * the waiter gives up or gets cancelled before acquiring. */
+    /* Park until the waiter queue drains: a yielding thread stays out of
+     * the mutex queue while peers are still blocked acquiring the lock,
+     * so an interactive thread can chain several lock/syscall cycles in
+     * one turn. A CPU-bound worker (SDL audio pump) otherwise re-enters
+     * after a single handoff and the interactive thread pays a full
+     * slice of latency on every syscall. The deadline keeps a
+     * permanently-contended lock from starving the yielder. */
     pthread_mutex_lock(&sched_mu);
     sched_waiting++;
-    u64 gen = sched_generation;
     struct timespec deadline = {
         .tv_sec = now.tv_sec, .tv_nsec = now.tv_nsec + 8000000L,
     };
@@ -510,11 +526,20 @@ void oah_darwin_guest_tick(oah_guest *g, u64 insns)
         deadline.tv_nsec -= 1000000000L;
     }
     oah_darwin_guest_leave();
-    while (sched_generation == gen &&
+    while (__atomic_load_n(&guest_lock_waiters, __ATOMIC_RELAXED) != 0 &&
            pthread_cond_timedwait(&sched_cv, &sched_mu, &deadline) == 0) {
     }
     sched_waiting--;
     pthread_mutex_unlock(&sched_mu);
+    /* Grace window before re-entering the mutex queue: the drained moment
+     * is usually a waiter's brief gap between releasing the lock for a
+     * host call and re-queueing, not the end of its burst. Sleeping a
+     * fraction of a millisecond lets that burst finish (or settle into a
+     * long block) before this thread competes again. */
+    {
+        struct timespec grace = {.tv_sec = 0, .tv_nsec = 400000L};
+        nanosleep(&grace, NULL);
+    }
     oah_darwin_guest_enter();
 }
 
