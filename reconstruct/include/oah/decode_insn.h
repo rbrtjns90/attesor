@@ -50,6 +50,15 @@ typedef enum {
     OAH_SC_SHL, OAH_SC_SHR, OAH_SC_SAR, OAH_SC_ROL, OAH_SC_ROR, OAH_SC_SHLD, OAH_SC_SHRD, OAH_SC_IMUL, OAH_SC_NEG, OAH_SC_NOT, OAH_SC_BSF, OAH_SC_BSR, OAH_SC_INC, OAH_SC_DEC, OAH_SC_XCHG, OAH_SC_DIV, OAH_SC_IDIV, OAH_SC_BT, OAH_SC_BSWAP, OAH_SC_BTS, OAH_SC_BTR, OAH_SC_BTC, OAH_SC_MUL, OAH_SC_IMUL_WIDE, OAH_SC_CMPXCHG, OAH_SC_CMPXCHG8B, OAH_SC_XADD, OAH_SC_PUSH
 } oah_scalar_op;
 
+/* string_kind values for OAH_OP_STRING. */
+enum {
+    OAH_STR_STOS,   /* aa/ab: rax -> [rdi] */
+    OAH_STR_MOVS,   /* a4/a5: [rsi] -> [rdi] */
+    OAH_STR_CMPS,   /* a6/a7: flags([rsi] - [rdi]) */
+    OAH_STR_SCAS,   /* ae/af: flags(rax - [rdi]) */
+    OAH_STR_LODS    /* ac/ad: [rsi] -> rax */
+};
+
 /* Internal tags for prefixed variants of vector moves. */
 enum {
     OAH_VECTOR_SCALAR_LOAD = 0x30,
@@ -96,6 +105,8 @@ typedef struct {
     bool rex_present;
     u8 src_width;
     bool repeat;
+    bool repeat_ne;   /* F2: repne/repnz for cmps/scas */
+    u8 string_kind;   /* OAH_STR_* below; STOS/MOVS default */
     bool string_move;
     u8 vector_opcode;
     u8 x87_modrm, x87_opcode;

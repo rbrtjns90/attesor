@@ -1178,6 +1178,25 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
     if (audio_disabled < 0) {
         audio_disabled = getenv("OAH_DISABLE_AUDIO") != NULL;
     }
+    /* Linux /dev/ptmx slaves are openable immediately; Darwin requires
+     * grantpt (chown to caller) + unlockpt on the master first, and guests
+     * may open the slave without a TIOCSPTLCK ioctl (xterm's child retry
+     * path). Unlock at master-open time to match Linux. */
+    bool is_ptmx = !strcmp(path, "/dev/ptmx");
+    /* Linux pts slaves are /dev/pts/N; Darwin names them /dev/ttysNNN.
+     * TIOCGPTN hands guests the unit number, which they open as
+     * /dev/pts/N — translate it to the Darwin slave device. */
+    if (!strncmp(path, "/dev/pts/", 9)) {
+        int unit = -1;
+        if (sscanf(path + 9, "%d", &unit) == 1 && unit >= 0) {
+            char slave[64];
+            snprintf(slave, sizeof(slave), "/dev/ttys%03d", unit);
+            int fd = open(slave, host_flags, (mode_t)mode);
+            if (fd >= 0 || (errno != ENOENT && errno != ENOTDIR)) {
+                return guest_lockable_fd(fd, host_flags);
+            }
+        }
+    }
     bool is_sound = !strcmp(path, "/dev/dsp") || !strcmp(path, "/dev/sound/dsp") ||
                     !strcmp(path, "/dev/audio") || !strcmp(path, "/dev/audio1") ||
                     !strncmp(path, "/dev/snd/", 9);
@@ -1211,9 +1230,13 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
             return fd;
         }
     }
-    return guest_lockable_fd(
-        openat(dirfd == -100 ? AT_FDCWD : dirfd, path, host_flags, (mode_t)mode),
-        host_flags);
+    int fd = openat(dirfd == -100 ? AT_FDCWD : dirfd, path, host_flags,
+                    (mode_t)mode);
+    if (fd >= 0 && is_ptmx) {
+        grantpt(fd);
+        unlockpt(fd);
+    }
+    return guest_lockable_fd(fd, host_flags);
 }
 
 /* Guest-root emulation: a writable sysroot marked .attesor-guest-root
@@ -1401,12 +1424,18 @@ static bool recorded_owner(const char *hostpath, u32 *uid, u32 *gid)
 /* For *reading* path calls (chdir, readlink, ...): resolve FHS paths into
  * the sysroot when the entry exists there, else keep the host path. */
 static int resolve_read_path(const oah_image *img, const char *path,
-                             char *out, size_t capacity)
+                             char *out, size_t capacity, bool leaf_follow)
 {
     if (!path || path[0] != '/' || !sysroot_path(img, path)) {
         return 0;
     }
-    if (oah_sysroot_hostpath(img->sysroot, path, out, capacity)) {
+    /* leaf_follow resolves a trailing symlink inside the sysroot too, for
+     * calls that follow links; leaf-literal keeps it for lstat/readlink/
+     * mutating calls so the host sees the link itself. */
+    bool ok = leaf_follow
+        ? oah_sysroot_readpath(img->sysroot, path, out, capacity)
+        : oah_sysroot_hostpath(img->sysroot, path, out, capacity);
+    if (ok) {
         struct stat st;
         if (sysroot_strict(img)) {
             return 1; /* strict: no host fallback; ENOENT comes from out */
@@ -1438,7 +1467,7 @@ static int owner_record_path(const oah_image *img, int dirfd,
         return under_sysroot(img, out) ? 1 : 0;
     }
     if (path[0] == '/') {
-        int rr = resolve_read_path(img, path, out, capacity);
+        int rr = resolve_read_path(img, path, out, capacity, true);
         if (rr < 0) {
             return rr;
         }
@@ -1591,7 +1620,7 @@ static s64 guest_stat(oah_image *img, int dirfd, const char *path, u64 addr, u64
         /* Resolve through the sysroot first (component walk keeps the leaf
          * symlink intact for AT_SYMLINK_NOFOLLOW and makes relative links
          * resolve inside the sysroot); fall back to the host on ENOENT. */
-        int rr = resolve_read_path(img, path, resolved, sizeof(resolved));
+        int rr = resolve_read_path(img, path, resolved, sizeof(resolved), !(flags & 0x100));
         if (rr < 0) {
             return rr;
         }
@@ -4125,7 +4154,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                 break;
             }
             char rp[PATH_MAX];
-            int rr = resolve_read_path(img, path, rp, sizeof(rp));
+            int rr = resolve_read_path(img, path, rp, sizeof(rp), true);
             result = rr < 0 ? rr : host_result(statvfs(rr ? rp : path, &sv));
             if (result < 0 && rr > 0 && !sysroot_strict(img) &&
                 (errno == ENOENT || errno == ENOTDIR)) {
@@ -4214,6 +4243,11 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         result = guest_poll(img, a0, a1, (s32)a2);
         break;
     case 16: { /* ioctl */
+        {   static int pty_trace = -1;
+            if (pty_trace < 0) { pty_trace = getenv("OAH_PTY_TRACE") != NULL; }
+            if (pty_trace) { fprintf(stderr, "ioctl fd=%lld req=%llx\n",
+                                     (long long)a0, (unsigned long long)a1); }
+        }
         if (eventfd_for_fd((int)a0)) {
             result = -ENOTTY;
             break;
@@ -4257,6 +4291,11 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             if (name) {
                 sscanf(name, "/dev/ttys%d", &unit);
             }
+            {   static int pty_trace = -1;
+                if (pty_trace < 0) { pty_trace = getenv("OAH_PTY_TRACE") != NULL; }
+                if (pty_trace) { fprintf(stderr, "TIOCGPTN fd=%lld name=%s unit=%d\n",
+                                         (long long)a0, name ? name : "?", unit); }
+            }
             result = unit < 0 ? host_result(-1) : 0;
             if (!result) {
                 memcpy(output, &unit, 4);
@@ -4268,12 +4307,22 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             break;
         }
         if (a1 == 0x40045431 || a1 == 0x80045432) { /* TIOCSPTLCK, TIOCGPTLCK */
+            static int pty_trace = -1;
+            if (pty_trace < 0) { pty_trace = getenv("OAH_PTY_TRACE") != NULL; }
+            if (pty_trace) { fprintf(stderr, "pty-ioctl %llx fd=%lld\n",
+                                     (unsigned long long)a1, (long long)a0); }
             /* Darwin unlocks pts at grantpt; lock state is a no-op. */
             void *output = a1 == 0x80045432 ?
                 oah_guest_access(img, a2, 4, PROT_WRITE) : NULL;
             if (a1 == 0x80045432 && !output) {
                 result = -EFAULT;
                 break;
+            }
+            /* Darwin grantpt chowns the slave to the caller; on Linux it's
+             * a no-op so guests (xterm) skip it and would hit EACCES on
+             * the slave open. Run it before unlockpt. */
+            if (a1 == 0x40045431) {
+                grantpt((int)a0);
             }
             result = a1 == 0x80045432 ? 0 : host_result(unlockpt((int)a0));
             if (a1 == 0x80045432) {
@@ -4282,6 +4331,15 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             break;
         }
         struct winsize *size = oah_guest_access(img, a2, sizeof(*size), PROT_WRITE);
+        if (a1 == 0x540e) { /* TIOCSCTTY */
+            result = host_result(ioctl((int)a0, TIOCSCTTY, 0));
+            break;
+        }
+        if (a1 == 0x5414) { /* TIOCSWINSZ — same 4x u16 layout on both. */
+            result = !size ? -EFAULT
+                           : host_result(ioctl((int)a0, TIOCSWINSZ, size));
+            break;
+        }
         result = a1 != 0x5413 ? -ENOTTY : !size ? -EFAULT
                             : host_result(ioctl((int)a0, TIOCGWINSZ, size));
         break;
@@ -4306,7 +4364,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             result = -EINVAL;
         } else {
             char rp[PATH_MAX];
-            int rr = resolve_read_path(img, path, rp, sizeof(rp));
+            int rr = resolve_read_path(img, path, rp, sizeof(rp), !(faccess_flags & 0x100));
             result = rr < 0 ? rr :
                      rr ? host_result(faccessat(AT_FDCWD, rp, (int)mode, host_flags))
                         : host_result(faccessat(dirfd, path, (int)mode, host_flags));
@@ -4664,7 +4722,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 80: { /* chdir */
         const char *path = guest_path(img, a0);
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        int rr = resolve_read_path(img, path, rp, sizeof(rp), true);
         result = !path ? -EFAULT : rr < 0 ? rr : host_result(chdir(rr ? rp : path));
         break;
     }
@@ -4740,14 +4798,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         const char *source = guest_path(img, a0);
         const char *target = guest_path(img, nr == 88 ? a1 : a2);
         int fd = nr == 88 ? AT_FDCWD : darwin_dirfd(a1);
-        char mut[PATH_MAX], tbuf[PATH_MAX];
+        char mut[PATH_MAX];
         int mr = resolve_mut_path(img, target, mut, sizeof(mut));
-        /* An absolute guest target must resolve on the host for the kernel
-         * to follow it — rewrite it to the sysroot-resolved path. */
-        if (source && sysroot_path(img, source) &&
-            oah_sysroot_hostpath(img->sysroot, source, tbuf, sizeof(tbuf))) {
-            source = tbuf;
-        }
+        /* Store the target verbatim like Linux does. Absolute targets
+         * re-anchor inside the sysroot when resolve_in_root follows them;
+         * baking host paths in would leak them into guest-visible state
+         * and re-anchor under the sysroot as nonexistent paths. */
         result = !source || !target ? -EFAULT : mr < 0 ? mr :
                  host_result(symlinkat(source, fd, mr ? mut : target));
         break;
@@ -4780,7 +4836,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         const char *name = a1 ? guest_path(img, a1) : NULL;
         const void *value = a2 ? oah_guest_access(img, a2, a3, PROT_READ) : NULL;
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        int rr = resolve_read_path(img, path, rp, sizeof(rp), nr != 189);
         result = !path || (a2 && !value) || (a1 && !name) ? -EFAULT :
                  a4 & ~3ull ? -EINVAL :
                  rr < 0 ? rr :
@@ -4804,7 +4860,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         const char *path = guest_path(img, a0);
         const char *name = a1 ? guest_path(img, a1) : NULL;
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        int rr = resolve_read_path(img, path, rp, sizeof(rp), nr != 198);
         result = !path || (a1 && !name) ? -EFAULT :
                  rr < 0 ? rr :
                  host_result(removexattr(rr ? rp : path, name ? name : "",
@@ -4820,7 +4876,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                                                listxattr, llistxattr */
         const char *path = guest_path(img, a0);
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        int rr = resolve_read_path(img, path, rp, sizeof(rp), nr != 192 && nr != 195);
         if (!path || rr < 0) {
             result = !path ? -EFAULT : rr;
             break;
@@ -4941,7 +4997,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         char *buffer = oah_guest_access(img, nr == 89 ? a1 : a2, size, PROT_WRITE);
         int fd = nr == 89 ? -100 : (int)a0;
         char rp[PATH_MAX];
-        int rr = resolve_read_path(img, path, rp, sizeof(rp));
+        int rr = resolve_read_path(img, path, rp, sizeof(rp), false);
         result = rr < 0 ? rr : !size ? -EINVAL : !path || !buffer ? -EFAULT :
                  host_result(readlinkat(fd == -100 ? AT_FDCWD : fd,
                                         rr ? rp : path, buffer, size));

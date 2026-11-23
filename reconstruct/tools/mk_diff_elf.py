@@ -392,6 +392,29 @@ def main() -> None:
     code.extend(b"\xf3\x48\xa5")             # rep movsq
     dump(31, BASE_MASK | (1 << 7))
 
+    # T3: repe cmpsb (src == dst prefix after T2), repne scasb on a
+    # byte absent from the buffer (runs the count out) and one present
+    # (stops early), plus lodsb. ZF decides the loop exit each way.
+    lea_rip(6, "src")
+    lea_rip(7, "dst")
+    mov_ri(1, 16)
+    code.extend(b"\xf3\xa6")                 # repe cmpsb — all equal
+    dump(32, BASE_MASK | (1 << 7))
+    lea_rip(7, "dst2")
+    mov_ri(0, 0x5A, w=4)
+    mov_ri(1, 9)
+    code.extend(b"\xf2\xae")                 # repne scasb — no match
+    dump(33, BASE_MASK | (1 << 7))
+    lea_rip(7, "dst2")
+    mov_ri(0, 0x41, w=4)
+    mov_ri(1, 9)
+    code.extend(b"\xf2\xae")                 # repne scasb — match at 0
+    dump(34, BASE_MASK | (1 << 7))
+    lea_rip(6, "src")
+    code.extend(b"\xac")                     # lodsb
+    code.extend(b"\x48\xad")                 # lodsq
+    dump(35, BASE_MASK)
+
     # The faulting rep movsb: shared 2-page file, page 2 PROT_NONE.
     code.extend(b"\xbf" + struct.pack("<i", AT_FDCWD))
     lea_rip(6, "fname")

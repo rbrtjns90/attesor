@@ -286,14 +286,37 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         return false;
     }
 
-    if (op == 0xa4 || op == 0xa5 || op == 0xaa || op == 0xab) {
-        if (address32 || segment || repeat_not_equal) {
+    if (op == 0xa4 || op == 0xa5 || op == 0xa6 || op == 0xa7 ||
+        op == 0xaa || op == 0xab || op == 0xac || op == 0xad ||
+        op == 0xae || op == 0xaf) {
+        /* repne is meaningful only for the compares (cmps/scas); rep
+         * prefixes on lods are meaningless but tolerated like hardware. */
+        if (address32 || segment ||
+            (repeat_not_equal && op < 0xa6)) {
             return false;
         }
         out->op = OAH_OP_STRING;
         out->opsize = !(op & 1) ? 1 : operand_override && opsize != 8 ? 2 : opsize;
         out->repeat = repeat;
-        out->string_move = op < 0xaa;
+        out->repeat_ne = repeat_not_equal;
+        switch (op) {
+        case 0xa4: case 0xa5:
+            out->string_kind = OAH_STR_MOVS;
+            out->string_move = true;
+            break;
+        case 0xa6: case 0xa7:
+            out->string_kind = OAH_STR_CMPS;
+            break;
+        case 0xaa: case 0xab:
+            out->string_kind = OAH_STR_STOS;
+            break;
+        case 0xac: case 0xad:
+            out->string_kind = OAH_STR_LODS;
+            break;
+        default:
+            out->string_kind = OAH_STR_SCAS;
+            break;
+        }
         goto done;
     }
     if ((op == 0xdb || op == 0xdf) && peek(&d) >= 0xe8 && peek(&d) <= 0xf7) {

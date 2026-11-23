@@ -378,6 +378,24 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
     return open(resolved, flags | O_NOFOLLOW, (mode_t)mode);
 }
 
+/* Same as oah_sysroot_open but returns the host path, following the leaf
+ * symlink too — for read calls (stat without NOFOLLOW, access, chdir) that
+ * follow links and need the target resolved inside the root. */
+bool oah_sysroot_readpath(const char *sysroot, const char *path,
+                          char *resolved, size_t capacity)
+{
+    char root[PATH_MAX];
+    if (path[0] != '/' || !realpath(sysroot, root)) {
+        return false;
+    }
+    int rc = resolve_in_root(root, path, resolved, capacity, true);
+    if (rc < 0) {
+        errno = -rc;
+        return false;
+    }
+    return true;
+}
+
 /* Same resolution as oah_sysroot_open but returns the host path for calls
  * that take paths (mkdirat, renameat, ...) rather than fds. */
 bool oah_sysroot_hostpath(const char *sysroot, const char *path,
@@ -589,8 +607,7 @@ static bool map_elf_fd(oah_image *img, int fd, char *interp, u64 *bias)
             seg->p_vaddr > UINT64_MAX - mask ||
             seg->p_memsz > UINT64_MAX - mask - seg->p_vaddr ||
             (seg->p_align > 1 && ((seg->p_align & (seg->p_align - 1)) ||
-             ((seg->p_vaddr ^ seg->p_offset) & (seg->p_align - 1)) ||
-             (eh.e_type == ET_DYN && seg->p_align > image_page)))) {
+             ((seg->p_vaddr ^ seg->p_offset) & (seg->p_align - 1))))) {
             goto done;
         }
         if (!seg->p_memsz) {

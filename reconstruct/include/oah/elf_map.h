@@ -88,6 +88,8 @@ int oah_image_module_at(const oah_image *img, u64 gva);
 /* Guest VA of a module-relative offset (base + off). */
 u64 oah_module_gva(const oah_image *img, int module, u64 off);
 int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode);
+bool oah_sysroot_readpath(const char *sysroot, const char *path,
+                          char *resolved, size_t capacity);
 bool oah_sysroot_hostpath(const char *sysroot, const char *path,
                           char *resolved, size_t capacity);
 #if defined(__APPLE__)

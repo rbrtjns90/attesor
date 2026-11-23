@@ -704,28 +704,79 @@ static bool run_string(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
     u64 *count = &g->gpr[OAH_X86_RCX];
     u64 *dst = &g->gpr[OAH_X86_RDI];
     u64 *src = &g->gpr[OAH_X86_RSI];
-    u64 value = g->gpr[OAH_X86_RAX];
     u8 width = in->opsize;
     u64 step = (g->rflags & OAH_RFLAGS_DF) ? -(u64)width : width;
-    if (in->repeat && !*count) {
+    bool rep = in->repeat || in->repeat_ne;
+    bool done;
+    if (rep && !*count) {
         g->rip = next;
         return true;
     }
-    void *out = oah_guest_access(img, *dst, width, PROT_WRITE);
-    if (!out) {
-        return false;
-    }
-    if (in->string_move) {
+    switch (in->string_kind) {
+    case OAH_STR_MOVS:
+    case OAH_STR_LODS: {
         const void *input = oah_guest_access(img, *src, width, PROT_READ);
         if (!input) {
             return false;
         }
-        memcpy(&value, input, width);
+        if (in->string_kind == OAH_STR_LODS) {
+            u64 v = 0;
+            memcpy(&v, input, width);
+            write_gpr(g, OAH_X86_RAX, width, v);
+        } else {
+            void *out = oah_guest_access(img, *dst, width, PROT_WRITE);
+            if (!out) {
+                return false;
+            }
+            memcpy(out, input, width);
+            *dst += step;
+        }
         *src += step;
+        break;
     }
-    memcpy(out, &value, width);
-    *dst += step;
-    if (!in->repeat || --*count == 0) {
+    case OAH_STR_STOS: {
+        void *out = oah_guest_access(img, *dst, width, PROT_WRITE);
+        if (!out) {
+            return false;
+        }
+        u64 value = g->gpr[OAH_X86_RAX];
+        memcpy(out, &value, width);
+        *dst += step;
+        break;
+    }
+    case OAH_STR_CMPS:
+    case OAH_STR_SCAS: {
+        u64 lhs, rhs = 0;
+        const void *dp = oah_guest_access(img, *dst, width, PROT_READ);
+        if (!dp) {
+            return false;
+        }
+        memcpy(&rhs, dp, width);
+        if (in->string_kind == OAH_STR_CMPS) {
+            const void *sp = oah_guest_access(img, *src, width, PROT_READ);
+            u64 sv = 0;
+            if (!sp) {
+                return false;
+            }
+            memcpy(&sv, sp, width);
+            lhs = sv;
+            *src += step;
+        } else {
+            lhs = g->gpr[OAH_X86_RAX] & mask_for(width);
+        }
+        g->rflags = oah_cmp_rflags(g->rflags, lhs, rhs, width);
+        *dst += step;
+        break;
+    }
+    }
+    done = !rep || --*count == 0;
+    if (rep && !done &&
+        (in->string_kind == OAH_STR_CMPS || in->string_kind == OAH_STR_SCAS)) {
+        /* repe continues while ZF; repne while !ZF. */
+        bool zf = (g->rflags & OAH_RFLAGS_ZF) != 0;
+        done = zf == in->repeat_ne;
+    }
+    if (done) {
         g->rip = next;
     }
     return true;
