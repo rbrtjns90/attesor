@@ -10,6 +10,7 @@ matching --*-sysroot arguments point at a populated tree; pass
 
 import argparse
 import hashlib
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -137,11 +138,13 @@ def main():
             if args.exec_guard:
                 # Two-sided invalidation check. The fixture translates and
                 # runs two mmap'd RWX stubs, churns unrelated data mappings
-                # (mprotect/munmap — must NOT flush), re-enters a stub to
+                # (mprotect/munmap — must NOT flush), re-enters stubA to
                 # prove its translation survived, then munmaps a range that
-                # crosses [data page][exec stub] (must flush) and de-execs
-                # the other stub (must flush). Finally it calls the de-exec'd
-                # stub, which must fault — the stale translation cannot run.
+                # crosses [data page][exec stub] (must flush), re-warms
+                # stubB so its revoke evicts LIVE code, de-execs it (must
+                # flush), and calls it — which must fault: stale native
+                # code cannot run on a page without PROT_EXEC. stdout is
+                # a 24-byte report (base, stubA, stubB) followed by "OK".
                 for mode, options, mode_env in MODES:
                     env = dict(mode_env)
                     env["OAH_JIT_FLUSH_DEBUG"] = "1"
@@ -154,20 +157,43 @@ def main():
                         raise ValueError(
                             f"{mode} exec-guard: de-exec'd stub ran "
                             f"without faulting (out={out!r}, err={err!r})")
-                    if not out.endswith(b"OK\n"):
+                    if len(out) != 27 or out[24:] != b"OK\n":
                         raise ValueError(
-                            f"{mode} exec-guard: translation did not survive "
-                            f"data-only mapping churn (out={out!r}, err={err!r})")
+                            f"{mode} exec-guard: expected 24-byte address "
+                            f"report + OK marker, got out={out!r} "
+                            f"(err={err!r})")
+                    base, stub_a, stub_b = struct.unpack("<QQQ", out[:24])
                     if len(flushes) != 2 or any(
                             b"mprotect/munmap" not in line for line in flushes):
                         raise ValueError(
                             f"{mode} exec-guard: expected exactly the two "
                             f"exec-range flushes, got {flushes!r} "
                             f"(stderr={err!r})")
-                    if b"guest stopped" not in err:
+                    stopped = [line for line in err.splitlines()
+                               if b"guest stopped" in line]
+                    # OAH_INTERP_FAULT = 3, and the faulting RIP must be the
+                    # de-exec'd stub — not the crossing-munmap'd stubA.
+                    if len(stopped) != 1 or b"(3)" not in stopped[0]:
                         raise ValueError(
-                            f"{mode} exec-guard: guest did not fault on the "
-                            f"de-exec'd page (err={err!r})")
+                            f"{mode} exec-guard: expected a single "
+                            f"OAH_INTERP_FAULT stop, got {stopped!r} "
+                            f"(stderr={err!r})")
+                    fault_rip = re.search(rb"rip=([0-9a-f]+)", stopped[0])
+                    if not fault_rip or int(fault_rip.group(1), 16) != stub_b:
+                        raise ValueError(
+                            f"{mode} exec-guard: fault RIP {fault_rip and fault_rip.group(0)!r} "
+                            f"is not the revoked stub {stub_b:#x} "
+                            f"(stderr={err!r})")
+                    # The second flush must evict live code — stubB was
+                    # re-warmed after the crossing munmap precisely so a
+                    # fresh fragment exists to invalidate. (Interpreter
+                    # mode has no fragment table.)
+                    if mode != "interpret":
+                        live = re.search(rb"(\d+) live frags", flushes[-1])
+                        if not live or int(live.group(1)) < 1:
+                            raise ValueError(
+                                f"{mode} exec-guard: revoke flush evicted "
+                                f"no live fragments: {flushes[-1]!r}")
                     print(f"PASS {mode}: exec-range invalidation guard")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),

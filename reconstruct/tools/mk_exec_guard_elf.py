@@ -21,7 +21,8 @@ three addresses it uses (block base, stub A, stub B) to stdout.
     data mmap+mprotect+munmap   unrelated churn — must not flush
     call stubA again    re-enters the surviving translation, writes OK
     munmap [page1,page2]        crosses data|exec boundary — must flush
-    mprotect stubB -> R         remove exec — must flush
+    call stubB again    installs a fresh live fragment to evict
+    mprotect stubB -> R         remove exec — must flush live code
     call stubB          must fault (flushed and no PROT_EXEC)
 """
 
@@ -156,6 +157,16 @@ def emit() -> bytes:
     lea_r12(b"\x49\x8d\xbc\x24", 0x1000)               # lea rdi,[r12+0x1000]
     code.extend(b"\xbe\x00\x20\x00\x00")               # mov esi,0x2000
     sys(SYS_MUNMAP)
+
+    # --- re-warm stubB: its flush must evict a LIVE translation -------
+    # Without this the de-exec flush below only proves a flush was
+    # requested — stubB's fragment was already evicted by the crossing
+    # munmap. Re-entering installs a fresh fragment so the revoke has
+    # real stale code to kill.
+    lea_r12(b"\x49\x8d\x84\x24", 0x3000)               # lea rax,[r12+0x3000]
+    code.extend(b"\xff\xd0")                           # call rax (stubB)
+    code.extend(b"\x83\xf8\x2a")                       # cmp eax,42
+    code.extend(b"\x75"); rel8("fail")                 # jne fail
 
     # --- remove exec on stubB -> must flush ---------------------------
     lea_r12(b"\x49\x8d\xbc\x24", 0x3000)               # lea rdi,[r12+0x3000]
