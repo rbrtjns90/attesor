@@ -367,7 +367,7 @@ static bool jit_arena_init(void)
  * the stale file is reclaimed by normal eviction or manual clearing.
  */
 
-#define OAH_PCACHE_VERSION 4u
+#define OAH_PCACHE_VERSION 5u
 /* Cache files are tied to the translator build: a rebuilt binary may emit
  * different code for the same guest, so old files must not be reused.
  * oah_build_key() is generated into src/build_key.c each build so every
@@ -704,20 +704,48 @@ static void pcache_flush_module(oah_module *m)
     }
     /* Pending entries hold absolute addresses; disk entries are already
      * module-relative. Normalize everything to module-relative, using the
-     * final base so late tags cannot skew earlier pending entries. */
+     * final base so late tags cannot skew earlier pending entries.
+     * Scalar fields live in the all[] copy, but all[i].rel aliases the
+     * caller-owned pc->pend[] arrays — this function can run once per
+     * thread, so relocs must be normalized into private copies or the
+     * same value would get base subtracted again on every later flush. */
     u64 base = m->base;
+    pcache_rel **copies = pc->n_pend ? calloc(pc->n_pend, sizeof(*copies))
+                                   : NULL;
+    if (pc->n_pend && !copies) {
+        fclose(f);
+        unlink(tmp);
+        free(all);
+        return;
+    }
     for (u32 i = pc->n_disk; i < total; i++) {
         all[i].off -= base;
-        for (u32 j = 0; j < all[i].nrel; j++) {
-            if (all[i].rel[j].kind == OAH_RELOC_GVA) {
-                all[i].rel[j].value -= base;
-            }
-        }
         for (u32 j = 0; j < all[i].nexits; j++) {
             all[i].exit_rip[j] -= base;
         }
         for (u32 j = 0; j < all[i].nbails; j++) {
             all[i].bail_rip[j] -= base;
+        }
+        if (all[i].nrel) {
+            pcache_rel *rc = malloc(all[i].nrel * sizeof(*rc));
+            if (!rc) {
+                for (u32 k = 0; k < pc->n_pend; k++) {
+                    free(copies[k]);
+                }
+                free(copies);
+                fclose(f);
+                unlink(tmp);
+                free(all);
+                return;
+            }
+            copies[i - pc->n_disk] = rc;
+            memcpy(rc, all[i].rel, all[i].nrel * sizeof(*rc));
+            for (u32 j = 0; j < all[i].nrel; j++) {
+                if (rc[j].kind == OAH_RELOC_GVA) {
+                    rc[j].value -= base;
+                }
+            }
+            all[i].rel = rc;
         }
     }
     qsort(all, total, sizeof(*all), pcache_ent_cmp);
@@ -762,6 +790,10 @@ static void pcache_flush_module(oah_module *m)
     if (bad || rename(tmp, path) != 0) {
         unlink(tmp);
     }
+    for (u32 i = 0; i < pc->n_pend; i++) {
+        free(copies[i]);
+    }
+    free(copies);
     free(all);
 }
 
@@ -886,7 +918,11 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
                   : r->kind == OAH_RELOC_GS ? g->gs_base
                   : r->kind == OAH_RELOC_XMMBASE
                     ? (u64)(uintptr_t)&g->xmm[0][0] : ~(u64)0;
-        if (val == ~(u64)0) {
+        if (val == ~(u64)0 ||
+            (r->kind == OAH_RELOC_GVA &&
+             oah_image_module_at(img, val) != module)) {
+            /* Corrupt persisted reloc: retranslate instead of baking a
+             * pointer outside the module into executable code. */
             free(code);
             return NULL;
         }
