@@ -71,6 +71,52 @@ int main(void)
         oah_insn i;
         CHECK(!oah_decode_insn(bytes, bytes + 1, &i));
     }
+    {
+        /* mov byte [r12+disp32], imm8 — C6 /0 is byte-size even under REX.W */
+        u8 bytes[] = {0x49, 0xc6, 0x84, 0x24, 0x04, 0x30, 0x00, 0x00, 0xc3};
+        oah_insn i;
+        CHECK(oah_decode_insn(bytes, bytes + sizeof(bytes), &i));
+        CHECK_EQ_U64(i.op, OAH_OP_SCALAR);
+        CHECK_EQ_U64(i.scalar, OAH_SC_MOV);
+        CHECK_EQ_U64(i.opsize, 1);
+        CHECK_EQ_U64(i.memory, 1);
+        CHECK_EQ_U64(i.rm_dest, 1);
+        CHECK_EQ_U64(i.imm, 0xffffffffffffffc3ull);
+        CHECK_EQ_U64(i.length, 9);
+    }
+    {
+        /* mov word [r12+disp32], imm16 — 66 prefix selects 16-bit operand */
+        u8 bytes[] = {0x66, 0xc7, 0x84, 0x24, 0x04, 0x30, 0x00, 0x00,
+                      0xc3, 0x00};
+        oah_insn i;
+        CHECK(oah_decode_insn(bytes, bytes + sizeof(bytes), &i));
+        CHECK_EQ_U64(i.scalar, OAH_SC_MOV);
+        CHECK_EQ_U64(i.opsize, 2);
+        CHECK_EQ_U64(i.imm, 0xc3);
+        CHECK_EQ_U64(i.length, 10);
+    }
+    {
+        /* 66 49 c7: REX.W wins over the 66 prefix — mov r/m64, imm32 */
+        u8 bytes[] = {0x66, 0x49, 0xc7, 0x84, 0x24, 0x04, 0x30, 0x00,
+                      0x00, 0xaa, 0xbb, 0xcc, 0xdd};
+        oah_insn i;
+        CHECK(oah_decode_insn(bytes, bytes + sizeof(bytes), &i));
+        CHECK_EQ_U64(i.scalar, OAH_SC_MOV);
+        CHECK_EQ_U64(i.opsize, 8);
+        CHECK_EQ_U64(i.imm, 0xffffffffddccbbaaull);
+        CHECK_EQ_U64(i.length, 13);
+    }
+    {
+        /* mov dword [r12+disp32], imm32 — the plain 32-bit form */
+        u8 bytes[] = {0x41, 0xc7, 0x84, 0x24, 0x04, 0x30, 0x00, 0x00,
+                      0xb8, 0x2a, 0x00, 0x00};
+        oah_insn i;
+        CHECK(oah_decode_insn(bytes, bytes + sizeof(bytes), &i));
+        CHECK_EQ_U64(i.scalar, OAH_SC_MOV);
+        CHECK_EQ_U64(i.opsize, 4);
+        CHECK_EQ_U64(i.imm, 0x2ab8);
+        CHECK_EQ_U64(i.length, 12);
+    }
 
     return test_report("decode_insn");
 }

@@ -105,6 +105,46 @@ int main(void)
     }
 
     {
+        /* mov byte [r12], imm8 (REX.W+C6) and mov word [r12+2], imm16
+         * (66+C7): store into the identity-mapped buffer, then the host
+         * verifies the bytes — pins semantics of both unusual imm-store
+         * forms. */
+        u8 buf[64];
+        oah_image img;
+        oah_guest g;
+        oah_interp_result r;
+        u8 *c;
+
+        memset(buf, 0, sizeof(buf));
+        c = buf;
+        /* mov r12, &buf[0x30] */
+        memcpy(c, "\x49\xbc", 2);
+        c += 2;
+        {
+            u64 addr = (u64)(uintptr_t)(buf + 0x30);
+            memcpy(c, &addr, 8);
+            c += 8;
+        }
+        /* 49 c6 84 24 00 00 00 00 c3 — mov byte [r12], 0xc3 */
+        memcpy(c, "\x49\xc6\x84\x24\x00\x00\x00\x00\xc3", 9);
+        c += 9;
+        /* 66 41 c7 84 24 02 00 00 00 4f 4b — mov word [r12+2], 0x4b4f */
+        memcpy(c, "\x66\x41\xc7\x84\x24\x02\x00\x00\x00\x4f\x4b", 11);
+        c += 11;
+        /* mov eax, 60 ; xor edi,edi ; syscall — exit(0) */
+        memcpy(c, "\xb8\x3c\x00\x00\x00\x31\xff\x0f\x05", 9);
+        c += 9;
+
+        image_identity(&img, buf, sizeof(buf));
+        oah_guest_init(&g, (u64)(uintptr_t)buf, 0);
+        r = oah_interp_run(&g, &img, 100);
+        CHECK_EQ_U64(r.status, OAH_INTERP_EXIT);
+        CHECK_EQ_U64(buf[0x30], 0xc3);
+        CHECK_EQ_U64(buf[0x32], 0x4f);
+        CHECK_EQ_U64(buf[0x33], 0x4b);
+    }
+
+    {
         u8 buf[8] = {0x06, 0, 0, 0, 0, 0, 0, 0}; /* invalid */
         oah_image img;
         oah_guest g;
