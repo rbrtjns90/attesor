@@ -75,6 +75,9 @@ def main():
                         help="two-worker TLS/XMM isolation fixture")
     parser.add_argument("--fault-store", type=Path,
                         help="mid-fragment fault store-replay fixture")
+    parser.add_argument("--fault-state", type=Path,
+                        help="mid-fragment fault register/memory/RIP "
+                             "recovery fixture")
     parser.add_argument("--exec-guard", type=Path,
                         help="executable-range invalidation fixture")
     parser.add_argument("--flag-live", type=Path,
@@ -139,6 +142,35 @@ def main():
                             f"{mode} mid-fragment fault store replay: "
                             f"counter={value} (rc={rc}, stderr={err!r})")
                     print(f"PASS {mode}: mid-fragment fault store replay")
+            if args.fault_state:
+                # Replay-safety across a fragment boundary: the guest
+                # loads OLD into rbx, commits a NEW store to the same
+                # shared qword, then faults on a separate load. Recovery
+                # must keep rbx=OLD (a replayed load must not re-read
+                # committed bytes), leave the file at NEW (store applied
+                # once), and stop at the exact faulting RIP (lea'd into
+                # r12 beforehand).
+                for mode, options, mode_env in MODES:
+                    state = Path(directory) / "state.bin"
+                    state.unlink(missing_ok=True)
+                    env = dict(mode_env)
+                    env["OAH_STOP_TRACE"] = "1"
+                    rc, out, err = run(
+                        [runner, *options, str(args.fault_state.resolve())],
+                        directory, b"", extra_env=env)
+                    value = struct.unpack("<Q", state.read_bytes()[:8])[0] \
+                        if state.exists() else -1
+                    regs = {m.group(1): int(m.group(2), 16)
+                            for m in re.finditer(
+                                rb"\b(r\d+|r[a-z]{2})=([0-9a-f]+)", err)}
+                    rip_m = re.search(rb"\brip=([0-9a-f]+)", err)
+                    if value != 0x1001 or regs.get(b"rbx") != 0x1000 or \
+                            not rip_m or \
+                            regs.get(b"r12") != int(rip_m.group(1), 16):
+                        raise ValueError(
+                            f"{mode} fault-state recovery: file={value:#x} "
+                            f"regs={regs} (rc={rc}, stderr={err!r})")
+                    print(f"PASS {mode}: mid-fragment fault-state recovery")
             if args.exec_guard:
                 # Two-sided invalidation check covering mprotect, munmap
                 # and mremap. The fixture translates and runs mmap'd RWX

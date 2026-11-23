@@ -298,6 +298,28 @@ int main(int argc, char **argv, char **envp)
         }
     }
     fputc('\n', stderr);
+    if (getenv("OAH_STOP_TRACE")) {
+        const u64 *r = guest.gpr;
+        fprintf(stderr,
+                " regs: rax=%llx rbx=%llx rcx=%llx rdx=%llx"
+                " rsi=%llx rdi=%llx r8=%llx r9=%llx\n"
+                "       r10=%llx r11=%llx r12=%llx r13=%llx"
+                " r14=%llx r15=%llx\n",
+                (unsigned long long)r[OAH_X86_RAX],
+                (unsigned long long)r[OAH_X86_RBX],
+                (unsigned long long)r[OAH_X86_RCX],
+                (unsigned long long)r[OAH_X86_RDX],
+                (unsigned long long)r[OAH_X86_RSI],
+                (unsigned long long)r[OAH_X86_RDI],
+                (unsigned long long)r[OAH_X86_R8],
+                (unsigned long long)r[OAH_X86_R9],
+                (unsigned long long)r[OAH_X86_R10],
+                (unsigned long long)r[OAH_X86_R11],
+                (unsigned long long)r[OAH_X86_R12],
+                (unsigned long long)r[OAH_X86_R13],
+                (unsigned long long)r[OAH_X86_R14],
+                (unsigned long long)r[OAH_X86_R15]);
+    }
 #if defined(__APPLE__)
     if (has_workers) {
         _Exit(126);

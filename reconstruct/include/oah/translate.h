@@ -61,6 +61,16 @@ typedef struct {
 
 enum { OAH_RELOC_GVA = 0, OAH_RELOC_FS = 1, OAH_RELOC_GS = 2,
        OAH_RELOC_XMMBASE = 3 };
+/* mem_flags bits: the fragment emitted a guest memory read / write.
+ * Fault recovery replays a fragment's prefix with stores suppressed —
+ * a load replayed after a committed store would re-read new bytes, so
+ * the translator ends a fragment before the first store that follows a
+ * load, and the dispatcher refuses to chain a load-bearing fragment
+ * into a store-bearing one (replay starts at the *entered* fragment,
+ * so chains would otherwise replay across this ordering). */
+#define OAH_FRAG_HAS_LOAD 2u
+#define OAH_FRAG_HAS_STORE 4u
+
 #define OAH_FRAG_MAX_RELOCS 24
 
 /* Start-of-guest-insn boundary: maps a native code offset to the guest
@@ -86,6 +96,7 @@ typedef struct {
     u32 nbounds;     /* guest-insn boundaries recorded (<= MAX_BOUNDS) */
     u32 bound_off[OAH_FRAG_MAX_BOUNDS];
     u64 bound_rip[OAH_FRAG_MAX_BOUNDS];
+    u32 mem_flags;   /* OAH_FRAG_HAS_LOAD / OAH_FRAG_HAS_STORE */
     oah_frag_reloc relocs[OAH_FRAG_MAX_RELOCS];
 } oah_frag_info;
 

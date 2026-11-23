@@ -1962,11 +1962,77 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
     }
 }
 
+/* Memory direction for replay safety: a native fault restores the
+ * entered fragment's entry state and replays the prefix under the
+ * interpreter with committed stores suppressed, so a replayed load
+ * must never precede a committed store — it would re-read new bytes.
+ * Conservative: anything ambiguous counts as both directions. */
+static bool insn_writes_mem(const oah_insn *in)
+{
+    switch (in->op) {
+    case OAH_OP_PUSH:
+    case OAH_OP_PUSH_IMM:
+    case OAH_OP_CALL_REL:
+    case OAH_OP_STRING: /* movs/stos write; lods/cmps/scas stay interp */
+        return true;
+    case OAH_OP_POP:
+        return in->rm_dest; /* pop r/m writes the destination */
+    case OAH_OP_FLAGS_STACK:
+        return in->rm_dest; /* pushf; popf goes to interp */
+    case OAH_OP_SCALAR:
+        if (in->scalar == OAH_SC_PUSH || in->scalar == OAH_SC_CALL) {
+            return true; /* stack write */
+        }
+        return in->memory && in->rm_dest;
+    case OAH_OP_VECTOR:
+        if (!in->memory) {
+            return false;
+        }
+        switch (in->vector_opcode) {
+        case 0x7f: case 0x11: case 0x29: /* mov stores */
+        case 0x13: case 0x17:           /* movlps/movhps stores */
+        case 0x7e: case 0xd6:           /* movd/movq stores */
+        case 0xe7:                      /* movntdq */
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool insn_reads_mem(const oah_insn *in)
+{
+    switch (in->op) {
+    case OAH_OP_POP:
+    case OAH_OP_RET:
+    case OAH_OP_LEAVE:
+    case OAH_OP_STRING:
+        return true;
+    case OAH_OP_FLAGS_STACK:
+        return !in->rm_dest; /* popf */
+    case OAH_OP_SCALAR:
+        if (in->scalar == OAH_SC_JMP) {
+            return in->memory; /* indirect target */
+        }
+        if (in->scalar == OAH_SC_PUSH || in->scalar == OAH_SC_CALL) {
+            return in->memory; /* operand read; stack side is a write */
+        }
+        /* rm load, or RMW — a plain mov store does not read */
+        return in->memory && !(in->rm_dest && in->scalar == OAH_SC_MOV);
+    case OAH_OP_VECTOR:
+        return in->memory && !insn_writes_mem(in);
+    default:
+        return false;
+    }
+}
+
 bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                         u64 rip, oah_frag_info *info)
 {
     u64 cur = rip;
     unsigned n = 0;
+    u32 frag_mem = 0;
 
     memset(info, 0, sizeof(*info));
     frag_relocs = info;
@@ -2103,6 +2169,20 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                        in.op == OAH_OP_CMP_RR || in.op == OAH_OP_CMP_IMM ||
                        in.op == OAH_OP_TEST_RR))) {
             boundary_interp = true;
+        }
+
+        /* Replay safety: once this fragment emitted a load, a following
+         * store must start a new fragment — a fault replayed past it
+         * would re-read bytes the committed store already changed. */
+        if (!boundary_interp && (frag_mem & OAH_FRAG_HAS_LOAD) &&
+            insn_writes_mem(&in)) {
+            if (!frag_exit(buf, g, cur)) {
+                return false;
+            }
+            info->insns = n;
+            info->interp_next = 0;
+            info->mem_flags = frag_mem;
+            return true;
         }
 
         if (!boundary_interp)
@@ -2356,11 +2436,19 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             info->nexits = 0; /* interp step must run before the next frag */
             info->insns = n;
             info->interp_next = 1;
+            info->mem_flags = frag_mem;
             return true;
+        }
+        if (insn_reads_mem(&in)) {
+            frag_mem |= OAH_FRAG_HAS_LOAD;
+        }
+        if (insn_writes_mem(&in)) {
+            frag_mem |= OAH_FRAG_HAS_STORE;
         }
         if (done) {
             info->insns = n + 1;
             info->interp_next = 0;
+            info->mem_flags = frag_mem;
             return true;
         }
         cur = after;
@@ -2371,5 +2459,6 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
     }
     info->insns = n;
     info->interp_next = 0;
+    info->mem_flags = frag_mem;
     return true;
 }

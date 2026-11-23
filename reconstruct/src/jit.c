@@ -159,7 +159,7 @@ typedef struct {
     u32 exit_off[2];
     u64 exit_rip[2];
     u32 nbails;
-    u64 bail_rip[4];
+    u64 bail_rip[8];
     /* Guest-insn start boundaries (native off -> guest rip), heap copy
      * of the translator's side table for fault recovery. NULL for
      * materialized fragments, which lack the map. */
@@ -950,7 +950,8 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
         .rip = rip,
         .owner = owner,
         .insns = info->insns,
-        .flags = info->interp_next ? OAH_FRAG_FALLBACK : 0,
+        .flags = (info->interp_next ? OAH_FRAG_FALLBACK : 0) |
+                 info->mem_flags,
         .code_off = (u32)jit_arena_used,
         .code_len = (u32)code_len,
         .stub_off = (u32)jit_arena_used + (u32)code_len,
@@ -961,7 +962,7 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
         e.exit_off[i] = info->exit_off[i];
         e.exit_rip[i] = info->exit_rip[i];
     }
-    for (u32 i = 0; i < e.nbails && i < 4; i++) {
+    for (u32 i = 0; i < e.nbails && i < 8; i++) {
         e.bail_rip[i] = info->bail_rip[i];
     }
     if (info->nbounds) {
@@ -1314,7 +1315,14 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             continue;
         }
         if (chain && !verify && chain_prev) {
-            for (u32 i = 0; i < chain_prev->nexits; i++) {
+            /* A fault replays from the entered fragment's saved state.
+             * Chaining a load-bearing exit into a store-bearing target
+             * would put replayed loads after committed stores — they
+             * would re-read new bytes — so such links stay unpatched
+             * and the store fragment is always entered fresh. */
+            bool hazard = (chain_prev->flags & OAH_FRAG_HAS_LOAD) &&
+                          (frag->flags & OAH_FRAG_HAS_STORE);
+            for (u32 i = 0; !hazard && i < chain_prev->nexits; i++) {
                 if (chain_prev->exit_off[i] &&
                     chain_prev->exit_rip[i] == frag->rip) {
                     jit_chain_patch(chain_prev, i, frag->stub_off);
