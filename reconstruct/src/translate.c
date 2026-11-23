@@ -505,6 +505,8 @@ static u32 arm_cond_for_x86(u8 cc)
     return cc < 16 ? map[cc] : 0xe;
 }
 
+static bool emit_xmm_spill(oah_asm_buf *buf, const oah_guest *g);
+
 /* Terminate the fragment: x20 = next rip (or computed), then ret.
  * Constant exits are recorded so the dispatcher can repatch the ret
  * into a direct branch once the successor fragment exists (repatch-style
@@ -538,6 +540,14 @@ static bool frag_bail_exit(oah_asm_buf *buf, u64 next)
     }
     frag_relocs->bail_rip[frag_relocs->nbails++] = next;
     return true;
+}
+
+/* frag_exit_imm with the resident-xmm spill first: chainable or not,
+ * every exit must commit dirty NEON regs so the dispatcher, interpreter,
+ * and successor fragments see exact g->xmm. */
+static bool frag_exit(oah_asm_buf *buf, const oah_guest *g, u64 next)
+{
+    return emit_xmm_spill(buf, g) && frag_exit_imm(buf, next);
 }
 
 /* Push/Pop on the guest stack (identity memory, RSP = x12). */
@@ -1024,7 +1034,8 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
         u64 stub;
         oah_asm_emit32(buf, 0x14000000u); /* b <after stub> */
         stub = buf->size;
-        if (!frag_bail_exit(buf, next - in->length)) {
+        if (!emit_xmm_spill(buf, g) ||
+            !frag_bail_exit(buf, next - in->length)) {
             return false;
         }
         while (nbail) {
@@ -1227,9 +1238,11 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
     case OAH_SC_PUSH:
         return emit_push64(buf, T1);
     case OAH_SC_JMP:
-        return frag_mov(buf, true, F_NR, T1) && oah_emit_ret(buf);
+        return emit_xmm_spill(buf, g) && frag_mov(buf, true, F_NR, T1) &&
+               oah_emit_ret(buf);
     case OAH_SC_CALL:
-        return emit_reloc_imm(buf, T4, next, OAH_RELOC_GVA) &&
+        return emit_xmm_spill(buf, g) &&
+               emit_reloc_imm(buf, T4, next, OAH_RELOC_GVA) &&
                emit_push64(buf, T4) &&
                frag_mov(buf, true, F_NR, T1) && oah_emit_ret(buf);
     default:
@@ -1267,6 +1280,44 @@ void oah_translate_enable_sse(bool on)
     }
 }
 
+/* Three-same vector encodings (Q=1). ADD/SUB/CMEQ element size goes in
+ * bits 23..22: b=0, h=1, s=2, d=3. */
+#define OAH_V_EOR  0x6e201c00u
+#define OAH_V_ORR  0x4ea01c00u
+#define OAH_V_AND  0x4e201c00u
+#define OAH_V_ADD(sz)  (0x4e208400u | ((u32)(sz) << 22))
+#define OAH_V_SUB(sz)  (0x6e208400u | ((u32)(sz) << 22))
+#define OAH_V_CMEQ(sz) (0x6e208c00u | ((u32)(sz) << 22))
+#define OAH_V_ZIP1(sz) (0x4e003800u | ((u32)(sz) << 22))
+#define OAH_V_ZIP2(sz) (0x4e007800u | ((u32)(sz) << 22))
+#define OAH_V_UMIN     0x6e206c00u
+#define OAH_V_UMAX     0x6e206400u
+/* Signed saturating narrow: SQXTN writes the low lanes, SQXTN2 the high —
+ * together they match x86 packss* (dest narrows low, source high). */
+#define OAH_V_SQXTN(sz)  (0x0e214800u | ((u32)(sz) << 22))
+#define OAH_V_SQXTN2(sz) (0x4e214800u | ((u32)(sz) << 22))
+
+/* --- XMM-in-NEON residency --------------------------------------------------
+ * Within a fragment each guest xmm[i] lives in a host NEON register so
+ * vector ops move data in registers instead of materializing the shadow
+ * pointer per operand. The map keeps to caller-saved regs: v8-v15's low
+ * halves are callee-saved and v18 is platform-reserved, while v16/v17/v18
+ * stay the translator's scratch temps:
+ *   xmm0-7 -> v0-7,  xmm8-15 -> v19-v26
+ * Loads are lazy (first read pulls g->xmm into the resident reg), writes
+ * mark the reg dirty, and every fragment exit spills dirty regs back to
+ * g->xmm. Guest memory therefore matches interpreter state at every exit
+ * and interp boundary, and a mid-fragment fault replays correctly because
+ * recovery re-derives the vector state from the committed shadow. */
+static __thread u16 xmm_resident, xmm_dirty;
+/* One slot beyond MAX so a bound_start index is always valid even when
+ * the persisted bound table is already full (oversized OAH_JIT_FRAGLEN). */
+static __thread u16 bound_res_snap[OAH_FRAG_MAX_BOUNDS + 1],
+                    bound_dirty_snap[OAH_FRAG_MAX_BOUNDS + 1];
+static const u8 xmm_vreg[16] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 19, 20, 21, 22, 23, 24, 25, 26
+};
+
 /* hr = &g->xmm[idx]. The shadow base is emitted as a fixed-length
  * immediate recorded with OAH_RELOC_XMMBASE so persisted fragments are
  * rebound to the live guest at materialize time. */
@@ -1284,15 +1335,50 @@ static bool emit_xmm_ptr(oah_asm_buf *buf, const oah_guest *g, u8 hr, u8 idx)
 static bool emit_ld_xmm_reg(oah_asm_buf *buf, const oah_guest *g, u8 v,
                                  u8 idx, u8 hr)
 {
-    return emit_xmm_ptr(buf, g, hr, idx) &&
-           oah_emit_ldr_str_vec(buf, false, true, v, hr, 0);
+    if (idx > 15) {
+        return false;
+    }
+    u8 vx = xmm_vreg[idx];
+    if (!(xmm_resident & (u16)(1u << idx))) {
+        if (!emit_xmm_ptr(buf, g, hr, idx) ||
+            !oah_emit_ldr_str_vec(buf, false, true, vx, hr, 0)) {
+            return false;
+        }
+        xmm_resident |= (u16)(1u << idx);
+    }
+    return v == vx || oah_emit_vec3(buf, OAH_V_ORR, v, vx, vx);
 }
 
 static bool emit_st_xmm_reg(oah_asm_buf *buf, const oah_guest *g, u8 v,
                                  u8 idx, u8 hr)
 {
-    return emit_xmm_ptr(buf, g, hr, idx) &&
-           oah_emit_ldr_str_vec(buf, true, true, v, hr, 0);
+    (void)g;
+    (void)hr;
+    if (idx > 15) {
+        return false;
+    }
+    xmm_resident |= (u16)(1u << idx);
+    xmm_dirty |= (u16)(1u << idx);
+    u8 vx = xmm_vreg[idx];
+    return v == vx || oah_emit_vec3(buf, OAH_V_ORR, vx, v, v);
+}
+
+/* Spill every dirty resident xmm back to g->xmm. Emitted before each
+ * fragment exit so shadow memory is exact whenever the dispatcher or
+ * interpreter next inspects it. */
+static bool emit_xmm_spill(oah_asm_buf *buf, const oah_guest *g)
+{
+    for (u8 idx = 0; idx < 16; idx++) {
+        if (!(xmm_dirty & (u16)(1u << idx))) {
+            continue;
+        }
+        if (!emit_xmm_ptr(buf, g, T4, idx) ||
+            !oah_emit_ldr_str_vec(buf, true, true, xmm_vreg[idx], T4, 0)) {
+            return false;
+        }
+    }
+    xmm_dirty = 0;
+    return true;
 }
 
 /* rm-side operand -> v (v16/v17 vector temps): memory EA or xmm[in->dst]. */
@@ -1305,23 +1391,6 @@ static bool emit_ld_rm128(oah_asm_buf *buf, const oah_guest *g,
     }
     return emit_ld_xmm_reg(buf, g, v, in->dst, T4);
 }
-
-/* Three-same vector encodings (Q=1). ADD/SUB/CMEQ element size goes in
- * bits 23..22: b=0, h=1, s=2, d=3. */
-#define OAH_V_EOR  0x6e201c00u
-#define OAH_V_ORR  0x4ea01c00u
-#define OAH_V_AND  0x4e201c00u
-#define OAH_V_ADD(sz)  (0x4e208400u | ((u32)(sz) << 22))
-#define OAH_V_SUB(sz)  (0x6e208400u | ((u32)(sz) << 22))
-#define OAH_V_CMEQ(sz) (0x6e208c00u | ((u32)(sz) << 22))
-#define OAH_V_ZIP1(sz) (0x4e003800u | ((u32)(sz) << 22))
-#define OAH_V_ZIP2(sz) (0x4e007800u | ((u32)(sz) << 22))
-#define OAH_V_UMIN     0x6e206c00u
-#define OAH_V_UMAX     0x6e206400u
-/* Signed saturating narrow: SQXTN writes the low lanes, SQXTN2 the high —
- * together they match x86 packss* (dest narrows low, source high). */
-#define OAH_V_SQXTN(sz)  (0x0e214800u | ((u32)(sz) << 22))
-#define OAH_V_SQXTN2(sz) (0x4e214800u | ((u32)(sz) << 22))
 
 static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                                   const oah_insn *in, u64 next)
@@ -1501,8 +1570,8 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                 ok = emit_ea(buf, g, &in->address, next, T0) &&
                      oah_emit_mem(buf, 3, false, false, false, T6, T0, 0);
             } else {
-                ok = emit_xmm_ptr(buf, g, T4, in->dst) &&
-                     oah_emit_ldr_str_uoff(buf, false, T6, T4, 0);
+                ok = emit_ld_xmm_reg(buf, g, 18, in->dst, T5) &&
+                     oah_emit_umov_gpr(buf, true, T6, 18, 0x08);
             }
             return ok && oah_emit_ins_gpr(buf, 16, 0x08, T6) &&
                    emit_st_xmm_reg(buf, g, 16, in->src, T4);
@@ -1603,6 +1672,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
 
     memset(info, 0, sizeof(*info));
     frag_relocs = info;
+    xmm_resident = 0;
+    xmm_dirty = 0;
 
     static int max_insns = -1;
     if (max_insns < 0) {
@@ -1632,6 +1703,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         /* Record this insn's boundary so a mid-fragment fault can map the
          * native fault offset back to its owning guest instruction. */
         u32 bound_start = info->nbounds;
+        bound_res_snap[bound_start] = xmm_resident;
+        bound_dirty_snap[bound_start] = xmm_dirty;
         if (info->nbounds < OAH_FRAG_MAX_BOUNDS) {
             info->bound_off[info->nbounds] = (u32)insn_start;
             info->bound_rip[info->nbounds] = cur;
@@ -1748,7 +1821,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             }
             break;
         case OAH_OP_RET:
-            if (!oah_emit_mem(buf, 3, false, false, true, F_NR, rsp, 0) ||
+            if (!emit_xmm_spill(buf, g) ||
+                !oah_emit_mem(buf, 3, false, false, true, F_NR, rsp, 0) ||
                 !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8) ||
                 !oah_emit_ret(buf)) {
                 return false;
@@ -1756,7 +1830,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             done = true;
             break;
         case OAH_OP_JMP_REL:
-            if (!frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
+            if (!frag_exit(buf, g, after + (u64)(s64)in.disp)) {
                 return false;
             }
             done = true;
@@ -1764,7 +1838,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         case OAH_OP_CALL_REL:
             if (!emit_reloc_imm(buf, T6, after, OAH_RELOC_GVA) ||
                 !emit_push64(buf, T6) ||
-                !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
+                !frag_exit(buf, g, after + (u64)(s64)in.disp)) {
                 return false;
             }
             done = true;
@@ -1773,8 +1847,10 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             /* Two constant exits: b.cc skips itself plus the fall exit
              * (reloc_imm 4 + ret 1 = 5 insns) to reach the taken exit:
              * 4 + 20 = 24 bytes. Both rets are chainable, so hot loop
-             * back-edges repatch to direct branches. */
-            if (!emit_rflags_to_nzcv(buf, T4) ||
+             * back-edges repatch to direct branches. The xmm spill must
+             * precede the b.cond so both paths keep the fixed skip. */
+            if (!emit_xmm_spill(buf, g) ||
+                !emit_rflags_to_nzcv(buf, T4) ||
                 !oah_emit_bcond(buf, arm_cond_for_x86(in.cc), 24) ||
                 !frag_exit_imm(buf, after) ||
                 !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
@@ -1904,13 +1980,17 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             info->nrelocs = reloc_start;
             info->reloc_overflow = reloc_overflow_start;
             info->nbounds = bound_start;
+            /* Vector state rolls back with the code: a partially emitted
+             * insn must not leak residency/dirty bits into the exit. */
+            xmm_resident = bound_res_snap[bound_start];
+            xmm_dirty = bound_dirty_snap[bound_start];
             if (getenv("OAH_JIT_TRACE")) {
                 fprintf(stderr, "  boundary %llx op=%d sc=%d w=%d imm=%d b0=%02x b1=%02x b2=%02x b3=%02x mem=%d\n",
                         (unsigned long long)cur, in.op, in.scalar,
                         in.opsize, in.immediate, pc[0], pc[1], pc[2],
                         pc[3], in.memory);
             }
-            if (!frag_exit_imm(buf, cur)) {
+            if (!frag_exit(buf, g, cur)) {
                 return false;
             }
             info->nexits = 0; /* interp step must run before the next frag */
@@ -1926,7 +2006,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         cur = after;
         n++;
     }
-    if (!frag_exit_imm(buf, cur)) {
+    if (!frag_exit(buf, g, cur)) {
         return false;
     }
     info->insns = n;
