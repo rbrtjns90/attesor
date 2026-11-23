@@ -449,6 +449,12 @@ final class AppState: ObservableObject {
         // Guest worker threads (SDL audio/hotplug) run on the cached JIT
         // instead of the interpreter — much shorter guest_lock holds.
         env["OAH_WORKER_JIT"] = "1"
+        if prog.sysroot == "freeciv" {
+            // SDL's audio pump is CPU-bound guest code that contends
+            // guest_lock with the UI thread; drop the emulated sound
+            // device so freeciv runs silent and fast.
+            env["OAH_DISABLE_AUDIO"] = "1"
+        }
         env["XFILESEARCHPATH"] = Repo.sysroot(named: prog.sysroot).path + "/etc/X11/app-defaults/%N"
         guard FileManager.default.isExecutableFile(atPath: "/opt/X11/bin/xdpyinfo") else {
             throw LaunchError(message: "Install XQuartz to run graphical Linux applications.")

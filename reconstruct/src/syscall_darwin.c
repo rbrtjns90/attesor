@@ -1170,17 +1170,24 @@ void oah_alsa_note_flags(int fd, int host_flags);
 
 static int open_guest_path(oah_image *img, int dirfd, const char *path, int host_flags, u64 mode)
 {
-    if (!strcmp(path, "/dev/dsp") || !strcmp(path, "/dev/sound/dsp") ||
-        !strcmp(path, "/dev/audio") || !strcmp(path, "/dev/audio1")) {
-        int fd = oah_dsp_open(host_flags);
-        if (fd >= 0) {
-            return fd;
-        }
-        errno = fd < -1 ? -fd : ENODEV;
-        return -1;
+    /* OAH_DISABLE_AUDIO makes the emulated sound devices absent: SDL's
+     * audio init then fails cleanly instead of spawning the CPU-bound
+     * pump thread that contends guest_lock with the UI thread. */
+    static int audio_disabled = -1;
+    if (audio_disabled < 0) {
+        audio_disabled = getenv("OAH_DISABLE_AUDIO") != NULL;
     }
-    if (!strncmp(path, "/dev/snd/", 9)) {
-        int fd = oah_alsa_open(path, host_flags);
+    bool is_sound = !strcmp(path, "/dev/dsp") || !strcmp(path, "/dev/sound/dsp") ||
+                    !strcmp(path, "/dev/audio") || !strcmp(path, "/dev/audio1") ||
+                    !strncmp(path, "/dev/snd/", 9);
+    if (is_sound) {
+        if (audio_disabled) {
+            errno = ENODEV;
+            return -1;
+        }
+        int fd = !strncmp(path, "/dev/snd/", 9)
+            ? oah_alsa_open(path, host_flags)
+            : oah_dsp_open(host_flags);
         if (fd >= 0) {
             return fd;
         }
