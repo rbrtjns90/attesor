@@ -533,11 +533,14 @@ void oah_darwin_guest_tick(oah_guest *g, u64 insns)
     pthread_mutex_unlock(&sched_mu);
     /* Grace window before re-entering the mutex queue: the drained moment
      * is usually a waiter's brief gap between releasing the lock for a
-     * host call and re-queueing, not the end of its burst. Sleeping a
-     * fraction of a millisecond lets that burst finish (or settle into a
-     * long block) before this thread competes again. */
+     * host call and re-queueing, not the end of its burst. Sleeping lets
+     * that burst finish (or settle into a long block) before this thread
+     * competes again. Only threads that burn a full slice reach this
+     * path — a CPU-bound worker pays the grace on every yield, throttling
+     * it to a minority share, while an interactive thread mostly returns
+     * through blocking syscalls and never sees it. */
     {
-        struct timespec grace = {.tv_sec = 0, .tv_nsec = 400000L};
+        struct timespec grace = {.tv_sec = 0, .tv_nsec = 1500000L};
         nanosleep(&grace, NULL);
     }
     oah_darwin_guest_enter();
