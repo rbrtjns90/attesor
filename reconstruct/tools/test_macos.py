@@ -74,6 +74,8 @@ def main():
                         help="two-worker TLS/XMM isolation fixture")
     parser.add_argument("--fault-store", type=Path,
                         help="mid-fragment fault store-replay fixture")
+    parser.add_argument("--exec-guard", type=Path,
+                        help="executable-range invalidation fixture")
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -132,6 +134,41 @@ def main():
                             f"{mode} mid-fragment fault store replay: "
                             f"counter={value} (rc={rc}, stderr={err!r})")
                     print(f"PASS {mode}: mid-fragment fault store replay")
+            if args.exec_guard:
+                # Two-sided invalidation check. The fixture translates and
+                # runs two mmap'd RWX stubs, churns unrelated data mappings
+                # (mprotect/munmap — must NOT flush), re-enters a stub to
+                # prove its translation survived, then munmaps a range that
+                # crosses [data page][exec stub] (must flush) and de-execs
+                # the other stub (must flush). Finally it calls the de-exec'd
+                # stub, which must fault — the stale translation cannot run.
+                for mode, options, mode_env in MODES:
+                    env = dict(mode_env)
+                    env["OAH_JIT_FLUSH_DEBUG"] = "1"
+                    rc, out, err = run(
+                        [runner, *options, str(args.exec_guard.resolve())],
+                        directory, b"", extra_env=env)
+                    flushes = [line for line in err.splitlines()
+                               if line.startswith(b"jit flush")]
+                    if rc == 0:
+                        raise ValueError(
+                            f"{mode} exec-guard: de-exec'd stub ran "
+                            f"without faulting (out={out!r}, err={err!r})")
+                    if not out.endswith(b"OK\n"):
+                        raise ValueError(
+                            f"{mode} exec-guard: translation did not survive "
+                            f"data-only mapping churn (out={out!r}, err={err!r})")
+                    if len(flushes) != 2 or any(
+                            b"mprotect/munmap" not in line for line in flushes):
+                        raise ValueError(
+                            f"{mode} exec-guard: expected exactly the two "
+                            f"exec-range flushes, got {flushes!r} "
+                            f"(stderr={err!r})")
+                    if b"guest stopped" not in err:
+                        raise ValueError(
+                            f"{mode} exec-guard: guest did not fault on the "
+                            f"de-exec'd page (err={err!r})")
+                    print(f"PASS {mode}: exec-range invalidation guard")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,
