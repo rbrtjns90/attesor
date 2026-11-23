@@ -46,6 +46,12 @@ typedef struct {
     u64 jit_owner; /* serial: fragments bake per-thread bases, keyed by this */
     bool thread_exit;
 #endif
+    /* Mid-fragment fault replay: while nonzero, guest RIPs in
+     * [replay_from, replay_until] run under the interpreter with stores
+     * suppressed (the JIT already committed them). Set by the fragment
+     * fault handler; the interpreter clears it at replay_until. */
+    u64 replay_from;
+    u64 replay_until;
 } oah_guest;
 
 static inline oah_guest_signal_action *oah_guest_actions(oah_guest *g)

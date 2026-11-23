@@ -160,6 +160,11 @@ typedef struct {
     u64 exit_rip[2];
     u32 nbails;
     u64 bail_rip[4];
+    /* Guest-insn start boundaries (native off -> guest rip), heap copy
+     * of the translator's side table for fault recovery. NULL for
+     * materialized fragments, which lack the map. */
+    oah_frag_bound *bounds;
+    u32 nbounds;
 } oah_frag_entry;
 
 /* Chain accounting: a patched exit branches to the target's stub,
@@ -206,6 +211,7 @@ static void jit_insert(const oah_frag_entry *entry)
     for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
         oah_frag_entry *e = &jit_table[(idx + i) & (OAH_JIT_TABLE_SIZE - 1)];
         if (!e->rip || (e->rip == entry->rip && e->owner == entry->owner)) {
+            free(e->bounds);
             *e = *entry;
             return;
         }
@@ -274,6 +280,9 @@ static void jit_chain_patch(oah_frag_entry *e, u32 slot, u32 target_off)
 
 void oah_jit_cache_flush(void)
 {
+    for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
+        free(jit_table[i].bounds);
+    }
     memset(jit_table, 0, sizeof(jit_table));
     jit_arena_used = 0;
 }
@@ -287,6 +296,7 @@ void oah_jit_cache_flush(void)
  * interpreter replay the region and raise the proper guest fault. */
 static __thread sigjmp_buf *jit_fault_env;
 static __thread u64 jit_fault_addr;
+static __thread u64 jit_fault_pc;
 static struct sigaction jit_old_segv, jit_old_bus;
 
 static void jit_fault_handler(int sig, siginfo_t *si, void *opaque)
@@ -296,6 +306,7 @@ static void jit_fault_handler(int sig, siginfo_t *si, void *opaque)
     u64 lo = (u64)(uintptr_t)jit_arena;
     if (jit_fault_env && pc >= lo && pc < lo + jit_arena_used) {
         jit_fault_addr = (u64)(uintptr_t)si->si_addr;
+        jit_fault_pc = pc;
         siglongjmp(*jit_fault_env, 1);
     }
     /* Not a fragment fault: restore the previous action and re-fault so
@@ -367,7 +378,7 @@ static bool jit_arena_init(void)
  * the stale file is reclaimed by normal eviction or manual clearing.
  */
 
-#define OAH_PCACHE_VERSION 5u
+#define OAH_PCACHE_VERSION 6u
 /* Cache files are tied to the translator build: a rebuilt binary may emit
  * different code for the same guest, so old files must not be reused.
  * oah_build_key() is generated into src/build_key.c each build so every
@@ -397,6 +408,10 @@ typedef struct {
     u64 bail_rip[4]; /* non-chainable exits needing an interp step */
     u8 *code;
     pcache_rel *rel;
+    /* Fault-recovery boundaries. pend: absolute rips, normalized to
+     * module-relative at flush like exit_rip; disk: deltas in blob. */
+    u32 nbounds;
+    oah_frag_bound *bounds;
 } pcache_ent;
 
 typedef struct {
@@ -561,6 +576,17 @@ static pcache *pcache_open(oah_image *img, int module)
         e->bail_rip[2] = ((const u64 *)p)[3];
         e->bail_rip[3] = ((const u64 *)p)[4];
         p += 40;
+        if (p + 4 > end) {
+            break;
+        }
+        e->nbounds = ((const u32 *)p)[0];
+        p += 4;
+        if (e->nbounds > OAH_FRAG_MAX_BOUNDS ||
+            e->nbounds * sizeof(oah_frag_bound) > (size_t)(end - p)) {
+            break;
+        }
+        e->bounds = (oah_frag_bound *)p;
+        p += e->nbounds * sizeof(oah_frag_bound);
         count++;
     }
     pc->blob = blob;
@@ -643,9 +669,12 @@ static void pcache_pend(oah_image *img, int module, u64 rip,
     }
     e->code = malloc(code_len ? code_len : 1);
     e->rel = malloc(info->nrelocs ? info->nrelocs * sizeof(*e->rel) : 1);
-    if (!e->code || !e->rel) {
+    e->nbounds = info->nbounds;
+    e->bounds = malloc(e->nbounds ? e->nbounds * sizeof(*e->bounds) : 1);
+    if (!e->code || !e->rel || !e->bounds) {
         free(e->code);
         free(e->rel);
+        free(e->bounds);
         return;
     }
     memcpy(e->code, code, code_len);
@@ -654,6 +683,10 @@ static void pcache_pend(oah_image *img, int module, u64 rip,
         e->rel[i].kind = info->relocs[i].kind;
         e->rel[i].rd = info->relocs[i].rd;
         e->rel[i].value = info->relocs[i].value;
+    }
+    for (u32 i = 0; i < e->nbounds; i++) {
+        e->bounds[i].off = info->bound_off[i];
+        e->bounds[i].rip = info->bound_rip[i];
     }
     pc->n_pend++;
 }
@@ -712,7 +745,11 @@ static void pcache_flush_module(oah_module *m)
     u64 base = m->base;
     pcache_rel **copies = pc->n_pend ? calloc(pc->n_pend, sizeof(*copies))
                                    : NULL;
-    if (pc->n_pend && !copies) {
+    oah_frag_bound **bcopies = pc->n_pend ? calloc(pc->n_pend, sizeof(*bcopies))
+                                        : NULL;
+    if (pc->n_pend && (!copies || !bcopies)) {
+        free(copies);
+        free(bcopies);
         fclose(f);
         unlink(tmp);
         free(all);
@@ -729,14 +766,7 @@ static void pcache_flush_module(oah_module *m)
         if (all[i].nrel) {
             pcache_rel *rc = malloc(all[i].nrel * sizeof(*rc));
             if (!rc) {
-                for (u32 k = 0; k < pc->n_pend; k++) {
-                    free(copies[k]);
-                }
-                free(copies);
-                fclose(f);
-                unlink(tmp);
-                free(all);
-                return;
+                goto oom;
             }
             copies[i - pc->n_disk] = rc;
             memcpy(rc, all[i].rel, all[i].nrel * sizeof(*rc));
@@ -747,6 +777,31 @@ static void pcache_flush_module(oah_module *m)
             }
             all[i].rel = rc;
         }
+        if (all[i].nbounds) {
+            oah_frag_bound *bc = malloc(all[i].nbounds * sizeof(*bc));
+            if (!bc) {
+                goto oom;
+            }
+            bcopies[i - pc->n_disk] = bc;
+            memcpy(bc, all[i].bounds, all[i].nbounds * sizeof(*bc));
+            for (u32 j = 0; j < all[i].nbounds; j++) {
+                bc[j].rip -= base;
+            }
+            all[i].bounds = bc;
+        }
+    }
+    if (0) {
+oom:
+        for (u32 k = 0; k < pc->n_pend; k++) {
+            free(copies ? copies[k] : NULL);
+            free(bcopies ? bcopies[k] : NULL);
+        }
+        free(copies);
+        free(bcopies);
+        fclose(f);
+        unlink(tmp);
+        free(all);
+        return;
     }
     qsort(all, total, sizeof(*all), pcache_ent_cmp);
     u32 out = 0;
@@ -780,7 +835,10 @@ static void pcache_flush_module(oah_module *m)
               fwrite(all[i].code, 1, all[i].code_len, f) != all[i].code_len ||
               fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f) != all[i].nrel ||
               fwrite(trailer, 1, sizeof(trailer), f) != sizeof(trailer) ||
-              fwrite(trailer2, 1, sizeof(trailer2), f) != sizeof(trailer2);
+              fwrite(trailer2, 1, sizeof(trailer2), f) != sizeof(trailer2) ||
+              fwrite(&all[i].nbounds, sizeof(all[i].nbounds), 1, f) != 1 ||
+              fwrite(all[i].bounds, sizeof(*all[i].bounds),
+                     all[i].nbounds, f) != all[i].nbounds;
         out++;
     }
     if (!bad && (fseek(f, 12, SEEK_SET) != 0 || fwrite(&out, 4, 1, f) != 1)) {
@@ -792,8 +850,10 @@ static void pcache_flush_module(oah_module *m)
     }
     for (u32 i = 0; i < pc->n_pend; i++) {
         free(copies[i]);
+        free(bcopies[i]);
     }
     free(copies);
+    free(bcopies);
     free(all);
 }
 
@@ -884,6 +944,16 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
     for (u32 i = 0; i < e.nbails && i < 4; i++) {
         e.bail_rip[i] = info->bail_rip[i];
     }
+    if (info->nbounds) {
+        e.bounds = malloc(info->nbounds * sizeof(*e.bounds));
+        if (e.bounds) {
+            for (u32 i = 0; i < info->nbounds; i++) {
+                e.bounds[i].off = info->bound_off[i];
+                e.bounds[i].rip = info->bound_rip[i];
+            }
+            e.nbounds = info->nbounds;
+        }
+    }
     pthread_jit_write_protect_np(0);
     memcpy(jit_arena + jit_arena_used, code, code_len);
     u32 stub_len = jit_emit_stub(jit_arena + e.stub_off,
@@ -940,6 +1010,18 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
     }
     for (u32 i = 0; i < e->nbails && i < 4; i++) {
         info.bail_rip[info.nbails++] = base + e->bail_rip[i];
+    }
+    /* Bound RIPs persist as module-relative deltas; rebase and require
+     * each to resolve inside the module like a GVA reloc. */
+    for (u32 i = 0; i < e->nbounds; i++) {
+        u64 brip = base + e->bounds[i].rip;
+        if (oah_image_module_at(img, brip) != module) {
+            info.nbounds = 0; /* corrupt map: entry-replay fallback */
+            break;
+        }
+        info.bound_off[info.nbounds] = e->bounds[i].off;
+        info.bound_rip[info.nbounds] = brip;
+        info.nbounds++;
     }
     const oah_frag_entry *res = jit_install(rip, g->jit_owner, &info, code,
                                             e->code_len);
@@ -1108,11 +1190,24 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             fprintf(stderr, "maxfrags=%llu\n", (unsigned long long)maxfrags);
         }
         /* A poisoned RIP faulted inside JIT code before — step it under
-         * the interpreter's checked accesses instead. */
+         * the interpreter's checked accesses instead. A fault replay
+         * window does the same for every RIP up to and including the
+         * guest insn that owned the fault, so mid-fragment RIPs aren't
+         * re-translated and re-executed during recovery. */
         bool poisoned = jit_poisoned(g->rip);
+        /* RIP left the replay window without reaching the owner (e.g. a
+         * branch target outside the range): the window is stale — drop
+         * it so suppression can't leak into normal execution. */
+        if (g->replay_until &&
+            (g->rip < g->replay_from || g->rip > g->replay_until)) {
+            g->replay_from = g->replay_until = 0;
+            oah_suppress_guest_stores = false;
+        }
+        bool replay = g->replay_until &&
+                      g->rip >= g->replay_from && g->rip <= g->replay_until;
         const oah_frag_entry *frag =
-            poisoned ? NULL : jit_lookup(g->rip, g->jit_owner);
-        if (!frag && !poisoned) {
+            (poisoned || replay) ? NULL : jit_lookup(g->rip, g->jit_owner);
+        if (!frag && !poisoned && !replay) {
             frag = jit_translate(img, g, g->rip);
         }
         if (!frag) {
@@ -1123,6 +1218,8 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                 (void)oah_interp_run(&g_ref, img, 1);
             }
             if (one.status != OAH_INTERP_LIMIT) {
+                g->replay_from = g->replay_until = 0;
+                oah_suppress_guest_stores = false;
                 fprintf(stderr,
                         "jit stop1 status=%d rip=%llx off=%llx\n"
                         " rax=%llx rbx=%llx rcx=%llx rdx=%llx\n"
@@ -1178,6 +1275,36 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
              * entry state — restore it and replay this region through
              * the interpreter, which reports a real guest fault. */
             jit_fault_env = NULL;
+            /* Map the native fault PC back to the guest insn that owns
+             * it, via the fragment's boundary table. The fault may have
+             * hit a chained fragment rather than the entered one, so
+             * find the containing fragment first. */
+            u64 owner_rip = 0;
+            {
+                u64 arena_off = jit_fault_pc - (u64)(uintptr_t)jit_arena;
+                const oah_frag_entry *ff = frag;
+                if (!(arena_off >= ff->code_off &&
+                      arena_off - ff->code_off < ff->code_len)) {
+                    ff = NULL;
+                    for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
+                        const oah_frag_entry *e = &jit_table[i];
+                        if (e->rip && arena_off >= e->code_off &&
+                            arena_off - e->code_off < e->code_len) {
+                            ff = e;
+                            break;
+                        }
+                    }
+                }
+                if (ff && ff->bounds) {
+                    u32 in_frag = (u32)(arena_off - ff->code_off);
+                    for (u32 i = 0; i < ff->nbounds; i++) {
+                        if (ff->bounds[i].off > in_frag) {
+                            break;
+                        }
+                        owner_rip = ff->bounds[i].rip;
+                    }
+                }
+            }
             oah_unpack_runtime_x(g, ctx);
             if (getenv("OAH_JIT_FAULT_DEBUG")) {
                 fprintf(stderr,
@@ -1220,6 +1347,17 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             g->rflags = ctx[16];
             g->rip = ctx[17];
             jit_poison_add(g->rip);
+            /* Replay [entry, owner) under the interpreter with stores
+             * suppressed: the JIT already committed those writes, and
+             * re-executing them would double-apply non-idempotent ops.
+             * The window also forces interpret mode for mid-fragment
+             * RIPs so they aren't freshly re-JIT'd per replay round.
+             * Backward or unmapped owners fall back to entry replay. */
+            if (owner_rip && owner_rip >= g->rip && !verify) {
+                g->replay_from = g->rip;
+                g->replay_until = owner_rip;
+                oah_suppress_guest_stores = true;
+            }
             continue;
         }
         oah_jit_native_enter(ctx, jit_arena + frag->code_off);

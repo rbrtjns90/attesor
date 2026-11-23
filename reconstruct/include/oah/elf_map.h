@@ -114,6 +114,10 @@ void oah_unmap_elf(oah_image *img);
 /* Return up to *len contiguous guest bytes and update *len to their count. */
 /* Validate both address range and guest memory permissions. */
 void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot);
+/* While set, PROT_WRITE accesses resolve to a scratch buffer instead of
+ * the guest mapping: JIT fault recovery replays a committed range under
+ * the interpreter without double-applying its stores. */
+extern __thread bool oah_suppress_guest_stores;
 const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len);
 
 /* Translate a guest pointer; NULL if not in a guest mapping. */

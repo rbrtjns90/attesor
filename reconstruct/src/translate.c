@@ -1629,6 +1629,14 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         u64 insn_start = buf->size;
         u32 reloc_start = info->nrelocs;
         u32 reloc_overflow_start = info->reloc_overflow;
+        /* Record this insn's boundary so a mid-fragment fault can map the
+         * native fault offset back to its owning guest instruction. */
+        u32 bound_start = info->nbounds;
+        if (info->nbounds < OAH_FRAG_MAX_BOUNDS) {
+            info->bound_off[info->nbounds] = (u32)insn_start;
+            info->bound_rip[info->nbounds] = cur;
+            info->nbounds++;
+        }
 
         /* Bisect aid: OAH_JIT_NOSTORE sends every memory-writing insn to the
          * interpreter so store-emit bugs can be isolated. */
@@ -1895,6 +1903,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             buf->size = insn_start;
             info->nrelocs = reloc_start;
             info->reloc_overflow = reloc_overflow_start;
+            info->nbounds = bound_start;
             if (getenv("OAH_JIT_TRACE")) {
                 fprintf(stderr, "  boundary %llx op=%d sc=%d w=%d imm=%d b0=%02x b1=%02x b2=%02x b3=%02x mem=%d\n",
                         (unsigned long long)cur, in.op, in.scalar,

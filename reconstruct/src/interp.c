@@ -1347,6 +1347,13 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
     }
 
     while (r.insns < max_insns) {
+        /* Fault replay reached the insn that owns the native fault:
+         * its stores are no longer suppressed — it executes for real
+         * and reproduces the genuine guest fault. */
+        if (g->replay_until && g->rip == g->replay_until) {
+            g->replay_from = g->replay_until = 0;
+            oah_suppress_guest_stores = false;
+        }
 #if defined(__APPLE__)
         oah_darwin_guest_tick(g, 1);
         oah_sys_status signal_status = oah_guest_signal_poll(g, img);

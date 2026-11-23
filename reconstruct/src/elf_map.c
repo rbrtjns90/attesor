@@ -187,7 +187,9 @@ const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len)
     return NULL;
 }
 
-void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
+__thread bool oah_suppress_guest_stores;
+
+static void *guest_access_lookup(const oah_image *img, u64 gva, u64 len, u32 prot)
 {
     for (unsigned i = 0; img && i < img->nseg; i++) {
         const oah_load_seg *seg = &img->segs[i];
@@ -242,6 +244,27 @@ void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
         }
     }
     return NULL;
+}
+
+void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot)
+{
+    void *p = guest_access_lookup(img, gva, len, prot);
+    if (p && (prot & PROT_WRITE) && oah_suppress_guest_stores) {
+        /* The store already committed under the JIT; replaying it would
+         * double-apply non-idempotent writes (RMWs, pushes). Return a
+         * scratch buffer pre-filled with the real bytes: callers that
+         * read through this pointer (RMW semantics) still compute the
+         * right register state, while their writes are absorbed. The
+         * mapping check above still ran, so unmapped writes fault
+         * exactly as they would unsuppressed. */
+        static __thread u8 scratch[256];
+        if (len > sizeof(scratch)) {
+            return p;
+        }
+        memcpy(scratch, p, len);
+        return scratch;
+    }
+    return p;
 }
 
 #if defined(__linux__)

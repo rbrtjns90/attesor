@@ -63,6 +63,16 @@ enum { OAH_RELOC_GVA = 0, OAH_RELOC_FS = 1, OAH_RELOC_GS = 2,
        OAH_RELOC_XMMBASE = 3 };
 #define OAH_FRAG_MAX_RELOCS 24
 
+/* Start-of-guest-insn boundary: maps a native code offset to the guest
+ * RIP owning it. On a mid-fragment fault the dispatcher finds the
+ * faulting guest instruction via the last boundary at or before the
+ * fault offset, then replays [entry, owner) with stores suppressed. */
+typedef struct {
+    u32 off;   /* byte offset into the fragment's code */
+    u64 rip;   /* guest RIP of the instruction emitted there */
+} oah_frag_bound;
+#define OAH_FRAG_MAX_BOUNDS 128
+
 typedef struct {
     u32 insns;       /* guest instructions emitted */
     u32 interp_next; /* nonzero: run one interpreter step at the exit RIP */
@@ -73,6 +83,9 @@ typedef struct {
     u64 exit_rip[2]; /* constant guest target of each exit */
     u32 nbails;      /* non-chainable exits that need an interp step */
     u64 bail_rip[4]; /* guest RIP each bail exit returns */
+    u32 nbounds;     /* guest-insn boundaries recorded (<= MAX_BOUNDS) */
+    u32 bound_off[OAH_FRAG_MAX_BOUNDS];
+    u64 bound_rip[OAH_FRAG_MAX_BOUNDS];
     oah_frag_reloc relocs[OAH_FRAG_MAX_RELOCS];
 } oah_frag_info;
 

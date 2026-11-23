@@ -11,6 +11,7 @@ matching --*-sysroot arguments point at a populated tree; pass
 import argparse
 import hashlib
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 
@@ -71,6 +72,8 @@ def main():
     parser.add_argument("--sse", type=Path)
     parser.add_argument("--thread", type=Path,
                         help="two-worker TLS/XMM isolation fixture")
+    parser.add_argument("--fault-store", type=Path,
+                        help="mid-fragment fault store-replay fixture")
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -111,6 +114,24 @@ def main():
                     raise ValueError(f"workerjit thread isolation: "
                                      f"expected {thread_expected!r}, got {actual!r}")
                 print("PASS workerjit: worker TLS/XMM isolation")
+            if args.fault_store:
+                # The fixture bumps a MAP_SHARED counter, then faults on a
+                # bad load mid-fragment. Every committed re-execution of
+                # the store lands in the file — recovery must leave it at 1.
+                for mode, options, mode_env in MODES:
+                    counter = Path(directory) / "counter.bin"
+                    counter.unlink(missing_ok=True)
+                    env = dict(mode_env)
+                    rc, out, err = run(
+                        [runner, *options, str(args.fault_store.resolve())],
+                        directory, b"", extra_env=env or None)
+                    value = struct.unpack("<Q", counter.read_bytes()[:8])[0] \
+                        if counter.exists() else -1
+                    if value != 1:
+                        raise ValueError(
+                            f"{mode} mid-fragment fault store replay: "
+                            f"counter={value} (rc={rc}, stderr={err!r})")
+                    print(f"PASS {mode}: mid-fragment fault store replay")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,
