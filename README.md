@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/rbrtjns90/attesor/main/runtime-src/
 
 **Manual** — `brew install --cask xquartz`, then download `Attesor-<ver>.dmg` from [the latest release](https://github.com/rbrtjns90/attesor/releases/latest) and drag Attesor to Applications.
 
-On first launch the app downloads the Linux runtime (~370 MB) into `~/Library/Application Support/Attesor/` — everything works offline after that. The package manager ships a Debian userland (guest `apt` works), Freeciv, DOSBox, and one-click installs for more programs. If Gatekeeper blocks the unsigned app, right-click → Open once.
+On first launch the app downloads the Linux runtime (~370 MB) into `~/Library/Application Support/Attesor/` — everything works offline after that. The package manager ships a Debian userland (guest `apt` works), Freeciv, DOSBox, and one-click installs for more programs. Verified working through the translator: `xterm` (real PTY + shell), `xboard` + `gnuchess`, `xsol`, `xpat2`, `xbill`, `lbreakout2`, and `xgalaga` (windowed). If Gatekeeper blocks the unsigned app, right-click → Open once.
 
 ![Attesor Package Manager](docs/screenshots/package-manager.png)
 
