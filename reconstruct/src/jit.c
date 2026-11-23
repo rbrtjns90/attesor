@@ -1241,6 +1241,15 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             (poisoned || replay) ? NULL : jit_lookup(g->rip, g->jit_owner);
         if (!frag && !poisoned && !replay) {
             frag = jit_translate(img, g, g->rip);
+            /* Persist translations incrementally: a long-running guest
+             * (or one that exits via _exit / signal / crash) otherwise
+             * loses its whole session's fragments, since the only other
+             * flush runs when this dispatch call returns. */
+            static __thread unsigned new_since_flush;
+            if (frag && jit_persist && ++new_since_flush >= 256) {
+                new_since_flush = 0;
+                pcache_flush(img);
+            }
         }
         if (!frag) {
             /* Undecodable or poisoned: interpreter runs it and reports. */
