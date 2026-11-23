@@ -446,6 +446,9 @@ final class AppState: ObservableObject {
         env["XAUTHORITY"] = NSHomeDirectory() + "/.Xauthority"
         env["DISPLAY"] = ":0"
         env["OAH_CACHE_DIR"] = Repo.root.path + "/runtime/var/cache/jit"
+        // Guest worker threads (SDL audio/hotplug) run on the cached JIT
+        // instead of the interpreter — much shorter guest_lock holds.
+        env["OAH_WORKER_JIT"] = "1"
         env["XFILESEARCHPATH"] = Repo.sysroot(named: prog.sysroot).path + "/etc/X11/app-defaults/%N"
         guard FileManager.default.isExecutableFile(atPath: "/opt/X11/bin/xdpyinfo") else {
             throw LaunchError(message: "Install XQuartz to run graphical Linux applications.")
@@ -505,7 +508,7 @@ final class AppState: ObservableObject {
             #!/bin/sh
             # Attesor Package Manager launch
             export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit" LC_ALL=C \
-                XAUTHORITY="$HOME/.Xauthority" HOME=/root
+                XAUTHORITY="$HOME/.Xauthority" HOME=/root OAH_WORKER_JIT=1
             mkdir -p "\(Repo.sysroot(named: prog.sysroot).path)/root" \
                 "\(Repo.root.path)/runtime/var/log"
             exec "\(Repo.oah.path)" --sysroot "\(Repo.sysroot(named: prog.sysroot).path)" \

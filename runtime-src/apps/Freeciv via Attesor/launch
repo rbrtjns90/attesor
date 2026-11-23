@@ -6,6 +6,9 @@ exec >>"$base/var/freeciv/Freeciv.log" 2>&1
 export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 export HOME="$base/var/freeciv/home" LC_ALL=C DISPLAY=:0
 export OAH_CACHE_DIR="$base/var/cache/jit"
+# Guest worker threads (SDL audio/hotplug) run on the cached JIT instead of
+# the interpreter — much shorter guest_lock holds on the audio pump.
+export OAH_WORKER_JIT=1
 export FREECIV_DATA_PATH="$root/usr/share/games/freeciv-attesor"
 export SDL_VIDEODRIVER=x11 SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=alsa AUDIODEV=hw:0,0
 export PATH="$root/usr/games:/usr/bin:/bin"
