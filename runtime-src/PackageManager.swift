@@ -55,6 +55,21 @@ struct InstalledProgram: Identifiable, Hashable {
     let package: String   // dpkg package, empty for hand-built sysroots
     let sysroot: String   // sysroot dir name, e.g. "debian-expanded"
     let isGUI: Bool
+    var iconPath: String? // host path to a loadable icon image, if any
+}
+
+/// A curated, friendly entry on the Featured page. `package` is the apt
+/// name used for install; `matchBin` lets the card light up when an
+/// equivalent program is already installed (e.g. hand-built sysroots).
+struct FeaturedApp: Identifiable {
+    var id: String { package }
+    let title: String
+    let blurb: String
+    let category: String   // "Games", "Utilities"…
+    let package: String    // apt package name
+    let matchBin: String   // substring matched against installed binaries
+    let iconName: String?  // freedesktop icon name to resolve
+    let isGUI: Bool
 }
 
 struct PackageEntry: Identifiable, Hashable {
@@ -72,6 +87,130 @@ struct LaunchError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+// MARK: - Icons
+
+/// Resolves freedesktop Icon= specs inside a sysroot and composites a
+/// penguin badge onto loaded images so Linux apps are visually marked.
+enum LinuxIcon {
+    /// The generated Tux icon the app bundles already ship.
+    static let penguin: NSImage? = {
+        for path in [
+            Repo.root.path + "/runtime/icons/Penguin.icns",
+            Bundle.main.path(forResource: "Penguin", ofType: "icns"),
+        ].compactMap({ $0 }) {
+            if let img = NSImage(contentsOfFile: path) { return img }
+        }
+        return nil
+    }()
+
+    /// Extensions NSImage can actually decode (XPM is not supported).
+    private static let loadable: Set<String> = ["png", "icns", "tiff", "jpg", "jpeg", "gif", "bmp"]
+
+    /// Icon= is either an absolute guest path or a theme icon name.
+    /// Theme names resolve through hicolor (largest size wins) with a
+    /// pixmaps fallback, matching the freedesktop lookup order loosely.
+    static func resolve(sysroot: String, spec: String) -> String? {
+        let root = Repo.sysroot(named: sysroot).path
+        if spec.hasPrefix("/") {
+            let p = root + spec
+            return loadable.contains((spec as NSString).pathExtension.lowercased())
+                && FileManager.default.fileExists(atPath: p) ? p : nil
+        }
+        let name = (spec as NSString).deletingPathExtension
+        var candidates: [(String, Int)] = []
+        let themes = ["hicolor"]
+        for theme in themes {
+            let themeRoot = root + "/usr/share/icons/\(theme)"
+            guard let sizes = try? FileManager.default.contentsOfDirectory(atPath: themeRoot)
+            else { continue }
+            for size in sizes {
+                let dir = themeRoot + "/\(size)/apps"
+                for ext in ["png", "svg", "xpm"] {
+                    let p = dir + "/\(name).\(ext)"
+                    guard loadable.contains(ext),
+                          FileManager.default.fileExists(atPath: p) else { continue }
+                    let px = Int(size.components(separatedBy: "x").first ?? "0") ?? 0
+                    candidates.append((p, px))
+                }
+            }
+        }
+        if let best = candidates.sorted(by: { $0.1 > $1.1 }).first { return best.0 }
+        for ext in ["png", "jpg", "jpeg", "gif", "bmp", "icns", "tiff"] {
+            let p = root + "/usr/share/pixmaps/\(name).\(ext)"
+            if FileManager.default.fileExists(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    /// Guest binary path -> host icon path, from every .desktop file in
+    /// the sysroot. Mirrors the Exec parsing in loadInstalled().
+    static func iconMap(sysroot root: URL) -> [String: String] {
+        let fm = FileManager.default
+        let sname = root.lastPathComponent
+        var map: [String: String] = [:]
+        let binDirs = ["/usr/bin", "/usr/sbin", "/usr/local/bin",
+                       "/usr/games", "/bin", "/sbin"]
+        let appsDir = root.appendingPathComponent("usr/share/applications")
+        guard let desks = try? fm.contentsOfDirectory(atPath: appsDir.path) else { return map }
+        for file in desks where file.hasSuffix(".desktop") {
+            guard let text = try? String(
+                contentsOf: appsDir.appendingPathComponent(file), encoding: .utf8)
+            else { continue }
+            var exec = "", icon = "", hidden = false, nodisplay = false, term = false
+            for line in text.split(separator: "\n") {
+                if line.hasPrefix("Exec=") && exec.isEmpty { exec = String(line.dropFirst(5)) }
+                else if line.hasPrefix("Icon=") && icon.isEmpty { icon = String(line.dropFirst(5)) }
+                else if line.hasPrefix("Hidden=") { hidden = line.contains("true") }
+                else if line.hasPrefix("Terminal=") { term = line.contains("true") }
+                else if line.hasPrefix("NoDisplay=") { nodisplay = line.contains("true") }
+            }
+            guard !hidden && !term && !nodisplay, !exec.isEmpty, !icon.isEmpty,
+                  let resolved = resolve(sysroot: sname, spec: icon) else { continue }
+            var tokens = exec.replacingOccurrences(of: "%[a-zA-Z]", with: "",
+                             options: .regularExpression)
+                .split(separator: " ").map(String.init)
+            while let first = tokens.first,
+                  (first == "env" || first.contains("=") || first.hasPrefix("-")) {
+                tokens.removeFirst()
+            }
+            guard var bin = tokens.first else { continue }
+            if !bin.hasPrefix("/") {
+                guard let found = binDirs.first(where: {
+                    fm.isExecutableFile(atPath: root.path + $0 + "/" + bin)
+                }) else { continue }
+                bin = found + "/" + bin
+            }
+            map[bin] = resolved
+        }
+        return map
+    }
+
+    private static var cache: [String: NSImage] = [:]
+
+    /// App icon with the penguin badge composited bottom-right. Falls
+    /// back to the penguin alone when the program ships no icon.
+    static func image(for prog: InstalledProgram, size: CGFloat = 28) -> NSImage {
+        let key = "\(prog.iconPath ?? "tux")@\(Int(size))"
+        if let hit = cache[key] { return hit }
+        let appIcon = prog.iconPath.flatMap { NSImage(contentsOfFile: $0) }
+        let out = NSImage(size: NSSize(width: size, height: size))
+        out.lockFocus()
+        defer { out.unlockFocus() }
+        let rect = NSRect(x: 0, y: 0, width: size, height: size)
+        (appIcon ?? penguin)?.draw(in: rect)
+        if appIcon != nil, let tux = penguin {
+            let badge = size * 0.42
+            let br = NSRect(x: size - badge, y: 0, width: badge, height: badge)
+            // White backing disc keeps the penguin legible on dark icons.
+            NSColor.white.setFill()
+            NSBezierPath(ovalIn: br.insetBy(dx: -1, dy: -1)).fill()
+            tux.draw(in: br)
+        }
+        cache[key] = out
+        return out
+    }
+}
+
 // MARK: - App state
 
 @MainActor
@@ -83,6 +222,39 @@ final class AppState: ObservableObject {
     @Published var busy = false
     @Published var busyTitle = ""
     @Published var alert: String?
+    /// Friendly name of the guest app currently spinning up — drives the
+    /// "Starting…" overlay so slow emulated launches give feedback.
+    @Published var launching: String?
+    /// GUI programs launched from this window, keyed by program id.
+    var procs: [String: Process] = [:]
+    /// Program ids with a live guest process (for Running/Quit UI).
+    @Published var running: Set<String> = []
+    /// XQuartz is required for every graphical launch; checked at reload.
+    @Published var xquartzMissing = false
+
+    /// Featured cards shown on the front page. `matchBin` marks the card
+    /// installed when any installed binary contains it — hand-built
+    /// sysroots (freeciv) light up without an apt record.
+    static let featured: [FeaturedApp] = [
+        FeaturedApp(title: "Freeciv", blurb: "Turn-based empire strategy game",
+                    category: "Games", package: "freeciv",
+                    matchBin: "freeciv-sdl2", iconName: "freeciv-client", isGUI: true),
+        FeaturedApp(title: "DOSBox", blurb: "Run classic DOS games and software",
+                    category: "Games", package: "dosbox",
+                    matchBin: "dosbox", iconName: "dosbox", isGUI: true),
+        FeaturedApp(title: "XDemineur", blurb: "Classic mine-sweeping puzzle",
+                    category: "Games", package: "xdemineur",
+                    matchBin: "xdemineur", iconName: "xdemineur-icon", isGUI: true),
+        FeaturedApp(title: "XEyes", blurb: "Eyes that follow your mouse",
+                    category: "Utilities", package: "x11-apps",
+                    matchBin: "xeyes", iconName: nil, isGUI: true),
+        FeaturedApp(title: "XLogo", blurb: "X Window System logo demo",
+                    category: "Utilities", package: "x11-apps",
+                    matchBin: "xlogo", iconName: nil, isGUI: true),
+        FeaturedApp(title: "Cowsay", blurb: "A talking cow in your terminal",
+                    category: "Fun", package: "cowsay",
+                    matchBin: "cowsay", iconName: nil, isGUI: false),
+    ]
 
     // --- process plumbing -------------------------------------------------
 
@@ -139,10 +311,22 @@ final class AppState: ObservableObject {
     // --- loading -----------------------------------------------------------
 
     func reload() {
+        xquartzMissing = !FileManager.default.isExecutableFile(
+            atPath: "/opt/X11/bin/xdpyinfo")
         // sysroot scanning + state-sync spawn processes — keep off main.
         DispatchQueue.global(qos: .userInitiated).async {
             Self.syncState()
-            let (gui, term) = Self.loadInstalled()
+            var (gui, term) = Self.loadInstalled()
+            // Stamp desktop icons (DB rows don't carry them).
+            for root in Repo.sysroots {
+                let icons = LinuxIcon.iconMap(sysroot: root)
+                guard !icons.isEmpty else { continue }
+                gui = gui.map {
+                    var p = $0
+                    if p.sysroot == root.lastPathComponent { p.iconPath = icons[p.binary] }
+                    return p
+                }
+            }
             let names = Self.loadInstalledNames()
             let pkgs = Self.loadPackages(installedNames: names)
             DispatchQueue.main.async {
@@ -432,11 +616,143 @@ final class AppState: ObservableObject {
     }
 
     func launch(_ prog: InstalledProgram) {
+        // Launch feedback: emulated guests can take tens of seconds before
+        // their first frame — show the overlay right away, then give it a
+        // generous window before auto-dismissing.
+        launching = prog.name
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            self?.launching = nil
+        }
         do {
             if prog.isGUI { try launchGUI(prog) } else { try launchTerminal(prog) }
         } catch {
+            launching = nil
             alert = error.localizedDescription
         }
+    }
+
+    /// Stop a guest process launched from this window.
+    func quit(_ prog: InstalledProgram) {
+        procs[prog.id]?.terminate()
+    }
+
+    /// Generate a double-clickable ~/Applications/<Name>.app that launches
+    /// this program — the same pattern runtime-src/apps uses by hand.
+    func createShortcut(_ prog: InstalledProgram) {
+        do {
+            let appsDir = URL(fileURLWithPath:
+                NSHomeDirectory() + "/Applications", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: appsDir, withIntermediateDirectories: true)
+            let bundle = appsDir.appendingPathComponent("\(prog.name).app")
+            let contents = bundle.appendingPathComponent("Contents")
+            try FileManager.default.createDirectory(
+                at: contents.appendingPathComponent("MacOS"),
+                withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: contents.appendingPathComponent("Resources"),
+                withIntermediateDirectories: true)
+
+            let plist: [String: Any] = [
+                "CFBundleExecutable": "launch",
+                "CFBundleIdentifier": "ai.attesor.shortcut.\(prog.id.hashValue)",
+                "CFBundleName": prog.name,
+                "CFBundlePackageType": "APPL",
+                "CFBundleIconFile": "app",
+                "LSMinimumSystemVersion": "12.0",
+            ]
+            try (plist as NSDictionary).write(
+                to: contents.appendingPathComponent("Info.plist"))
+
+            // Same environment as launchGUI, baked to absolute paths so
+            // the bundle works from anywhere.
+            let root = Repo.sysroot(named: prog.sysroot).path
+            var exports = """
+                  export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+                  HOME="\(root)/root" LC_ALL=C DISPLAY=:0
+                  export OAH_CACHE_DIR="\(Repo.root.path)/runtime/var/cache/jit"
+                  export OAH_WORKER_JIT=1
+                  export XFILESEARCHPATH="\(root)/etc/X11/app-defaults/%N"
+                """
+            if prog.sysroot == "freeciv" {
+                exports += "\n  export OAH_DISABLE_AUDIO=1 FREECIV_DATA_PATH=\"\(root)/usr/share/games/freeciv-attesor\""
+                exports += "\n  export SDL_VIDEODRIVER=x11 SDL_RENDER_DRIVER=software SDL_AUDIODRIVER=alsa"
+            }
+            let script = """
+                #!/bin/sh
+                set -eu
+                \(exports)
+                mkdir -p "\(root)/root" "$OAH_CACHE_DIR" \
+                    "\(Repo.root.path)/runtime/var/log"
+                exec >>"\(Repo.root.path)/runtime/var/log/\(prog.name).log" 2>&1
+                if ! /opt/X11/bin/xdpyinfo -display :0 >/dev/null 2>&1; then
+                    /usr/bin/open -a XQuartz || true
+                    attempts=0
+                    until /opt/X11/bin/xdpyinfo -display :0 >/dev/null 2>&1; do
+                        attempts=$((attempts + 1))
+                        [ "$attempts" -lt 30 ] || exit 1
+                        /bin/sleep 1
+                    done
+                fi
+                exec "\(Repo.oah.path)" --max-insns 18446744073709551615 \
+                    --sysroot "\(root)" "\(root)\(prog.binary)"
+                """
+            let launch = contents.appendingPathComponent("MacOS/launch")
+            try script.write(to: launch, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: launch.path)
+
+            // App icon: the program's own icon as .icns when we have a
+            // PNG, else the Tux default.
+            let icns = contents.appendingPathComponent("Resources/app.icns")
+            var made = false
+            if let iconPath = prog.iconPath, iconPath.hasSuffix(".png") {
+                let set = (NSTemporaryDirectory() as NSString)
+                    .appendingPathComponent("attesor.iconset")
+                try? FileManager.default.removeItem(atPath: set)
+                try? FileManager.default.createDirectory(
+                    atPath: set, withIntermediateDirectories: true)
+                let link = set + "/icon_128x128.png"
+                try? FileManager.default.copyItem(atPath: iconPath, toPath: link)
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+                p.arguments = ["-c", "icns", set, "-o", icns.path]
+                try? p.run(); p.waitUntilExit()
+                made = p.terminationStatus == 0 &&
+                    FileManager.default.fileExists(atPath: icns.path)
+            }
+            if !made, let penguin = Bundle.main.path(forResource: "Penguin", ofType: "icns")
+                       ?? Optional(Repo.root.path + "/runtime/icons/Penguin.icns") {
+                try? FileManager.default.copyItem(atPath: penguin, toPath: icns.path)
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([bundle])
+            alert = "Created \(prog.name).app in ~/Applications — pin it to the Dock if you like."
+        } catch {
+            alert = "Couldn't create shortcut: \(error.localizedDescription)"
+        }
+    }
+
+    /// Launch an arbitrary downloaded x86-64 ELF via an open panel —
+    /// the same job the standalone Launcher app does.
+    func openFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an x86-64 Linux executable"
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // Reuse the standalone Launcher's richer detection by delegating —
+        // it owns ELF classification, mode choice and history.
+        let launcher = Repo.root.path +
+            "/runtime/Apps/Attesor Linux Launcher.app"
+        guard FileManager.default.fileExists(atPath: launcher) else {
+            alert = "The Attesor Linux Launcher app is missing — rebuild the app bundles."
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-a", launcher, url.path]
+        try? p.run()
     }
 
     private func launchGUI(_ prog: InstalledProgram) throws {
@@ -495,7 +811,16 @@ final class AppState: ObservableObject {
             p.standardOutput = handle
             p.standardError = handle
         }
+        let id = prog.id
+        p.terminationHandler = { _ in
+            Task { @MainActor in
+                self.procs.removeValue(forKey: id)
+                self.running.remove(id)
+            }
+        }
         try p.run()
+        procs[id] = p
+        running.insert(id)
     }
 
     private func displayReady(_ env: [String: String]) -> Bool {
@@ -532,26 +857,39 @@ final class AppState: ObservableObject {
 
 struct ProgramRow: View {
     let prog: InstalledProgram
+    let isRunning: Bool
     let onLaunch: () -> Void
+    let onQuit: () -> Void
     let onRemove: () -> Void
+    let onShortcut: () -> Void
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: prog.isGUI ? "desktopcomputer" : "terminal")
-                .font(.title3)
-                .foregroundStyle(prog.isGUI ? Color.accentColor : Color.secondary)
-                .frame(width: 24)
+            Image(nsImage: LinuxIcon.image(for: prog))
+                .resizable()
+                .frame(width: 28, height: 28)
             VStack(alignment: .leading, spacing: 2) {
                 Text(prog.name).font(.body)
-                Text("\(prog.binary)  ·  \(prog.package.isEmpty ? prog.sysroot : prog.package)")
+                Text(prog.package.isEmpty ? "Linux app" : "From \(prog.package)")
                     .font(.caption).foregroundStyle(.secondary)
+                    .help(prog.binary)
+            }
+            if isRunning {
+                Label("Running", systemImage: "circle.fill")
+                    .font(.caption).foregroundStyle(.green)
             }
             Spacer()
+            if isRunning {
+                Button("Quit", action: onQuit).buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             Button("Launch", action: onLaunch).buttonStyle(.borderedProminent)
                 .controlSize(.small)
+                .disabled(isRunning)
         }
         .padding(.vertical, 2)
         .contextMenu {
             Button("Launch", action: onLaunch)
+            Button("Add to Applications Folder…", action: onShortcut)
             if !prog.package.isEmpty {
                 Divider()
                 Button("Remove \(prog.package)…", role: .destructive, action: onRemove)
@@ -588,10 +926,37 @@ struct PackageRow: View {
     }
 }
 
+struct XQuartzBanner: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("XQuartz needed for graphical apps")
+                    .font(.callout).bold()
+                Text("One-time install — graphical Linux apps open through it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Get XQuartz") {
+                NSWorkspace.shared.open(URL(string: "https://www.xquartz.org")!)
+            }
+            .buttonStyle(.borderedProminent).controlSize(.small)
+        }
+        .padding(10)
+        .background(Color.yellow.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 struct InstalledView: View {
     @EnvironmentObject var state: AppState
     var body: some View {
         List {
+            if state.xquartzMissing {
+                Section { XQuartzBanner() }
+                    .listRowSeparator(.hidden)
+            }
             Section {
                 if state.guiPrograms.isEmpty {
                     Text("No graphical applications installed yet.")
@@ -599,8 +964,11 @@ struct InstalledView: View {
                 }
                 ForEach(state.guiPrograms) { prog in
                     ProgramRow(prog: prog,
+                               isRunning: state.running.contains(prog.id),
                                onLaunch: { state.launch(prog) },
-                               onRemove: { Task { await state.uninstall(prog) } })
+                               onQuit: { state.quit(prog) },
+                               onRemove: { Task { await state.uninstall(prog) } },
+                               onShortcut: { state.createShortcut(prog) })
                 }
             } header: {
                 Label("GUI Applications", systemImage: "desktopcomputer")
@@ -613,8 +981,11 @@ struct InstalledView: View {
                 }
                 ForEach(state.termPrograms) { prog in
                     ProgramRow(prog: prog,
+                               isRunning: false,
                                onLaunch: { state.launch(prog) },
-                               onRemove: { Task { await state.uninstall(prog) } })
+                               onQuit: {},
+                               onRemove: { Task { await state.uninstall(prog) } },
+                               onShortcut: { state.createShortcut(prog) })
                 }
             } header: {
                 Label("Terminal Programs", systemImage: "terminal")
@@ -623,6 +994,100 @@ struct InstalledView: View {
             }
         }
         .navigationTitle("Installed Applications")
+    }
+}
+
+/// A curated card on the Featured page: icon, blurb, Install or Launch.
+struct FeaturedCard: View {
+    @EnvironmentObject var state: AppState
+    let app: FeaturedApp
+    var installedProg: InstalledProgram?
+    var pkg: PackageEntry?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                if let installedProg {
+                    Image(nsImage: LinuxIcon.image(for: installedProg, size: 40))
+                        .resizable().frame(width: 40, height: 40)
+                } else {
+                    Image(systemName: app.isGUI ? "desktopcomputer" : "terminal")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 40, height: 40)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(app.title).font(.headline)
+                    Text(app.category).font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15))
+                        .clipShape(Capsule())
+                }
+                Spacer()
+            }
+            Text(app.blurb).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+            HStack {
+                if let installedProg {
+                    Label("Installed", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                    Spacer()
+                    Button("Launch") { state.launch(installedProg) }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                } else if let pkg, !pkg.installed {
+                    Button("Install") { Task { await state.install(pkg) } }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                        .disabled(state.busy)
+                } else if pkg != nil {
+                    Label("Installed", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                } else {
+                    Text("Refresh the package index to install")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+struct FeaturedView: View {
+    @EnvironmentObject var state: AppState
+    /// Match a featured entry to a live installed program by binary name.
+    func match(_ app: FeaturedApp) -> InstalledProgram? {
+        (state.guiPrograms + state.termPrograms).first {
+            $0.binary.contains(app.matchBin)
+        }
+    }
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if state.xquartzMissing { XQuartzBanner() }
+                Text("Featured").font(.title2).bold()
+                Text("Hand-picked apps known to run well. One click installs; "
+                     + "the Launch button appears once they're on your Mac.")
+                    .font(.callout).foregroundStyle(.secondary)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())],
+                          spacing: 12) {
+                    ForEach(AppState.featured) { app in
+                        FeaturedCard(app: app,
+                                     installedProg: match(app),
+                                     pkg: state.packages.first { $0.name == app.package })
+                    }
+                }
+                Divider()
+                Text("Looking for something else? The full Debian catalog is "
+                     + "under “All Packages” in the sidebar.")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+            .padding(20)
+        }
+        .navigationTitle("Attesor")
     }
 }
 
@@ -689,26 +1154,55 @@ struct LogView: View {
     }
 }
 
+/// Floating "Starting <app>…" card — emulated guests can take tens of
+/// seconds to first paint, so silent launches read as "broken".
+struct LaunchOverlay: View {
+    let name: String
+    var body: some View {
+        VStack(spacing: 10) {
+            ProgressView().controlSize(.large)
+            Text("Starting \(name)…").font(.headline)
+            Text("First launches translate code — this can take a minute.")
+                .font(.caption).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(24)
+        .frame(minWidth: 260)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .shadow(radius: 20)
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject var state: AppState
-    @State private var selection: String? = "apps"
+    @State private var selection: String? = "featured"
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
+                Label("Featured", systemImage: "star").tag("featured")
                 Label("Applications", systemImage: "square.grid.2x2").tag("apps")
-                Label("Browse Packages", systemImage: "shippingbox").tag("browse")
+                Label("All Packages", systemImage: "shippingbox").tag("browse")
             }
             .navigationSplitViewColumnWidth(min: 170, ideal: 190)
         } detail: {
             VStack(spacing: 0) {
                 Group {
-                    if selection == "browse" { BrowseView() } else { InstalledView() }
+                    if selection == "browse" { BrowseView() }
+                    else if selection == "apps" { InstalledView() }
+                    else { FeaturedView() }
                 }
                 Divider()
                 LogView()
             }
         }
         .toolbar {
+            ToolbarItem {
+                Button { state.openFile() } label: {
+                    Label("Open File…", systemImage: "doc.badge.plus")
+                }
+                .help("Run a downloaded x86-64 Linux executable")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await state.refreshIndex() }
@@ -716,6 +1210,11 @@ struct RootView: View {
                     Label("Refresh Index", systemImage: "arrow.clockwise")
                 }
                 .disabled(state.busy)
+            }
+        }
+        .overlay {
+            if let name = state.launching {
+                LaunchOverlay(name: name)
             }
         }
         .alert("Attesor", isPresented: .constant(state.alert != nil)) {
