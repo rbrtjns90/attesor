@@ -77,6 +77,8 @@ def main():
                         help="mid-fragment fault store-replay fixture")
     parser.add_argument("--exec-guard", type=Path,
                         help="executable-range invalidation fixture")
+    parser.add_argument("--flag-live", type=Path,
+                        help="zero-count shift flag-liveness fixture")
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -211,6 +213,29 @@ def main():
                                     f"{mode} exec-guard: flush evicted no "
                                     f"live fragments: {line!r}")
                     print(f"PASS {mode}: exec-range invalidation guard")
+            if args.flag_live:
+                # x86 shifts/rotates with an effective count of zero
+                # preserve every status flag. The JIT flag-liveness pass
+                # must model them as conditional writers — if it marks
+                # the earlier producer's flags dead, a setcc/jcc/cmovcc
+                # after a cl=0 (or masked-to-zero) shift reads stale
+                # flags. The fixture runs 11 checks (cmp/CF producers,
+                # shl/shr/sar/rol/ror at cl=0, cl=32 dword, cl=64 qword,
+                # and imm=0) observed by setcc/jcc/cmovcc; any wrong
+                # result exits with the test number. Runs under the
+                # optimized JIT — OAH_JIT_VERIFY disables liveness, so
+                # it cannot cover this path.
+                for mode, options, mode_env in MODES:
+                    env = dict(mode_env)
+                    rc, out, err = run(
+                        [runner, *options, str(args.flag_live.resolve())],
+                        directory, b"", extra_env=env)
+                    if rc != 0 or out != b"OK\n":
+                        raise ValueError(
+                            f"{mode} flag-liveness zero-count: expected "
+                            f"OK + exit 0, got rc={rc} out={out!r} "
+                            f"err={err!r}")
+                    print(f"PASS {mode}: zero-count shift flag liveness")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,

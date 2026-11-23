@@ -447,21 +447,57 @@ static void insn_flag_masks(const oah_insn *in, u16 *rd, u16 *wr)
         case OAH_SC_ADD: case OAH_SC_SUB: case OAH_SC_CMP:
         case OAH_SC_OR: case OAH_SC_AND: case OAH_SC_XOR:
         case OAH_SC_TEST: case OAH_SC_NEG:
-        case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
             *wr = OAH_FL_ALL;
             return;
+        case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR: {
+            if (!in->immediate) {
+                /* CL count: a masked-to-zero count preserves every
+                 * flag (the emit sits behind a cbz) — conditional
+                 * writer: it may read all fields and may write all. */
+                *rd = OAH_FL_ALL;
+                *wr = OAH_FL_ALL;
+                return;
+            }
+            u32 bits = in->opsize * 8;
+            u32 raw = (u32)(in->imm & (in->opsize == 8 ? 63 : 31));
+            if (!raw) {
+                return;                 /* no-op: flags preserved */
+            }
+            *wr = OAH_FL_ALL & ~(OAH_FL_CF | OAH_FL_OF);
+            if (raw <= bits) {
+                *wr |= OAH_FL_CF;       /* defined when count <= width */
+            }
+            if (raw == 1) {
+                *wr |= OAH_FL_OF;       /* defined only for count 1 */
+            }
+            return;
+        }
         case OAH_SC_INC: case OAH_SC_DEC:
             *wr = OAH_FL_ALL & ~OAH_FL_CF;
             return;
         case OAH_SC_IMUL:
             *wr = OAH_FL_CF | OAH_FL_OF;
             return;
-        case OAH_SC_ROL: case OAH_SC_ROR:
+        case OAH_SC_ROL: case OAH_SC_ROR: {
             if (in->opsize < 4) {
                 *rd = OAH_FL_ALL;    /* narrow widths -> interp boundary */
             }
-            *wr = OAH_FL_CF | OAH_FL_OF;
+            if (!in->immediate) {
+                /* CL count: masked-to-zero preserves all flags. */
+                *rd = OAH_FL_ALL;
+                *wr = OAH_FL_CF | OAH_FL_OF;
+                return;
+            }
+            u32 m = (u32)(in->imm & (in->opsize == 8 ? 63 : 31));
+            if (!m) {
+                return;                 /* no-op: flags preserved */
+            }
+            *wr = OAH_FL_CF;            /* CF written for any masked>0 */
+            if (m == 1) {
+                *wr |= OAH_FL_OF;
+            }
             return;
+        }
         case OAH_SC_BSF: case OAH_SC_BSR:
             *wr = OAH_FL_ZF;
             return;
