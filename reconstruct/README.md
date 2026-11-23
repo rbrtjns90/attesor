@@ -88,6 +88,9 @@ Diagnostics, all off by default:
 | `OAH_JIT_FRAGLEN` | cap instructions per fragment |
 | `OAH_JIT_MAXFRAGS` | run at most N native fragments, then fall back |
 | `OAH_JIT_VERIFY` | run a reference interpreter alongside and report the first divergent instruction |
+| `OAH_JIT_VERIFY_FROM` | arm verification only at an image-relative RIP offset (e.g. `0xfb`) |
+| `OAH_JIT_VERIFY_COUNT` | verify only N fragments, then disarm |
+| `OAH_JIT_VERIFY_MEM` | `<gva>:<len>` — also diff a guest memory region after each fragment |
 | `OAH_JIT_NOALL` / `NOLOAD` / `NOSTORE` / `NOALU` / `NOCTRL` / `NOJCC` / `NOCALL` / `NORMW` | force instruction classes through the interpreter (bisection) |
 | `OAH_SEG_DEBUG` | dump the guest segment table on a permission miss |
 

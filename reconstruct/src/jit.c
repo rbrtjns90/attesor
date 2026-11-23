@@ -1162,12 +1162,34 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
     }
 
     /* Differential debug: OAH_JIT_VERIFY runs a reference interpreter
-     * alongside and reports the first divergent instruction. */
+     * alongside and reports the first divergence.
+     * OAH_JIT_VERIFY_FROM=<off> arms it only when the guest reaches that
+     * image-relative RIP offset (as printed by "jit stop1 off=");
+     * OAH_JIT_VERIFY_COUNT=<n> disarms after n verified fragments;
+     * OAH_JIT_VERIFY_MEM=<gva>:<len> also diffs a guest memory region. */
     oah_guest g_ref;
-    bool verify = getenv("OAH_JIT_VERIFY") != NULL;
+    bool verify_want = getenv("OAH_JIT_VERIFY") != NULL;
+    u64 verify_from = getenv("OAH_JIT_VERIFY_FROM")
+                      ? strtoull(getenv("OAH_JIT_VERIFY_FROM"), NULL, 0) : 0;
+    long verify_left = getenv("OAH_JIT_VERIFY_COUNT")
+                       ? strtol(getenv("OAH_JIT_VERIFY_COUNT"), NULL, 0) : -1;
+    bool verify = verify_want && !verify_from;
+    u64 verify_mem = 0;
+    u32 verify_mem_len = 0;
+    if (verify_want) {
+        const char *m = getenv("OAH_JIT_VERIFY_MEM");
+        if (m) {
+            char *end = NULL;
+            verify_mem = strtoull(m, &end, 0);
+            if (end && *end == ':') {
+                long l = strtol(end + 1, NULL, 0);
+                verify_mem_len = l > 0 ? (u32)(l > 4096 ? 4096 : l) : 0;
+            }
+        }
+    }
     /* Chaining stays off for worker threads until isolated tests prove
      * worker progress and signal delivery (OAH_WORKER_CHAIN opts back in). */
-    bool chain = jit_chain && !getenv("OAH_JIT_NOCHAIN") && !verify &&
+    bool chain = jit_chain && !getenv("OAH_JIT_NOCHAIN") && !verify_want &&
                  (!worker || getenv("OAH_WORKER_CHAIN") != NULL);
     /* Previous fragment for exit repatching — invocation-local so a chain
      * can only target fragments owned by this thread. */
@@ -1178,6 +1200,16 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
 
     while (r.insns < budget) {
         u64 entry_rip = g->rip;
+        if (verify_want && verify_from &&
+            g->rip == oah_module_gva(img, 0, verify_from)) {
+            /* Reached the arming RIP: snapshot the ref state and start
+             * differential checking from here. */
+            verify_from = 0;
+            verify = true;
+            g_ref = *g;
+            fprintf(stderr, "JIT verify armed @%llx\n",
+                    (unsigned long long)g->rip);
+        }
         if (verify && g_ref.rip != g->rip) {
             fprintf(stderr,
                     "JIT drift before frag: jit=%llx ref=%llx\n",
@@ -1360,6 +1392,14 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             }
             continue;
         }
+        static __thread u8 verify_mem_pre[4096], verify_mem_jit[4096];
+        if (verify && verify_mem_len) {
+            const void *w = oah_guest_access(img, verify_mem,
+                                             verify_mem_len, PROT_READ);
+            if (w) {
+                memcpy(verify_mem_pre, w, verify_mem_len);
+            }
+        }
         oah_jit_native_enter(ctx, jit_arena + frag->code_off);
         jit_fault_env = NULL;
         oah_unpack_runtime_x(g, ctx);
@@ -1442,6 +1482,16 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
         }
 
         if (verify) {
+            /* Snapshot the watched region post-JIT: the ref steps below
+             * run on top of the same memory, so compare states after
+             * both sides finish. */
+            if (verify_mem_len) {
+                const void *w = oah_guest_access(img, verify_mem,
+                                                 verify_mem_len, PROT_READ);
+                if (w) {
+                    memcpy(verify_mem_jit, w, verify_mem_len);
+                }
+            }
             /* RDTSC is non-deterministic — sync timestamp regs afterward. */
             bool skip_tsc = false;
             if (frag->flags & OAH_FRAG_FALLBACK) {
@@ -1521,6 +1571,59 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                     r.status = OAH_INTERP_FAULT;
                     return r;
                 }
+            }
+            for (int i = 0; i < 16; i++) {
+                int bad = -1;
+                for (int b = 0; b < 16; b++) {
+                    if (g->xmm[i][b] != g_ref.xmm[i][b]) {
+                        bad = b;
+                        break;
+                    }
+                }
+                if (bad >= 0) {
+                    fprintf(stderr,
+                            "JIT divergence @%llx: xmm%d jit=",
+                            (unsigned long long)entry_rip, i);
+                    for (int b = 15; b >= 0; b--) {
+                        fprintf(stderr, "%02x", g->xmm[i][b]);
+                    }
+                    fputs(" ref=", stderr);
+                    for (int b = 15; b >= 0; b--) {
+                        fprintf(stderr, "%02x", g_ref.xmm[i][b]);
+                    }
+                    fprintf(stderr, " (first diff byte %d)\n", bad);
+                    *g = g_ref;
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+            }
+            if (verify_mem_len) {
+                const void *w = oah_guest_access(img, verify_mem,
+                                                 verify_mem_len, PROT_READ);
+                if (w && memcmp(w, verify_mem_jit, verify_mem_len)) {
+                    const u8 *refm = (const u8 *)w;
+                    fprintf(stderr,
+                            "JIT divergence @%llx: watched mem %llx:%u differs\n",
+                            (unsigned long long)entry_rip,
+                            (unsigned long long)verify_mem, verify_mem_len);
+                    unsigned shown = 0;
+                    for (u32 o = 0; o < verify_mem_len && shown < 8; o++) {
+                        if (refm[o] != verify_mem_jit[o]) {
+                            fprintf(stderr,
+                                    "  +%04x pre=%02x jit=%02x ref=%02x\n",
+                                    o, verify_mem_pre[o],
+                                    verify_mem_jit[o], refm[o]);
+                            shown++;
+                        }
+                    }
+                    *g = g_ref;
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+            }
+            if (verify_left > 0 && --verify_left == 0) {
+                fprintf(stderr, "JIT verify: count reached, disarming\n");
+                verify = false;
             }
         }
     }
