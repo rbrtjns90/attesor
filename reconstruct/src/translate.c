@@ -762,7 +762,7 @@ static bool frag_bail_exit(oah_asm_buf *buf, u64 next)
         !oah_emit_ret(buf)) {
         return false;
     }
-    if (!frag_relocs || frag_relocs->nbails >= 4) {
+    if (!frag_relocs || frag_relocs->nbails >= 8) {
         return false;
     }
     frag_relocs->bail_rip[frag_relocs->nbails++] = next;
@@ -1645,12 +1645,46 @@ static bool emit_xmm_spill(oah_asm_buf *buf, const oah_guest *g)
     return true;
 }
 
+/* Vector memory EA with the alignment guard x86 requires: aarch64 NEON
+ * ldr/str never faults on unaligned addresses, but aligned forms
+ * (movdqa/movaps/movapd/movntdq, in->aligned) must #GP on EA & 15.
+ * Emits EA into `ea`, then — for aligned insns — a ubfx+cbz skip over an
+ * out-of-line bail stub. A misaligned address falls into the stub, which
+ * spills resident XMM and bails at this insn's gva so the interpreter
+ * re-executes it and raises the fault. Guest page permissions need no
+ * explicit check: guest mappings are real host mmaps, so a store to a
+ * PROT_READ page faults at the host level and the fault handler routes
+ * it back through the interpreter. */
+static bool emit_vec_ea(oah_asm_buf *buf, const oah_guest *g,
+                        const oah_insn *in, u64 next, u8 ea)
+{
+    if (!emit_ea(buf, g, &in->address, next, ea)) {
+        return false;
+    }
+    if (!in->aligned) {
+        return true;
+    }
+    if (!oah_emit_ubfm(buf, true, T4, ea, 0, 3)) {
+        return false;
+    }
+    u64 cbz_off = buf->size;
+    oah_asm_emit32(buf, 0xb4000000u | T4); /* cbz xT4, patched to skip stub */
+    if (!emit_xmm_spill(buf, g) ||
+        !frag_bail_exit(buf, next - in->length)) {
+        return false;
+    }
+    oah_asm_patch32(buf, cbz_off,
+                    0xb4000000u | T4 |
+                    (u32)(((buf->size - cbz_off) >> 2) << 5));
+    return true;
+}
+
 /* rm-side operand -> v (v16/v17 vector temps): memory EA or xmm[in->dst]. */
 static bool emit_ld_rm128(oah_asm_buf *buf, const oah_guest *g,
                           const oah_insn *in, u64 next, u8 v)
 {
     if (in->memory) {
-        return emit_ea(buf, g, &in->address, next, T0) &&
+        return emit_vec_ea(buf, g, in, next, T0) &&
                oah_emit_ldr_str_vec(buf, false, true, v, T0, 0);
     }
     return emit_ld_xmm_reg(buf, g, v, in->dst, T4);
@@ -1673,7 +1707,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
             return false;
         }
         if (in->memory) {
-            return emit_ea(buf, g, &in->address, next, T0) &&
+            return emit_vec_ea(buf, g, in, next, T0) &&
                    oah_emit_ldr_str_vec(buf, true, true, 16, T0, 0);
         }
         return emit_st_xmm_reg(buf, g, 16, in->dst, T5);
@@ -1795,7 +1829,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                    oah_emit_ins_elem(buf, 3, 16, 0, 17, 1) &&
                    emit_st_xmm_reg(buf, g, 16, in->src, T4);
         }
-        return emit_ea(buf, g, &in->address, next, T0) &&
+        return emit_vec_ea(buf, g, in, next, T0) &&
                emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
                oah_emit_mem(buf, 3, false, false, false, T6, T0, 0) &&
                oah_emit_ins_gpr(buf, 16, 0x08, T6) &&
@@ -1804,14 +1838,14 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         if (!in->memory) {
             return false;
         }
-        return emit_ea(buf, g, &in->address, next, T0) &&
+        return emit_vec_ea(buf, g, in, next, T0) &&
                emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
                oah_emit_ldr_str_vec(buf, true, false, 16, T0, 0);
     case 0x16:  /* movhpd xmm, m64 */
         if (!in->memory) {
             return false;
         }
-        return emit_ea(buf, g, &in->address, next, T0) &&
+        return emit_vec_ea(buf, g, in, next, T0) &&
                emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
                oah_emit_mem(buf, 3, false, false, false, T6, T0, 0) &&
                oah_emit_ins_gpr(buf, 16, 0x18, T6) &&
@@ -1820,7 +1854,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         if (!in->memory) {
             return false;
         }
-        return emit_ea(buf, g, &in->address, next, T0) &&
+        return emit_vec_ea(buf, g, in, next, T0) &&
                emit_ld_xmm_reg(buf, g, 16, in->src, T4) &&
                oah_emit_umov_gpr(buf, true, T6, 16, 0x18) &&
                oah_emit_mem(buf, 3, true, false, false, T6, T0, 0);
@@ -1831,7 +1865,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         {
             bool ok;
             if (in->memory) {
-                ok = emit_ea(buf, g, &in->address, next, T0) &&
+                ok = emit_vec_ea(buf, g, in, next, T0) &&
                      oah_emit_mem(buf, 3, false, false, false, T6, T0, 0);
             } else {
                 ok = emit_ld_xmm_reg(buf, g, 18, in->dst, T5) &&
@@ -1848,7 +1882,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
             bool w64 = in->opsize == 8;
             bool ok;
             if (in->memory) {
-                ok = emit_ea(buf, g, &in->address, next, T0) &&
+                ok = emit_vec_ea(buf, g, in, next, T0) &&
                      oah_emit_mem(buf, w64 ? 3 : 2, false, false, w64,
                                   T6, T0, 0);
             } else {
@@ -1867,7 +1901,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
                 return false;
             }
             if (in->memory) {
-                return emit_ea(buf, g, &in->address, next, T0) &&
+                return emit_vec_ea(buf, g, in, next, T0) &&
                        oah_emit_mem(buf, w64 ? 3 : 2, true, false, false,
                                     T6, T0, 0);
             }
@@ -1898,7 +1932,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
             return false;
         }
         if (in->memory) {
-            return emit_ea(buf, g, &in->address, next, T0) &&
+            return emit_vec_ea(buf, g, in, next, T0) &&
                    oah_emit_ldr_str_vec(buf, true, false, 16, T0, 0);
         }
         /* xmm low->low, upper zeroed */

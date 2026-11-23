@@ -79,6 +79,8 @@ def main():
                         help="executable-range invalidation fixture")
     parser.add_argument("--flag-live", type=Path,
                         help="zero-count shift flag-liveness fixture")
+    parser.add_argument("--vec-align", type=Path,
+                        help="vector memory fault-semantics fixture")
     parser.add_argument("--busybox", type=Path)
     parser.add_argument("--alpine-sysroot", type=Path)
     parser.add_argument("--debian-sysroot", type=Path)
@@ -236,6 +238,30 @@ def main():
                             f"OK + exit 0, got rc={rc} out={out!r} "
                             f"err={err!r}")
                     print(f"PASS {mode}: zero-count shift flag liveness")
+            if args.vec_align:
+                # aarch64 NEON never faults on unaligned addresses, so
+                # the JIT must guard aligned vector memory forms itself:
+                # misaligned movdqa/movaps exit through an interpreter
+                # bail that raises the x86 #GP, while movdqu stays a bare
+                # native access. Host page protections mirror guest
+                # permissions, so a vector store to a read-only guest
+                # page faults like the interpreter path. The fixture
+                # runs aligned/misaligned/cross-page success cases, then
+                # forks children for the three fault cases (misaligned
+                # movdqa load, misaligned movaps store, movdqu store to a
+                # page the guest mprotect'd read-only); each child must
+                # die with the guest fault exit 126.
+                for mode, options, mode_env in MODES:
+                    env = dict(mode_env)
+                    rc, out, err = run(
+                        [runner, *options, str(args.vec_align.resolve())],
+                        directory, b"", extra_env=env)
+                    if rc != 0 or out != b"OK\n":
+                        raise ValueError(
+                            f"{mode} vector memory faults: expected "
+                            f"OK + exit 0, got rc={rc} out={out!r} "
+                            f"err={err!r}")
+                    print(f"PASS {mode}: vector memory fault checks")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
                 ("musl", args.alpine_sysroot / "bin/busybox" if args.alpine_sysroot else None,

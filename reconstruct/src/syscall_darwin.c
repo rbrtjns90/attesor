@@ -9,6 +9,7 @@
 #include <sys/clonefile.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <sys/sysctl.h>
 #include <libproc.h>
 #include <poll.h>
@@ -1696,6 +1697,50 @@ static u64 guest_brk(oah_image *img, u64 addr)
     return addr;
 }
 
+/* Host protection mirroring a guest prot value. JIT'd accesses run as
+ * bare host loads/stores, so hardware must enforce guest permissions:
+ * a store to a PROT_READ guest page faults and the fault handler routes
+ * it back through the interpreter for the guest-visible fault. Guest
+ * PROT_EXEC never maps to host exec (translated code runs from the code
+ * cache) but implies host read so the translator can fetch guest bytes.
+ */
+static int host_prot_for(u64 prot)
+{
+    int p = (int)(prot & (PROT_READ | PROT_WRITE));
+    if (prot & PROT_EXEC) {
+        p |= PROT_READ;
+    }
+    return p;
+}
+
+/* Recompute host permissions for each host page touching [gva,gva+len).
+ * Host pages are 16KB while guest pages are 4KB and mprotect requires a
+ * host-page-aligned start, so guest permissions cannot be mirrored one
+ * for one inside a shared host page. Each host page therefore gets the
+ * OR of the guest permissions across its subpages: a guest-writable
+ * subpage keeps the host page writable so legitimate stores never
+ * fault, while a page that is entirely guest-read-only or unmapped ends
+ * up host-read-only or inaccessible, so JIT'd stores fault and are
+ * routed back through the interpreter like unmapped accesses. */
+static void host_sync_prot(oah_image *img, u64 gva, u64 len)
+{
+    const u64 hmask = (u64)getpagesize() - 1;
+    for (u64 p = gva & ~hmask; p < gva + len; p += hmask + 1) {
+        int prot = 0;
+        for (u64 s = 0; s <= hmask; s += OAH_X86_PAGE_SIZE) {
+            u64 sub = p + s;
+            for (unsigned i = 0; i < img->nseg; i++) {
+                const oah_load_seg *seg = &img->segs[i];
+                if (sub >= seg->gva && sub < seg->gva + seg->size) {
+                    prot |= (int)seg->prot;
+                    break;
+                }
+            }
+        }
+        mprotect((void *)(uintptr_t)p, hmask + 1, host_prot_for(prot));
+    }
+}
+
 /* Isolate a guest subrange without changing its underlying host reservation. */
 static void split_mapping(oah_image *img, unsigned index, u64 addr, u64 len, u32 prot)
 {
@@ -1724,6 +1769,9 @@ static void split_mapping(oah_image *img, unsigned index, u64 addr, u64 len, u32
     img->nseg += extra;
     if (index < img->load_segments) {
         img->load_segments += extra;
+    }
+    if (original.host) {
+        host_sync_prot(img, addr, len);
     }
 }
 
@@ -1828,24 +1876,90 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
             if (extra > OAH_MAX_LOAD_SEGS - img->nseg) {
                 return -ENOMEM;
             }
-            /* MAP_FIXED changes only bytes inside this guest-owned reservation. */
-            if (file) {
-                u8 *staged = calloc(1, size);
+            /* Stage by replacing the covered host pages with fresh
+             * anonymous pages — Linux MAP_FIXED replaces pages, it does
+             * not modify them in place. mprotect cannot do this job:
+             * the reservation may contain host-side holes or file-backed
+             * pages whose max protection forbids writes. Host mmap/munmap
+             * need host-page (16KB) granularity, so a page is replaced
+             * only when it lies wholly inside this seg's host range —
+             * munmap'ing a page that extends past the seg would destroy
+             * neighbouring mappings. A partial tail page is instead
+             * written in place at 4KB granularity. Within a replaced
+             * page, bytes outside the covered range are preserved when
+             * the guest can still read them. */
+            {
+                const uintptr_t hmask = (uintptr_t)getpagesize() - 1;
+                uintptr_t h = (uintptr_t)(seg->host + left);
+                uintptr_t hend = h + size;
+                uintptr_t seg_lo = (uintptr_t)seg->host;
+                uintptr_t seg_hi = seg_lo + seg->size;
+                size_t span = ((hend + hmask) & ~hmask) - (h & ~hmask);
+                u8 *staged = calloc(1, span);
                 if (!staged) {
                     return -ENOMEM;
                 }
-                bool loaded = load_file(staged, size, fd, offset);
-                int error = errno;
-                if (loaded) {
-                    memcpy(seg->host + left, staged, size);
-                    oah_jit_cache_flush("map-fixed");
+                bool ok = true;
+                int error = 0;
+                if (file && !load_file(staged + (h & hmask), size, fd,
+                                       offset)) {
+                    ok = false;
+                    error = errno;
+                }
+                for (uintptr_t p = h & ~hmask; ok && p < hend;
+                     p += hmask + 1) {
+                    uintptr_t ps = hmask + 1;
+                    uintptr_t c_lo = p > h ? p : h;
+                    uintptr_t c_hi = p + ps < hend ? p + ps : hend;
+                    u8 *dst = staged + (p - (h & ~hmask));
+                    if (p < seg_lo || p + ps > seg_hi) {
+                        /* Page reaches past the seg's host range: write
+                         * the covered bytes in place — the rest belongs
+                         * to other mappings, so it cannot be replaced.
+                         * Raising the whole host page to RW briefly
+                         * over-permits the untouched bytes; the
+                         * host_sync_prot in split_mapping restores the
+                         * merged protections right after staging. */
+                        if (mprotect((void *)p, ps,
+                                     PROT_READ | PROT_WRITE) != 0) {
+                            ok = false;
+                            error = errno;
+                            break;
+                        }
+                        memcpy((void *)c_lo, dst + (c_lo - p),
+                               c_hi - c_lo);
+                        continue;
+                    }
+                    /* Whole host page is this seg's: replace it after
+                     * stashing guest-readable bytes the mapping does
+                     * not cover. */
+                    u64 g_lo = address - (h - p);
+                    for (u64 q = 0; q < ps; q += OAH_X86_PAGE_SIZE) {
+                        if (q >= c_lo - p && q < c_hi - p) {
+                            continue;
+                        }
+                        const void *src = oah_guest_access(
+                            img, g_lo + q, OAH_X86_PAGE_SIZE, PROT_READ);
+                        if (src) {
+                            memcpy(dst + q, src, OAH_X86_PAGE_SIZE);
+                        }
+                    }
+                    munmap((void *)p, ps);
+                    void *rep = mmap((void *)p, ps, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                     -1, 0);
+                    if (rep != (void *)p) {
+                        ok = false;
+                        error = rep == MAP_FAILED ? errno : ENOMEM;
+                        break;
+                    }
+                    memcpy((void *)p, dst, ps);
                 }
                 free(staged);
-                if (!loaded) {
+                if (!ok) {
                     return linux_error(error);
                 }
-            } else {
-                memset(seg->host + left, 0, size);
+                oah_jit_cache_flush("map-fixed");
             }
             split_mapping(img, i, address, size, (u32)prot);
             img->segs[i + (left != 0)].file_mapping = file;
@@ -1863,7 +1977,8 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
     if (file && (flags & 0x01)) {
         /* MAP_SHARED on a file: hand the guest a genuinely shared host
          * mapping so writes reach the file (gdbm database updates). */
-        backing = mmap(NULL, size, (int)prot, MAP_SHARED, fd, (off_t)offset);
+        backing = mmap(NULL, size, host_prot_for(prot), MAP_SHARED, fd,
+                       (off_t)offset);
     } else {
         backing = mmap(NULL, size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1881,6 +1996,11 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
         .file_mapping = file, .allocation = backing, .allocation_size = size,
         .module = -1
     };
+    if (!(file && (flags & 0x01))) {
+        /* Anonymous/private backing starts RW for staging; then mirror
+         * the guest protections so JIT'd accesses fault like the interp. */
+        host_sync_prot(img, (u64)(uintptr_t)backing, size);
+    }
     if (file) {
         tag_mapped_module(img, (u64)(uintptr_t)backing, size, fd);
     }
@@ -1975,6 +2095,11 @@ static s64 memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool unmap
                 }
                 *seg = img->segs[--img->nseg];
             }
+            /* The guest range is gone but the host allocation usually
+             * stays — deny host access over it so JIT'd loads/stores to
+             * the unmapped range fault instead of touching stale
+             * memory. Whole-allocation unmaps already munmap'd it. */
+            host_sync_prot(img, addr, len);
             return 0;
         }
         return -EINVAL;
@@ -2022,7 +2147,9 @@ static s64 guest_mremap(oah_image *img, u64 address, u64 prior, u64 requested, u
             }
         }
         if (requested <= prior) {
+            /* Shrunk tail stays allocated but is gone for the guest. */
             seg->size = requested;
+            host_sync_prot(img, address + requested, prior - requested);
             return (s64)address;
         }
         if (!(flags & 1)) {
@@ -2042,6 +2169,7 @@ static s64 guest_mremap(oah_image *img, u64 address, u64 prior, u64 requested, u
         seg->host = seg->allocation = replacement;
         seg->gva = (u64)(uintptr_t)replacement;
         seg->size = seg->allocation_size = requested;
+        host_sync_prot(img, seg->gva, requested);
         return (s64)seg->gva;
     }
     return -EFAULT;
