@@ -43,8 +43,12 @@ Then refresh the Desktop shortcuts so new executables appear:
 
 ## Installing Attesor (end users)
 
-One-liner — installs XQuartz via Homebrew, then the app from GitHub
-Releases:
+Homebrew (pulls in XQuartz automatically):
+
+    brew install --cask rbrtjns90/tap/attesor
+
+Or the one-liner — installs XQuartz via Homebrew, then the app from
+GitHub Releases:
 
     curl -fsSL https://raw.githubusercontent.com/rbrtjns90/attesor/main/runtime-src/install.sh | bash
 
@@ -62,9 +66,9 @@ The downloaded tree is repo-shaped (`reconstruct/`, `runtime/`,
 `runtime-src/`) so every script and bundle resolves paths the same way
 as a dev checkout; `Repo.root` prefers the Application Support copy.
 
-Homebrew cask: `Casks/attesor.rb` — intended for a tap (e.g.
-`brew install --cask rbrtjns90/tap/attesor`); it declares the xquartz
-dependency and `zap`s the runtime data on uninstall.
+Homebrew cask: `Casks/attesor.rb` — the canonical copy lives in the tap
+repo `rbrtjns90/homebrew-tap`; this one is the template. It declares
+the xquartz dependency and `zap`s the runtime data on uninstall.
 
 ## Cutting a release
 

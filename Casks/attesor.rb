@@ -1,6 +1,6 @@
 cask "attesor" do
   version "0.1.0"
-  sha256 :no_check   # set to the DMG sha256 from SHA256SUMS at release time
+  sha256 "392716c080ee073086ab8cae94c71a76329aaffa699b126bdb00e8ae21b15a0a"
 
   url "https://github.com/rbrtjns90/attesor/releases/download/v#{version}/Attesor-v#{version}.dmg"
   name "Attesor"
