@@ -367,6 +367,129 @@ static u32 mem_size_log2(u8 width)
 /* Scratch regs reserved for the flag-merge helpers (never operand regs). */
 enum { M1 = 27, M2 = 28 };
 
+/* --- Guest flag liveness ----------------------------------------------------
+ * The translator used to rematerialize every produced flag field into the
+ * x19 shadow (F_RF) after each arithmetic/logic instruction — ~10-14 host
+ * insns per guest op whether or not anything ever reads them. A per-fragment
+ * liveness pre-pass now computes which produced fields reach a consumer (or
+ * the fragment exit, which needs a complete shadow for interp handoff), and
+ * producers merge only those. Producers still emit the flag-setting host
+ * op, so NZCV stays live: flag consumers (jcc/setcc/cmov) test NZCV
+ * directly whenever the fields they read were produced in it.
+ *
+ * Masks use the guest rflags bit positions for the six status flags. */
+#define OAH_FL_CF   0x001u
+#define OAH_FL_PF   0x004u
+#define OAH_FL_AF   0x010u
+#define OAH_FL_ZF   0x040u
+#define OAH_FL_SF   0x080u
+#define OAH_FL_OF   0x800u
+#define OAH_FL_ALL  0x8d5u
+#define OAH_FL_NZCV (OAH_FL_CF | OAH_FL_ZF | OAH_FL_SF | OAH_FL_OF)
+
+/* Which guest flag fields currently live in host NZCV, and the C polarity
+ * (1 = C holds !guestCF — the sub/cmp/restore convention). PF/AF are never
+ * NZCV-resident. */
+static __thread u16 nzcv_fields;
+static __thread int nzcv_cfinv;
+
+/* Per-insn merge masks from the liveness pre-pass, indexed by the emit
+ * loop's insn counter; uncovered insns fall back to ALL (eager merge). */
+#define OAH_FLAG_SCAN_MAX 256
+static __thread oah_insn frag_pins[OAH_FLAG_SCAN_MAX];
+static __thread u16 frag_frd[OAH_FLAG_SCAN_MAX];
+static __thread u16 frag_fwr[OAH_FLAG_SCAN_MAX];
+static __thread u16 frag_fmerge[OAH_FLAG_SCAN_MAX];
+static __thread unsigned frag_fmerge_n;
+
+/* x86 condition code -> guest flag fields it reads. */
+static u16 cc_flag_mask(u8 cc)
+{
+    switch (cc & 0xf) {
+    case 0: case 1:   return OAH_FL_OF;
+    case 2: case 3:   return OAH_FL_CF;
+    case 4: case 5:   return OAH_FL_ZF;
+    case 6: case 7:   return OAH_FL_CF | OAH_FL_ZF;
+    case 8: case 9:   return OAH_FL_SF;
+    case 10: case 11: return OAH_FL_PF;
+    default:          return OAH_FL_ZF | OAH_FL_SF | OAH_FL_OF;
+    }
+}
+
+/* Flag read/write masks (status fields only) for the liveness pre-pass.
+ * Anything that may take an interpreter boundary reads ALL: the exit then
+ * forces preceding producers to leave F_RF complete. */
+static void insn_flag_masks(const oah_insn *in, u16 *rd, u16 *wr)
+{
+    *rd = 0;
+    *wr = 0;
+    switch (in->op) {
+    case OAH_OP_XOR_RR: case OAH_OP_CMP_RR: case OAH_OP_CMP_IMM:
+    case OAH_OP_TEST_RR:
+        *wr = OAH_FL_ALL;
+        return;
+    case OAH_OP_JCC_REL: case OAH_OP_RET:
+    case OAH_OP_JMP_REL: case OAH_OP_CALL_REL:
+        *rd = OAH_FL_ALL;            /* fragment exit */
+        return;
+    case OAH_OP_FLAGS_STACK:
+        *rd = OAH_FL_ALL;            /* pushf reads the whole shadow */
+        return;
+    case OAH_OP_SCALAR:
+        switch (in->scalar) {
+        case OAH_SC_MOV: case OAH_SC_LEA: case OAH_SC_MOVSX:
+        case OAH_SC_MOVZX: case OAH_SC_NOT: case OAH_SC_BSWAP:
+        case OAH_SC_PUSH: case OAH_SC_XCHG:
+            return;
+        case OAH_SC_DIV:
+            *rd = OAH_FL_ALL;        /* internal #DE bail exits to interp */
+            return;
+        case OAH_SC_ADD: case OAH_SC_SUB: case OAH_SC_CMP:
+        case OAH_SC_OR: case OAH_SC_AND: case OAH_SC_XOR:
+        case OAH_SC_TEST: case OAH_SC_NEG:
+        case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR:
+            *wr = OAH_FL_ALL;
+            return;
+        case OAH_SC_INC: case OAH_SC_DEC:
+            *wr = OAH_FL_ALL & ~OAH_FL_CF;
+            return;
+        case OAH_SC_IMUL:
+            *wr = OAH_FL_CF | OAH_FL_OF;
+            return;
+        case OAH_SC_ROL: case OAH_SC_ROR:
+            if (in->opsize < 4) {
+                *rd = OAH_FL_ALL;    /* narrow widths -> interp boundary */
+            }
+            *wr = OAH_FL_CF | OAH_FL_OF;
+            return;
+        case OAH_SC_BSF: case OAH_SC_BSR:
+            *wr = OAH_FL_ZF;
+            return;
+        case OAH_SC_SETCC: case OAH_SC_CMOV:
+            /* P/NP conds are always interp-boundary in the emit loop. */
+            *rd = (in->cc & 0xfe) == 10 ? OAH_FL_ALL : cc_flag_mask(in->cc);
+            return;
+        case OAH_SC_JMP: case OAH_SC_CALL:
+            *rd = OAH_FL_ALL;        /* fragment exit */
+            return;
+        default:
+            *rd = OAH_FL_ALL;        /* unsupported scalar -> boundary */
+            return;
+        }
+    case OAH_OP_MOV_IMM: case OAH_OP_MOV_RR: case OAH_OP_LEA_RIP:
+    case OAH_OP_PUSH: case OAH_OP_PUSH_IMM: case OAH_OP_POP:
+    case OAH_OP_NOP: case OAH_OP_ENDBR64: case OAH_OP_LEAVE:
+    case OAH_OP_SIGN_HIGH: case OAH_OP_SET_DIRECTION:
+    case OAH_OP_STORE_FENCE:
+        return;
+    default:
+        /* vector/string/x87/syscall/etc.: no flags of its own, but a
+         * possible interp boundary => complete shadow needed. */
+        *rd = OAH_FL_ALL;
+        return;
+    }
+}
+
 /* PF = even parity of res low byte -> x19 bit 2. Scratch: M2. */
 static bool emit_parity(oah_asm_buf *buf, u8 res)
 {
@@ -379,25 +502,36 @@ static bool emit_parity(oah_asm_buf *buf, u8 res)
 }
 
 /*
- * Merge host NZCV into guest RFLAGS (x19). Sets CF,PF,AF,ZF,SF,OF.
+ * Merge the live subset of host NZCV into guest RFLAGS (x19).
  * res = masked result reg (low byte feeds PF).
  * lhs/rhs = masked operand regs feeding AF (lhs^rhs^res bit 4).
  * invert_cf: host C is not-borrow for subs → flip.
- * keep_cf: inc/dec leave guest CF alone.
- * set_af: write AF from operands (cleared by logic ops).
+ * set_af: write AF from operands when live (cleared by logic ops —
+ *         the base mask clears AF either way).
+ * mask: produced fields that are live — only those are written to F_RF.
  */
 static bool emit_merge_arith(oah_asm_buf *buf, u8 res, u8 lhs, u8 rhs,
-                             bool invert_cf, bool keep_cf, bool set_af)
+                             bool invert_cf, bool set_af, u16 mask)
 {
-    if (!oah_emit_mrs_nzcv(buf, M1) ||
-        !oah_emit_movn(buf, true, M2, 0, 0x8d5 - (keep_cf ? 1 : 0)) ||
-        !oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, M2, 0, 0) ||
-        !frag_ubfx(buf, M2, M1, 30, 2) ||          /* N,Z -> 6,7 */
-        !frag_lsl(buf, false, M2, M2, 6) ||
-        !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, M2, 0, 0)) {
+    if (!mask) {
+        return true;                        /* all produced flags dead */
+    }
+    u16 nz = mask & OAH_FL_NZCV;
+    if (!oah_emit_movn(buf, true, M2, 0, mask) ||
+        !oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, M2, 0, 0)) {
         return false;
     }
-    if (!keep_cf) {
+    if (nz && !oah_emit_mrs_nzcv(buf, M1)) {
+        return false;
+    }
+    if (nz & (OAH_FL_SF | OAH_FL_ZF)) {
+        if (!frag_ubfx(buf, M2, M1, 30, 2) ||          /* N,Z -> 6,7 */
+            !frag_lsl(buf, false, M2, M2, 6) ||
+            !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, M2, 0, 0)) {
+            return false;
+        }
+    }
+    if (nz & OAH_FL_CF) {
         if (!frag_ubfx(buf, M2, M1, 29, 1)) {
             return false;
         }
@@ -409,12 +543,16 @@ static bool emit_merge_arith(oah_asm_buf *buf, u8 res, u8 lhs, u8 rhs,
             return false;
         }
     }
-    if (!frag_ubfx(buf, M2, M1, 28, 1) ||
-        !frag_bfi(buf, F_RF, M2, 11, 1) ||
-        !emit_parity(buf, res)) {
+    if (nz & OAH_FL_OF) {
+        if (!frag_ubfx(buf, M2, M1, 28, 1) ||
+            !frag_bfi(buf, F_RF, M2, 11, 1)) {
+            return false;
+        }
+    }
+    if ((mask & OAH_FL_PF) && !emit_parity(buf, res)) {
         return false;
     }
-    if (set_af) {
+    if ((mask & OAH_FL_AF) && set_af) {
         if (!oah_emit_logic_reg(buf, OAH_LOGIC_EOR, true, M2, lhs, rhs, 0, 0) ||
             !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, true, M2, M2, res, 0, 0) ||
             !frag_ubfx(buf, M2, M2, 4, 1) ||
@@ -425,26 +563,37 @@ static bool emit_merge_arith(oah_asm_buf *buf, u8 res, u8 lhs, u8 rhs,
     return true;
 }
 
-/* SZP flags for a masked result; clears CF|OF|AF (logical op semantics). */
-static bool emit_merge_logic(oah_asm_buf *buf, u8 res, u8 width)
+/* SZP flags for a masked result; clears the live subset of CF|OF|AF
+ * (logical op semantics) and merges live SF/ZF/PF. mask==0 skips all
+ * flag work — and leaves NZCV alone since the ANDS is skipped too. */
+static bool emit_merge_logic(oah_asm_buf *buf, u8 res, u8 width, u16 mask)
 {
-    /* Position the result's sign bit for the flag producer. */
-    u8 t = M1;
-    if (width < 4) {
-        if (!frag_lsl(buf, false, t, res, 32 - 8 * width)) {
+    if (!mask) {
+        return true;
+    }
+    if (!oah_emit_movn(buf, true, M2, 0, mask) ||
+        !oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, M2, 0, 0)) {
+        return false;
+    }
+    if (mask & (OAH_FL_SF | OAH_FL_ZF)) {
+        /* Position the result's sign bit for the flag producer. */
+        u8 t = M1;
+        if (width < 4) {
+            if (!frag_lsl(buf, false, t, res, 32 - 8 * width)) {
+                return false;
+            }
+        } else {
+            t = res;
+        }
+        if (!oah_emit_logic_reg(buf, OAH_LOGIC_ANDS, width == 8, 31, t, t, 0, 0) ||
+            !oah_emit_mrs_nzcv(buf, M1) ||
+            !frag_ubfx(buf, M2, M1, 30, 2) ||
+            !frag_lsl(buf, false, M2, M2, 6) ||
+            !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, M2, 0, 0)) {
             return false;
         }
-    } else {
-        t = res;
     }
-    if (!oah_emit_logic_reg(buf, OAH_LOGIC_ANDS, width == 8, 31, t, t, 0, 0) ||
-        !oah_emit_mrs_nzcv(buf, M1) ||
-        !oah_emit_movn(buf, true, M2, 0, 0x8d5) ||
-        !oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, M2, 0, 0) ||
-        !frag_ubfx(buf, M2, M1, 30, 2) ||
-        !frag_lsl(buf, false, M2, M2, 6) ||
-        !oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, M2, 0, 0) ||
-        !emit_parity(buf, res)) {
+    if ((mask & OAH_FL_PF) && !emit_parity(buf, res)) {
         return false;
     }
     return true;
@@ -469,12 +618,12 @@ static bool emit_arith_compute(oah_asm_buf *buf, bool is_sub, u8 res_r,
                                 lhs_r, rhs_r, 0, 0);
 }
 
-/* ADD/SUB/CMP family with full flag merge; res_r = result. */
+/* ADD/SUB/CMP family with a live-masked flag merge; res_r = result. */
 static bool emit_arith_flags(oah_asm_buf *buf, bool is_sub, u8 res_r,
-                             u8 lhs_r, u8 rhs_r, u8 width, bool keep_cf)
+                             u8 lhs_r, u8 rhs_r, u8 width, u16 mask)
 {
     return emit_arith_compute(buf, is_sub, res_r, lhs_r, rhs_r, width) &&
-           emit_merge_arith(buf, res_r, lhs_r, rhs_r, is_sub, keep_cf, true);
+           emit_merge_arith(buf, res_r, lhs_r, rhs_r, is_sub, true, mask);
 }
 
 /* Build host NZCV from guest RFLAGS into scratch t, then msr. */
@@ -503,6 +652,48 @@ static u32 arm_cond_for_x86(u8 cc)
         0xb /*LT*/, 0xa /*GE*/, 0xd /*LE*/, 0xc /*GT*/
     };
     return cc < 16 ? map[cc] : 0xe;
+}
+
+/* Same mapping under the carry polarity of the live NZCV producer.
+ * cfinv=0 means C == guest CF (add/logic producers): CF-only conds swap,
+ * CF+ZF conds (BE/A) have no single ARM encoding -> 0xff (materialize). */
+static u32 arm_cond_pol(u8 cc, int cfinv)
+{
+    static const u8 map0[16] = {
+        0x6 /*VS*/, 0x7 /*VC*/, 0x2 /*CS*/, 0x3 /*CC*/,
+        0x0 /*EQ*/, 0x1 /*NE*/, 0xff, 0xff,
+        0x4 /*MI*/, 0x5 /*PL*/, 0xff, 0xff,
+        0xb /*LT*/, 0xa /*GE*/, 0xd /*LE*/, 0xc /*GT*/
+    };
+    if (cfinv) {
+        return arm_cond_for_x86(cc);
+    }
+    return cc < 16 ? map0[cc & 0xf] : 0xe;
+}
+
+/*
+ * Prepare flags for a conditional consumer: when every field the cc reads
+ * still lives in host NZCV, just return the matching ARM cond (free);
+ * otherwise rebuild NZCV from the F_RF shadow (the materialized value
+ * uses the !CF convention, so the standard map applies afterward).
+ */
+static bool emit_flags_for_cc(oah_asm_buf *buf, u8 cc, u32 *cond)
+{
+    u16 need = cc_flag_mask(cc);
+    if ((need & ~nzcv_fields) == 0) {
+        u32 c = arm_cond_pol(cc, nzcv_cfinv);
+        if (c != 0xff) {
+            *cond = c;
+            return true;
+        }
+    }
+    if (!emit_rflags_to_nzcv(buf, T4)) {
+        return false;
+    }
+    nzcv_fields = OAH_FL_NZCV;
+    nzcv_cfinv = 1;
+    *cond = arm_cond_for_x86(cc);
+    return true;
 }
 
 static bool emit_xmm_spill(oah_asm_buf *buf, const oah_guest *g);
@@ -606,7 +797,7 @@ static bool frag_scalar_supported(const oah_insn *in)
 }
 
 static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
-                                  const oah_insn *in, u64 next)
+                                  const oah_insn *in, u64 next, u16 fmask)
 {
     u8 width = in->opsize;
 
@@ -685,32 +876,42 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
         u8 r = in->immediate ? T7 : rhs;
         switch (in->scalar) {
         case OAH_SC_ADD:
-            if (!emit_arith_flags(buf, false, res, lhs, r, width, false)) {
+            if (!emit_arith_flags(buf, false, res, lhs, r, width, fmask)) {
                 return false;
             }
+            nzcv_fields = OAH_FL_NZCV;
+            nzcv_cfinv = 0;
             break;
         case OAH_SC_SUB: case OAH_SC_CMP:
-            if (!emit_arith_flags(buf, true, res, lhs, r, width, false)) {
+            if (!emit_arith_flags(buf, true, res, lhs, r, width, fmask)) {
                 return false;
             }
+            nzcv_fields = OAH_FL_NZCV;
+            nzcv_cfinv = 1;
             break;
         case OAH_SC_OR:
             if (!oah_emit_logic_reg(buf, OAH_LOGIC_ORR, width == 8, res, lhs, r, 0, 0) ||
-                !emit_merge_logic(buf, res, width)) {
+                !emit_merge_logic(buf, res, width, fmask)) {
                 return false;
             }
+            nzcv_fields = (fmask & (OAH_FL_SF | OAH_FL_ZF)) ? OAH_FL_NZCV : 0;
+            nzcv_cfinv = 0;
             break;
         case OAH_SC_AND: case OAH_SC_TEST:
             if (!oah_emit_logic_reg(buf, OAH_LOGIC_AND, width == 8, res, lhs, r, 0, 0) ||
-                !emit_merge_logic(buf, res, width)) {
+                !emit_merge_logic(buf, res, width, fmask)) {
                 return false;
             }
+            nzcv_fields = (fmask & (OAH_FL_SF | OAH_FL_ZF)) ? OAH_FL_NZCV : 0;
+            nzcv_cfinv = 0;
             break;
         case OAH_SC_XOR:
             if (!oah_emit_logic_reg(buf, OAH_LOGIC_EOR, width == 8, res, lhs, r, 0, 0) ||
-                !emit_merge_logic(buf, res, width)) {
+                !emit_merge_logic(buf, res, width, fmask)) {
                 return false;
             }
+            nzcv_fields = (fmask & (OAH_FL_SF | OAH_FL_ZF)) ? OAH_FL_NZCV : 0;
+            nzcv_cfinv = 0;
             break;
         default:
             return false;
@@ -736,14 +937,22 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                                                res, lhs, 1, 0)) {
             return false;
         }
-        return emit_merge_arith(buf, res, lhs, res, dec, true, true) &&
+        /* S-form compute leaves N,Z,V valid in NZCV; C is the inc/dec
+         * carry, not guest CF — don't claim it. */
+        nzcv_fields = OAH_FL_SF | OAH_FL_ZF | OAH_FL_OF;
+        return emit_merge_arith(buf, res, lhs, res, dec, true,
+                                fmask & ~OAH_FL_CF) &&
                emit_store_result(buf, in, res, T0);
     }
     case OAH_SC_NEG:
         /* res = 0 - lhs; flags = cmp(0,lhs); AF = lhs^res */
-        return emit_arith_compute(buf, true, res, 31, lhs, width) &&
-               emit_merge_arith(buf, res, 31, lhs, true, false, true) &&
-               emit_store_result(buf, in, res, T0);
+        if (!emit_arith_compute(buf, true, res, 31, lhs, width) ||
+            !emit_merge_arith(buf, res, 31, lhs, true, true, fmask)) {
+            return false;
+        }
+        nzcv_fields = OAH_FL_NZCV;
+        nzcv_cfinv = 1;
+        return emit_store_result(buf, in, res, T0);
     case OAH_SC_NOT:
         return oah_emit_orn(buf, width == 8, res, 31, lhs, 0, 0) &&
                emit_store_result(buf, in, res, T0);
@@ -772,13 +981,17 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
             }
         }
         /* c = !Z (high != sign-extension of res) -> CF and OF */
-        return oah_emit_csinc(buf, false, T4, 31, 31, 0 /*EQ*/) &&
-               oah_emit_movn(buf, true, T5, 0, 0x801) &&
-               oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, T5, 0, 0) &&
-               frag_lsl(buf, false, T5, T4, 11) &&
-               oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, T5, T5, T4, 0, 0) &&
-               oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, T5, 0, 0) &&
-               emit_store_result(buf, in, res, T0);
+        nzcv_fields = 0;                    /* cmp_reg clobbered NZCV */
+        if ((fmask & (OAH_FL_CF | OAH_FL_OF)) &&
+            !(oah_emit_csinc(buf, false, T4, 31, 31, 0 /*EQ*/) &&
+              oah_emit_movn(buf, true, T5, 0, 0x801) &&
+              oah_emit_logic_reg(buf, OAH_LOGIC_AND, true, F_RF, F_RF, T5, 0, 0) &&
+              frag_lsl(buf, false, T5, T4, 11) &&
+              oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, T5, T5, T4, 0, 0) &&
+              oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, F_RF, F_RF, T5, 0, 0))) {
+            return false;
+        }
+        return emit_store_result(buf, in, res, T0);
     }
     case OAH_SC_SHL: case OAH_SC_SHR: case OAH_SC_SAR: {
         u32 bits = width * 8;
@@ -803,13 +1016,14 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                 op = T5;
             }
             if (!oah_emit_shift_var(buf, width == 8, kind, res, op, T4) ||
-                !emit_merge_logic(buf, res, width)) {
+                !emit_merge_logic(buf, res, width, fmask)) {
                 return false;
             }
+            nzcv_fields = 0;
             /* CF = bit(bits-cnt) [SHL] or bit(cnt-1) [SHR/SAR] of lhs;
              * defined only when cnt <= bits (undefined otherwise). */
             u64 skip_cf = 0;
-            if (bits < 32) {
+            if ((fmask & OAH_FL_CF) && bits < 32) {
                 if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
                                                 T4, bits, 0)) {
                     return false;
@@ -819,18 +1033,23 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                     return false;
                 }
             }
-            if (kind == 0) {
-                if (!frag_movi(buf, T5, bits) ||
-                    !oah_emit_add_sub_reg(buf, false, true, false, T5, T5,
-                                          T4, 0, 0)) {
+            /* SHL's OF reads F_RF.CF, so the CF bit is needed when
+             * either field is live (over-storing a dead CF is harmless —
+             * it is the produced value anyway). */
+            if (fmask & (OAH_FL_CF | OAH_FL_OF)) {
+                if (kind == 0) {
+                    if (!frag_movi(buf, T5, bits) ||
+                        !oah_emit_add_sub_reg(buf, false, true, false, T5, T5,
+                                              T4, 0, 0)) {
+                        return false;
+                    }
+                } else if (!oah_emit_add_sub_imm(buf, false, true, T5, T4, 1)) {
                     return false;
                 }
-            } else if (!oah_emit_add_sub_imm(buf, false, true, T5, T4, 1)) {
-                return false;
-            }
-            if (!oah_emit_shift_var(buf, width == 8, 1, T7, lhs, T5) ||
-                !frag_bfi(buf, F_RF, T7, 0, 1)) {
-                return false;
+                if (!oah_emit_shift_var(buf, width == 8, 1, T7, lhs, T5) ||
+                    !frag_bfi(buf, F_RF, T7, 0, 1)) {
+                    return false;
+                }
             }
             if (skip_cf) {
                 oah_asm_patch32(buf, skip_cf,
@@ -839,7 +1058,7 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                                 OAH_ARM_HI);
             }
             /* OF on cnt==1: SHR = sign(lhs); SHL = sign(res)^CF. */
-            if (kind != 2) {
+            if ((fmask & OAH_FL_OF) && kind != 2) {
                 if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
                                                 T4, 1, 0)) {
                     return false;
@@ -913,12 +1132,14 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                 return false;
             }
         }
-        if (!emit_merge_logic(buf, res, width)) {
+        if (!emit_merge_logic(buf, res, width, fmask)) {
             return false;
         }
+        nzcv_fields = 0;
         /* CF = bit(bits-count) [SHL] or bit(count-1) [SHR/SAR] of lhs,
-         * only when the masked count doesn't exceed the operand width. */
-        if (raw_count <= bits) {
+         * only when the masked count doesn't exceed the operand width.
+         * Computed when CF or OF is live (SHL's OF reads F_RF.CF). */
+        if ((fmask & (OAH_FL_CF | OAH_FL_OF)) && raw_count <= bits) {
             u32 bit = kind == 0 ? bits - raw_count : raw_count - 1;
             if (!oah_emit_ubfm(buf, width == 8, T4, lhs, bit, bit) ||
                 !frag_bfi(buf, F_RF, T4, 0, 1)) {
@@ -926,7 +1147,7 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
             }
         }
         /* OF on count==1: SHR = sign(lhs); SHL = sign(res)^CF; SAR unchanged. */
-        if (raw_count == 1 && kind != 2) {
+        if ((fmask & OAH_FL_OF) && raw_count == 1 && kind != 2) {
             if (kind == 1) {
                 if (!oah_emit_ubfm(buf, width == 8, T4, lhs,
                                    bits - 1, bits - 1) ||
@@ -1082,43 +1303,47 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
             if (!oah_emit_shift_var(buf, width == 8, 3, res, lhs, amount)) {
                 return false;
             }
+            nzcv_fields = 0;
             /* CF = res&1 [ROL] or res>>(bits-1) [ROR]. */
-            if (!oah_emit_ubfm(buf, width == 8, T7, res,
-                               left ? 0 : bits - 1, left ? 0 : bits - 1) ||
-                !frag_bfi(buf, F_RF, T7, 0, 1)) {
+            if ((fmask & OAH_FL_CF) &&
+                (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                left ? 0 : bits - 1, left ? 0 : bits - 1) ||
+                 !frag_bfi(buf, F_RF, T7, 0, 1))) {
                 return false;
             }
             /* OF (masked==1): ROL = msb^CF; ROR = msb^(msb-1). */
-            if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
-                                            T4, 1, 0)) {
-                return false;
-            }
-            u64 skip_of = buf->size;
-            if (!oah_emit_bcond(buf, OAH_ARM_NE, 0)) {
-                return false;
-            }
-            if (left) {
-                if (!oah_emit_ubfm(buf, width == 8, T7, res,
-                                   bits - 1, bits - 1) ||
-                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T7, T7,
-                                        res, 0, 0) ||
-                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
+            if (fmask & OAH_FL_OF) {
+                if (!oah_emit_add_sub_imm_flags(buf, false, true, true, 31,
+                                                T4, 1, 0)) {
                     return false;
                 }
-            } else {
-                if (!frag_lsr(buf, width == 8, T7, res, 1) ||
-                    !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, width == 8,
-                                        T7, T7, res, 0, 0) ||
-                    !oah_emit_ubfm(buf, width == 8, T7, T7,
-                                   bits - 2, bits - 2) ||
-                    !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                u64 skip_of = buf->size;
+                if (!oah_emit_bcond(buf, OAH_ARM_NE, 0)) {
                     return false;
                 }
+                if (left) {
+                    if (!oah_emit_ubfm(buf, width == 8, T7, res,
+                                       bits - 1, bits - 1) ||
+                        !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, false, T7, T7,
+                                            res, 0, 0) ||
+                        !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                        return false;
+                    }
+                } else {
+                    if (!frag_lsr(buf, width == 8, T7, res, 1) ||
+                        !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, width == 8,
+                                            T7, T7, res, 0, 0) ||
+                        !oah_emit_ubfm(buf, width == 8, T7, T7,
+                                       bits - 2, bits - 2) ||
+                        !frag_bfi(buf, F_RF, T7, 11, 1)) {
+                        return false;
+                    }
+                }
+                oah_asm_patch32(buf, skip_of,
+                                0x54000000u |
+                                (((u32)(buf->size - skip_of) >> 2) << 5) |
+                                OAH_ARM_NE);
             }
-            oah_asm_patch32(buf, skip_of,
-                            0x54000000u |
-                            (((u32)(buf->size - skip_of) >> 2) << 5) |
-                            OAH_ARM_NE);
             if (!emit_store_result(buf, in, res, T0)) {
                 return false;
             }
@@ -1147,12 +1372,14 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                 return false;
             }
         }
-        if (!oah_emit_ubfm(buf, width == 8, T7, res,
-                           left ? 0 : bits - 1, left ? 0 : bits - 1) ||
-            !frag_bfi(buf, F_RF, T7, 0, 1)) {
+        nzcv_fields = 0;
+        if ((fmask & OAH_FL_CF) &&
+            (!oah_emit_ubfm(buf, width == 8, T7, res,
+                            left ? 0 : bits - 1, left ? 0 : bits - 1) ||
+             !frag_bfi(buf, F_RF, T7, 0, 1))) {
             return false;
         }
-        if (masked == 1) {
+        if ((fmask & OAH_FL_OF) && masked == 1) {
             if (left) {
                 if (!oah_emit_ubfm(buf, width == 8, T7, res,
                                    bits - 1, bits - 1) ||
@@ -1180,9 +1407,11 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
          * ZF=1 and dest unchanged; else ZF=0 and res = lowest/highest
          * set-bit index. Other flags are undefined on x86 — untouched. */
         bool is64 = width == 8;
-        if (!oah_emit_add_sub_imm_flags(buf, is64, true, true, 31, T1, 0, 0) ||
-            !oah_emit_csinc(buf, false, T4, 31, 31, OAH_ARM_NE) ||
-            !frag_bfi(buf, F_RF, T4, 6, 1)) {
+        nzcv_fields = 0;
+        if ((fmask & OAH_FL_ZF) &&
+            (!oah_emit_add_sub_imm_flags(buf, is64, true, true, 31, T1, 0, 0) ||
+             !oah_emit_csinc(buf, false, T4, 31, 31, OAH_ARM_NE) ||
+             !frag_bfi(buf, F_RF, T4, 6, 1))) {
             return false;
         }
         u64 skip_store = buf->size;
@@ -1221,18 +1450,17 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
     case OAH_SC_BSWAP:
         return oah_emit_rev(buf, width == 8, res, lhs) &&
                emit_store_result(buf, in, res, T0);
-    case OAH_SC_SETCC:
-        return emit_rflags_to_nzcv(buf, T4) &&
-               oah_emit_csinc(buf, false, res, 31, 31,
-                              arm_cond_for_x86(in->cc) ^ 1) &&
+    case OAH_SC_SETCC: {
+        u32 cond;
+        return emit_flags_for_cc(buf, in->cc, &cond) &&
+               oah_emit_csinc(buf, false, res, 31, 31, cond ^ 1) &&
                emit_store_result(buf, in, res, T0);
+    }
     case OAH_SC_CMOV: {
         /* csel res = cond ? rm(T1) : dst(T2). */
-        if (!emit_rflags_to_nzcv(buf, T4)) {
-            return false;
-        }
-        u32 cond = arm_cond_for_x86(in->cc);
-        return oah_emit_csel(buf, width == 8, res, T1, T2, cond) &&
+        u32 cond;
+        return emit_flags_for_cc(buf, in->cc, &cond) &&
+               oah_emit_csel(buf, width == 8, res, T1, T2, cond) &&
                emit_store_result(buf, in, res, T0);
     }
     case OAH_SC_PUSH:
@@ -1680,6 +1908,56 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         const char *e = getenv("OAH_JIT_FRAGLEN");
         max_insns = e ? atoi(e) : 96;
     }
+
+    /* Flag liveness pre-pass: decode the fragment's insn stream the same
+     * way the emit loop will, then propagate F_RF needs backward from the
+     * exit (which requires a complete shadow). A producer merges only the
+     * fields in frag_fmerge[i]; dead flag work drops to zero host insns.
+     * Disabled under VERIFY (dead fields stay stale, the verifier compares
+     * full rflags) and under the OAH_JIT_NO* bisection gates, which create
+     * unpredictable interp boundaries. OAH_JIT_NOFLAGS also forces eager
+     * merges for A/B debugging. */
+    static int flag_live_on = -1;
+    if (flag_live_on < 0) {
+        flag_live_on = !getenv("OAH_JIT_VERIFY") &&
+                       !getenv("OAH_JIT_NOFLAGS") &&
+                       !getenv("OAH_JIT_NOSTORE") && !getenv("OAH_JIT_NOLOAD") &&
+                       !getenv("OAH_JIT_NOCTRL") && !getenv("OAH_JIT_NOALU") &&
+                       !getenv("OAH_JIT_NOALL") && !getenv("OAH_JIT_NORMW") &&
+                       !getenv("OAH_JIT_NOJCC") && !getenv("OAH_JIT_NOCALL") &&
+                       !getenv("OAH_JIT_RMWTRACE");
+    }
+    nzcv_fields = 0;
+    nzcv_cfinv = 0;
+    frag_fmerge_n = 0;
+    if (flag_live_on && max_insns > 0) {
+        u64 c = rip;
+        unsigned k = 0;
+        bool term = false;
+        for (; k < (unsigned)max_insns && k < OAH_FLAG_SCAN_MAX && !term; k++) {
+            u64 avail = OAH_X86_MAX_INSN;
+            const u8 *p = oah_guest_span(img, c, &avail);
+            oah_insn *pi = &frag_pins[k];
+            if (!p || !oah_guest_access(img, c, 1, PROT_EXEC) ||
+                !oah_decode_insn(p, p + avail, pi)) {
+                break;
+            }
+            insn_flag_masks(pi, &frag_frd[k], &frag_fwr[k]);
+            c += pi->length;
+            term = pi->op == OAH_OP_RET || pi->op == OAH_OP_JMP_REL ||
+                   pi->op == OAH_OP_CALL_REL || pi->op == OAH_OP_JCC_REL ||
+                   (pi->op == OAH_OP_SCALAR &&
+                    (pi->scalar == OAH_SC_JMP || pi->scalar == OAH_SC_CALL));
+        }
+        frag_fmerge_n = k;
+        /* live = fields whose value must be correct in F_RF for later
+         * readers; the fragment exit (seeded below) needs all six. */
+        u16 live = OAH_FL_ALL;
+        for (unsigned i = k; i-- > 0;) {
+            frag_fmerge[i] = (u16)(frag_fwr[i] & live);
+            live = (u16)((live & ~frag_fwr[i]) | frag_frd[i]);
+        }
+    }
     while (n < (unsigned)max_insns) {
         u64 available = OAH_X86_MAX_INSN;
         const u8 *pc = oah_guest_span(img, cur, &available);
@@ -1697,6 +1975,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         u8 rsp = xn(OAH_X86_RSP);
         bool done = false;
         bool boundary_interp = false;
+        u16 fmask = (n < frag_fmerge_n) ? frag_fmerge[n] : OAH_FL_ALL;
         u64 insn_start = buf->size;
         u32 reloc_start = info->nrelocs;
         u32 reloc_overflow_start = info->reloc_overflow;
@@ -1791,10 +2070,12 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                 !emit_read_gpr(buf, T2, in.src, in.opsize, in.rex_present) ||
                 !oah_emit_logic_reg(buf, OAH_LOGIC_EOR, in.opsize == 8,
                                     T6, T1, T2, 0, 0) ||
-                !emit_merge_logic(buf, T6, in.opsize) ||
+                !emit_merge_logic(buf, T6, in.opsize, fmask) ||
                 !emit_store_gpr(buf, in.dst, T6, in.opsize, in.rex_present)) {
                 return false;
             }
+            nzcv_fields = (fmask & (OAH_FL_SF | OAH_FL_ZF)) ? OAH_FL_NZCV : 0;
+            nzcv_cfinv = 0;
             break;
         case OAH_OP_LEA_RIP:
             if (!emit_reloc_imm(buf, T6, after + (u64)(s64)in.disp,
@@ -1849,12 +2130,17 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
              * 4 + 20 = 24 bytes. Both rets are chainable, so hot loop
              * back-edges repatch to direct branches. The xmm spill must
              * precede the b.cond so both paths keep the fixed skip. */
-            if (!emit_xmm_spill(buf, g) ||
-                !emit_rflags_to_nzcv(buf, T4) ||
-                !oah_emit_bcond(buf, arm_cond_for_x86(in.cc), 24) ||
-                !frag_exit_imm(buf, after) ||
-                !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
-                return false;
+            {
+                u32 cc_cond;
+                if (!emit_flags_for_cc(buf, in.cc, &cc_cond)) {
+                    return false;
+                }
+                if (!emit_xmm_spill(buf, g) ||
+                    !oah_emit_bcond(buf, cc_cond, 24) ||
+                    !frag_exit_imm(buf, after) ||
+                    !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
+                    return false;
+                }
             }
             done = true;
             break;
@@ -1875,9 +2161,11 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                     return false;
                 }
             }
-            if (!emit_arith_flags(buf, true, T6, T1, T5, in.opsize, false)) {
+            if (!emit_arith_flags(buf, true, T6, T1, T5, in.opsize, fmask)) {
                 return false;
             }
+            nzcv_fields = OAH_FL_NZCV;
+            nzcv_cfinv = 1;
             break;
         }
         case OAH_OP_TEST_RR:
@@ -1885,9 +2173,11 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                 !emit_read_gpr(buf, T2, in.src, in.opsize, in.rex_present) ||
                 !oah_emit_logic_reg(buf, OAH_LOGIC_AND, in.opsize == 8,
                                     T6, T1, T2, 0, 0) ||
-                !emit_merge_logic(buf, T6, in.opsize)) {
+                !emit_merge_logic(buf, T6, in.opsize, fmask)) {
                 return false;
             }
+            nzcv_fields = (fmask & (OAH_FL_SF | OAH_FL_ZF)) ? OAH_FL_NZCV : 0;
+            nzcv_cfinv = 0;
             break;
         case OAH_OP_LEAVE: {
             u8 rbp = xn(OAH_X86_RBP);
@@ -1952,7 +2242,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             oah_asm_emit32(buf, 0xd5033bbfu); /* dmb ish */
             break;
         case OAH_OP_SCALAR:
-            if (!frag_translate_scalar(buf, g, &in, after)) {
+            if (!frag_translate_scalar(buf, g, &in, after, fmask)) {
                 boundary_interp = true;
                 break;
             }

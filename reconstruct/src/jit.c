@@ -225,6 +225,7 @@ static void jit_insert(const oah_frag_entry *entry)
 static bool jit_chain = true;
 static u64 fallback_steps; /* interpreter steps at fragment boundaries */
 static u64 stats_insns;
+static u64 stats_bytes;   /* generated host bytes across all translations */
 static u64 stats_ops[64]; /* decoded op of each boundary insn */
 static u64 stats_scalar[64]; /* OAH_SC_* subtype within OAH_OP_SCALAR */
 static bool jit_stats;
@@ -239,11 +240,14 @@ static void jit_stats_print(void)
     printed = true;
     int out = stats_fd >= 0 ? stats_fd : STDERR_FILENO;
     dprintf(out,
-            "jit stats: insns=%llu boundary_interp_steps=%llu (%.1f%%)\n",
+            "jit stats: insns=%llu boundary_interp_steps=%llu (%.1f%%) "
+            "host_bytes=%llu (%.1f/g-insn)\n",
             (unsigned long long)stats_insns,
             (unsigned long long)fallback_steps,
             stats_insns ? 100.0 * (double)fallback_steps / (double)stats_insns
-                        : 0.0);
+                        : 0.0,
+            (unsigned long long)stats_bytes,
+            stats_insns ? (double)stats_bytes / (double)stats_insns : 0.0);
     if (getenv("OAH_JIT_STATS_OPS")) {
         for (int i = 0; i < 64; i++) {
             if (stats_ops[i]) {
@@ -1101,6 +1105,7 @@ static const oah_frag_entry *jit_translate(oah_image *img, const oah_guest *g,
     }
     const oah_frag_entry *frag = jit_install(rip, g->jit_owner, &info,
                                              buf.data, buf.size);
+    stats_bytes += buf.size;
     if (frag && module >= 0) {
         pcache_pend(img, module, rip, buf.data, buf.size, &info);
     }
@@ -1140,6 +1145,7 @@ static void jit_prewarm(oah_image *img, const oah_guest *g)
             oah_frag_info info;
             oah_asm_buf_init(&buf);
             if (oah_translate_frag(&buf, img, g, rip, &info) && buf.size) {
+                stats_bytes += buf.size;
                 if (buf.size <= jit_arena_size - jit_arena_used) {
                     jit_install(rip, g->jit_owner, &info, buf.data, buf.size);
                 }
