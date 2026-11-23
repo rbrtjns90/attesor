@@ -19,7 +19,7 @@
 
 set -uo pipefail
 
-A=/Users/rob/Documents/GitHub/attesor
+A="$(cd "$(dirname "$0")/.." && pwd)"
 S="$A/runtime/sysroots/debian-expanded"
 OAH="$A/reconstruct/oah"
 INSTALLER="$A/runtime-src/native-deb-install.sh"

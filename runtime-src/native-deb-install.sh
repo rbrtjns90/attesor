@@ -32,7 +32,7 @@ fi
 
 SYSROOT=$(cd "$1" && pwd)
 shift
-A=/Users/rob/Documents/GitHub/attesor
+A="$(cd "$(dirname "$0")/.." && pwd)"
 DPKG="$SYSROOT/var/lib/dpkg"
 INFO="$DPKG/info"
 STATUS="$DPKG/status"

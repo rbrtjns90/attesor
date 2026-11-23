@@ -95,7 +95,7 @@ intermittent decompressor crash. The native path (`apt-update.sh` +
 - To run a program directly:
 
   ```sh
-  A=/Users/rob/Documents/GitHub/attesor
+  A=<repo root or ~/Library/Application Support/Attesor>
   S="$A/runtime/sysroots/debian-expanded"
   OAH_CACHE_DIR="$A/runtime/var/cache/jit" \
       "$A/reconstruct/oah" --sysroot "$S" "$S/usr/bin/<program>"

@@ -9,21 +9,44 @@ import AppKit
 // MARK: - Paths
 
 struct Repo {
-    // runtime/Apps/X.app/Contents/MacOS -> repo root (5 levels up from
-    // the binary); falls back to the development path.
-    static var root: URL = {
-        let bundle = Bundle.main.bundleURL
-        let candidate = bundle
-            .deletingLastPathComponent()   // Contents
-            .deletingLastPathComponent()   // X.app
-            .deletingLastPathComponent()   // Apps
-            .deletingLastPathComponent()   // runtime
-        if FileManager.default.fileExists(
-            atPath: candidate.appendingPathComponent("reconstruct/oah").path) {
-            return candidate
+    /// Where the runtime payload lives once downloaded on first launch —
+    /// the "installed" location for a shipped Attesor.app.
+    static var appSupport: URL {
+        URL(fileURLWithPath: NSHomeDirectory()
+            + "/Library/Application Support/Attesor")
+    }
+
+    /// The runtime root: payload installed under Application Support
+    /// first, then a development checkout (bundle inside runtime/Apps or
+    // the hardcoded path). Falls through to appSupport so the first-run
+    /// bootstrap has a target to create.
+    static var root: URL {
+        let fm = FileManager.default
+        let candidates = [
+            appSupport,
+            Bundle.main.bundleURL
+                .deletingLastPathComponent()   // Contents
+                .deletingLastPathComponent()   // X.app
+                .deletingLastPathComponent()   // Apps
+                .deletingLastPathComponent(),  // runtime
+            URL(fileURLWithPath: "/Users/rob/Documents/GitHub/attesor"),
+        ]
+        for c in candidates where fm.fileExists(
+            atPath: c.appendingPathComponent("reconstruct/oah").path) {
+            return c
         }
-        return URL(fileURLWithPath: "/Users/rob/Documents/GitHub/attesor")
-    }()
+        return appSupport
+    }
+
+    /// True when a usable payload (translator + at least one sysroot) is
+    /// present — false on a fresh install before first-run setup.
+    static var payloadPresent: Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: oah.path) else { return false }
+        let sysroots = root.appendingPathComponent("runtime/sysroots")
+        return !((try? fm.contentsOfDirectory(atPath: sysroots.path)) ?? [])
+            .filter { !$0.hasPrefix(".") }.isEmpty
+    }
     static var sysroot: URL { root.appendingPathComponent("runtime/sysroots/debian-expanded") }
     static var sysroots: [URL] {
         let dir = root.appendingPathComponent("runtime/sysroots")
@@ -231,6 +254,87 @@ final class AppState: ObservableObject {
     @Published var running: Set<String> = []
     /// XQuartz is required for every graphical launch; checked at reload.
     @Published var xquartzMissing = false
+
+    // --- first-run setup ----------------------------------------------------
+
+    enum SetupPhase: Equatable {
+        case needed           // no payload — show welcome
+        case downloading(Double) // fraction 0…1 (negative = indeterminate)
+        case extracting
+        case failed(String)
+    }
+    @Published var setup: SetupPhase = .needed
+
+    /// Release asset the bootstrap downloads; overridable for testing.
+    static var runtimeURL: String {
+        ProcessInfo.processInfo.environment["ATTESOR_RUNTIME_URL"]
+            ?? "https://github.com/rbrtjns90/attesor/releases/latest/download/attesor-runtime.tar.xz"
+    }
+
+    /// Download + unpack the Linux runtime into Application Support.
+    /// The tarball holds a repo-shaped tree: reconstruct/oah,
+    /// runtime/sysroots/*, runtime-src/*.sh, runtime/Apps/*.
+    func beginSetup() {
+        setup = .downloading(-1)
+        let url = Self.runtimeURL
+        Task.detached {
+            let fm = FileManager.default
+            let dest = Repo.appSupport
+            let tmp = dest.appendingPathComponent("runtime-download.tar.xz")
+            do {
+                try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+                try? fm.removeItem(at: tmp)
+                // HEAD first so the progress bar has a denominator.
+                var expected: Int64 = -1
+                if let head = Self.pipeOut("/usr/bin/curl", ["-fsSI", url]),
+                   let text = String(data: head, encoding: .utf8) {
+                    for line in text.split(separator: "\r\n") + text.split(separator: "\n")
+                    where line.lowercased().hasPrefix("content-length:") {
+                        expected = Int64(line.split(separator: ":").last?
+                            .trimmingCharacters(in: .whitespaces) ?? "") ?? -1
+                    }
+                }
+                let curl = Process()
+                curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                curl.arguments = ["-fSL", "--retry", "3", "-o", tmp.path, url]
+                try curl.run()
+                while curl.isRunning {
+                    if expected > 0, let size = try? tmp.resourceValues(
+                        forKeys: [.fileSizeKey]).fileSize {
+                        let frac = min(0.99, Double(size) / Double(expected))
+                        await MainActor.run { self.setup = .downloading(frac) }
+                    }
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                }
+                guard curl.terminationStatus == 0 else {
+                    throw LaunchError(message: "Download failed (curl exit \(curl.terminationStatus)). Check your connection.")
+                }
+                await MainActor.run { self.setup = .extracting }
+                try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+                let tar = Process()
+                tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                tar.arguments = ["-xJf", tmp.path, "-C", dest.path]
+                try tar.run(); tar.waitUntilExit()
+                guard tar.terminationStatus == 0 else {
+                    throw LaunchError(message: "Couldn't unpack the runtime (bad archive?).")
+                }
+                try? fm.removeItem(at: tmp)
+                // Writable-data dirs the tarball may not carry.
+                for d in ["runtime/var/cache/jit", "runtime/var/log",
+                          "runtime/var/freeciv/home"] {
+                    try? fm.createDirectory(
+                        at: dest.appendingPathComponent(d),
+                        withIntermediateDirectories: true)
+                }
+                await MainActor.run { self.setup = .needed; self.reload() }
+            } catch {
+                try? fm.removeItem(at: tmp)
+                await MainActor.run {
+                    self.setup = .failed(error.localizedDescription)
+                }
+            }
+        }
+    }
 
     /// Featured cards shown on the front page. `matchBin` marks the card
     /// installed when any installed binary contains it — hand-built
@@ -1225,20 +1329,74 @@ struct RootView: View {
     }
 }
 
+/// First-run screen: downloads the Linux runtime into Application
+/// Support so the app itself stays a thin bundle.
+struct SetupView: View {
+    @EnvironmentObject var state: AppState
+    var body: some View {
+        VStack(spacing: 18) {
+            if let tux = LinuxIcon.penguin {
+                Image(nsImage: tux).resizable().frame(width: 96, height: 96)
+            }
+            Text("Welcome to Attesor").font(.largeTitle).bold()
+            Text("Attesor runs x86-64 Linux programs on your Mac.\n"
+                 + "First launch downloads the Linux runtime (~350 MB) — "
+                 + "this happens once.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            switch state.setup {
+            case .needed:
+                Button("Download & Set Up") { state.beginSetup() }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                if state.xquartzMissing {
+                    Text("Tip: graphical apps need XQuartz — install it with "
+                         + "“brew install --cask xquartz” anytime.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            case .downloading(let frac):
+                if frac >= 0 {
+                    ProgressView(value: frac) {
+                        Text("Downloading runtime… \(Int(frac * 100))%")
+                    }
+                } else {
+                    ProgressView { Text("Downloading runtime…") }
+                }
+            case .extracting:
+                ProgressView { Text("Unpacking…") }
+            case .failed(let msg):
+                Label(msg, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red).font(.callout)
+                    .multilineTextAlignment(.center)
+                Button("Try Again") { state.beginSetup() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 @main
 struct AttesorPackageManager: App {
     @StateObject private var state = AppState()
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environmentObject(state)
-                .frame(minWidth: 640, minHeight: 480)
-                .onAppear { state.reload() }
-                // Picks up guest-side apt/dpkg installs made in the shell.
-                .onReceive(NotificationCenter.default.publisher(
-                    for: NSApplication.didBecomeActiveNotification)) { _ in
-                    state.reload()
+            Group {
+                if Repo.payloadPresent {
+                    RootView()
+                } else {
+                    SetupView()
                 }
+            }
+            .environmentObject(state)
+            .frame(minWidth: 640, minHeight: 480)
+            .onAppear { state.reload() }
+            // Picks up guest-side apt/dpkg installs made in the shell.
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSApplication.didBecomeActiveNotification)) { _ in
+                state.reload()
+            }
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 780, height: 560)

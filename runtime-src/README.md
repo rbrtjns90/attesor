@@ -41,6 +41,46 @@ Then refresh the Desktop shortcuts so new executables appear:
 
     runtime/sync-programs.sh          # or: Launcher menu → Refresh Program Shortcuts
 
+## Installing Attesor (end users)
+
+One-liner — installs XQuartz via Homebrew, then the app from GitHub
+Releases:
+
+    curl -fsSL https://raw.githubusercontent.com/rbrtjns90/attesor/main/runtime-src/install.sh | bash
+
+Or manually:
+
+    brew install --cask xquartz        # needed for graphical Linux apps
+    # download Attesor-<ver>.dmg from
+    # https://github.com/rbrtjns90/attesor/releases/latest
+    # drag Attesor.app to Applications
+
+On first launch `Attesor.app` downloads the Linux runtime
+(`attesor-runtime.tar.xz`, ~350 MB) into
+`~/Library/Application Support/Attesor/` — the app itself stays thin.
+The downloaded tree is repo-shaped (`reconstruct/`, `runtime/`,
+`runtime-src/`) so every script and bundle resolves paths the same way
+as a dev checkout; `Repo.root` prefers the Application Support copy.
+
+Homebrew cask: `Casks/attesor.rb` — intended for a tap (e.g.
+`brew install --cask rbrtjns90/tap/attesor`); it declares the xquartz
+dependency and `zap`s the runtime data on uninstall.
+
+## Cutting a release
+
+    runtime-src/release.sh v0.1.0
+
+Builds in `dist/v0.1.0/`:
+
+- `Attesor-v0.1.0.dmg` — drag-to-Applications thin app
+- `attesor-runtime-v0.1.0.tar.xz` + `attesor-runtime.tar.xz` — payload;
+  the un-versioned copy is what the app fetches via
+  `releases/latest/download/attesor-runtime.tar.xz`
+- `SHA256SUMS`
+
+Upload all to a GitHub Release tagged `v0.1.0`. Override the download
+URL for testing with `ATTESOR_RUNTIME_URL` (file:// works too).
+
 ## Future work
 
 - GUI package manager app: browse/search the Debian archive (official

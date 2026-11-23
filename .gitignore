@@ -58,3 +58,4 @@ reconstruct/oah-aarch64
 
 # Freeciv autosaves
 freeciv-*.sav*
+dist/
