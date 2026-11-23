@@ -278,8 +278,24 @@ static void jit_chain_patch(oah_frag_entry *e, u32 slot, u32 target_off)
     e->exit_off[slot] = 0;
 }
 
-void oah_jit_cache_flush(void)
+void oah_jit_cache_flush(const char *why)
 {
+    static int flush_debug = -1;
+    if (flush_debug < 0) {
+        flush_debug = getenv("OAH_JIT_FLUSH_DEBUG") != NULL;
+    }
+    if (flush_debug) {
+        unsigned live = 0;
+        u64 insns = 0;
+        for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
+            if (jit_table[i].rip) {
+                live++;
+                insns += jit_table[i].insns;
+            }
+        }
+        fprintf(stderr, "jit flush (%s): %u live frags, %llu guest insns\n",
+                why ? why : "?", live, (unsigned long long)insns);
+    }
     for (unsigned i = 0; i < OAH_JIT_TABLE_SIZE; i++) {
         free(jit_table[i].bounds);
     }
@@ -337,7 +353,7 @@ static void jit_poison_add(u64 rip)
     if (jit_npoison == JIT_POISON_MAX) {
         /* Poison only grows on real faults; a full table means something
          * is pathological — drop everything and retranslate on demand. */
-        oah_jit_cache_flush();
+        oah_jit_cache_flush("poison-full");
         jit_npoison = 0;
     }
     jit_poison[jit_npoison++] = rip;
@@ -921,7 +937,7 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
 {
     if (code_len + OAH_STUB_SIZE > jit_arena_size - jit_arena_used) {
         /* Arena full: drop everything and retranslate on demand. */
-        oah_jit_cache_flush();
+        oah_jit_cache_flush("arena-full");
     }
     if (code_len + OAH_STUB_SIZE > jit_arena_size) {
         return NULL;
@@ -1708,8 +1724,9 @@ oah_interp_result oah_jit_run_worker(oah_guest *g, oah_image *img,
     return oah_jit_run_native(g, img, max_insns);
 }
 
-void oah_jit_cache_flush(void)
+void oah_jit_cache_flush(const char *why)
 {
+    (void)why;
 }
 
 #endif /* __APPLE__ && __aarch64__ */

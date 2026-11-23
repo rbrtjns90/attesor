@@ -1838,7 +1838,7 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
                 int error = errno;
                 if (loaded) {
                     memcpy(seg->host + left, staged, size);
-                    oah_jit_cache_flush();
+                    oah_jit_cache_flush("map-fixed");
                 }
                 free(staged);
                 if (!loaded) {
@@ -1892,13 +1892,32 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
     return (s64)(uintptr_t)backing;
 }
 
+/* Only ranges that can contain guest code need a JIT flush: profiling
+ * shows mprotect/munmap fires constantly on data mappings (malloc
+ * arenas, RELRO, stacks) that hold no translated fragments. Checked
+ * before the mapping changes so exec segs about to be unmapped still
+ * count. */
+static bool range_hits_exec(oah_image *img, u64 addr, u64 len)
+{
+    for (unsigned i = 0; i < img->nseg; i++) {
+        const oah_load_seg *s = &img->segs[i];
+        if ((s->prot & PROT_EXEC) &&
+            addr < s->gva + s->size && s->gva < addr + len) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static s64 memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool unmap)
 {
     const u64 mask = OAH_X86_PAGE_SIZE - 1;
     if (!len || len > UINT64_MAX - mask || (prot & ~7ull) || (addr & mask)) {
         return -EINVAL;
     }
-    oah_jit_cache_flush();
+    if (range_hits_exec(img, addr, len)) {
+        oah_jit_cache_flush("mprotect/munmap");
+    }
     len = (len + mask) & ~mask;
     if (unmap) {
         for (unsigned i = img->load_segments; i < img->nseg; i++) {
@@ -1980,7 +1999,9 @@ static s64 memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool unmap
 
 static s64 guest_mremap(oah_image *img, u64 address, u64 prior, u64 requested, u64 flags)
 {
-    oah_jit_cache_flush();
+    if (range_hits_exec(img, address, prior)) {
+        oah_jit_cache_flush("mremap");
+    }
     const u64 mask = OAH_X86_PAGE_SIZE - 1;
     if (!prior || !requested || (address & mask) ||
         prior > (1ull << 30) || requested > (1ull << 30) ||
@@ -5094,7 +5115,7 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case OAH_X86_NR_ARCH_PRCTL:
         if (a0 == OAH_ARCH_SET_FS) {
             g->fs_base = a1;
-            oah_jit_cache_flush();
+            oah_jit_cache_flush("set-fs");
             result = 0;
         } else if (a0 == OAH_ARCH_GET_FS) {
             void *output = oah_guest_access(img, a1, 8, PROT_WRITE);

@@ -121,7 +121,7 @@ oah_interp_result oah_jit_run_worker(oah_guest *g, oah_image *img,
                                      u64 max_insns);
 
 /* Drop all cached fragments (guest memory/protection changed). */
-void oah_jit_cache_flush(void);
+void oah_jit_cache_flush(const char *why);
 
 #ifdef __cplusplus
 }
