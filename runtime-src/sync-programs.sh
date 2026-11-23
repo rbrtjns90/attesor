@@ -93,6 +93,7 @@ EOF
 
 emit_gui() {
     local bin="$1" name="$2"
+    local extra="$(gui_extra_args "$bin")"
     cat >"$GUI_DIR/$name.command" <<EOF
 #!/bin/sh
 $MARK gui — $bin
@@ -108,9 +109,21 @@ if ! ready; then
 fi
 export DISPLAY="\$display" LC_ALL=C OAH_CACHE_DIR="\$A/runtime/var/cache/jit" \
     XAUTHORITY="\$HOME/.Xauthority" HOME=/root
-exec "\$A/reconstruct/oah" --sysroot "\$S" "\$S$bin" "\$@"
+exec "\$A/reconstruct/oah" --sysroot "\$S" "\$S$bin" $extra "\$@"
 EOF
     chmod +x "$GUI_DIR/$name.command"
+}
+
+# Extra arguments per binary basename: workarounds for gaps between what
+# a Debian package assumes and what XQuartz provides.
+gui_extra_args() {
+    case "$(basename "$1")" in
+        # XQuartz lacks XFree86-VidMode; xgalaga's fullscreen path
+        # dereferences the missing mode list and crashes. -window is
+        # the supported windowed mode.
+        xgalaga|xgalaga-hyperspace) printf -- "-window" ;;
+        *) ;;
+    esac
 }
 
 count_t=0; count_g=0
