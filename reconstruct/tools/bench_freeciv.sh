@@ -22,6 +22,7 @@
 # Run matrix (set MODE):
 #   chain    - default JIT + chaining, fresh OAH_CACHE_DIR
 #   nochain  - OAH_JIT_NOCHAIN=1
+#   noflags  - OAH_JIT_NOFLAGS=1 (flag liveness off / eager flags)
 #   nocache  - OAH_JIT_NOCACHE=1 (persistence disabled, chaining on)
 #   warm     - reuse $WARM_CACHE_DIR across runs
 #
@@ -63,6 +64,7 @@ mkdir -p "$HOME/.freeciv/saves"
 case "$mode" in
     chain)   export OAH_CACHE_DIR="$work/cache" ;;
     nochain) export OAH_CACHE_DIR="$work/cache" OAH_JIT_NOCHAIN=1 ;;
+    noflags) export OAH_CACHE_DIR="$work/cache" OAH_JIT_NOFLAGS=1 ;;
     nocache) export OAH_JIT_NOCACHE=1 ;;
     warm)    export OAH_CACHE_DIR="${WARM_CACHE_DIR:-$work/cache-warm}" ;
              mkdir -p "$OAH_CACHE_DIR" ;;
@@ -160,6 +162,8 @@ if [ "${PAN:-0}" -gt 0 ]; then
     pan_cpu0=$(cpu "$client_pid")
     pan_end=$((PAN))
     keys_sent=0
+    pan_samples=""
+    prev_cpu=$pan_cpu0
     while [ "$pan_end" -gt 0 ]; do
         key_pids=""
         for k in 124 124 124 124; do  # right arrow x4/s
@@ -169,15 +173,30 @@ if [ "${PAN:-0}" -gt 0 ]; then
         done
         wait $key_pids   # NOT bare wait — server/client are also bg jobs
         keys_sent=$((keys_sent + 4))
+        cur_cpu=$(cpu "$client_pid")
+        pan_samples="$pan_samples $(awk -v a="$prev_cpu" -v b="$cur_cpu" \
+            'BEGIN { printf "%.3f", b - a }')"
+        prev_cpu=$cur_cpu
         pan_end=$((pan_end - 1))
     done
-    pan_cpu1=$(cpu "$client_pid")
+    pan_cpu1=$cur_cpu
     [ "${FC_FLUSH:-0}" = 1 ] && phase pan
     awk -v a="$idle_cpu0" -v b="$idle_cpu1" -v c="$pan_cpu0" -v d="$pan_cpu1" \
-        -v s="$PAN" -v k="$keys_sent" 'BEGIN {
+        -v s="$PAN" -v k="$keys_sent" -v samples="$pan_samples" 'BEGIN {
         printf "  idle %ds: client cpu %.1fs (%.1f%% core)\n", s, b - a, (b - a) * 100 / s;
         printf "  pan %ds (%d keys): client cpu %.1fs (%.1f%% core), +%.1fs vs idle\n",
-               s, k, d - c, (d - c) * 100 / s, (d - c) - (b - a) }'
+               s, k, d - c, (d - c) * 100 / s, (d - c) - (b - a);
+        n = split(samples, v, " ");
+        for (i = 1; i <= n; i++) v[i] += 0;
+        for (i = 1; i <= n; i++)
+            for (j = i + 1; j <= n; j++)
+                if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
+        if (n > 0) {
+            med = (n % 2) ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2;
+            p95 = v[int(n * 0.95) < 1 ? 1 : int(n * 0.95)];
+            printf "  frame cost (cpu/key): median %.0fms p95 %.0fms (n=%d)\n",
+                   med * 250, p95 * 250, n;   # /4 keys per sample * 1000
+        } }'
 fi
 
 # Time the next $turns turn boundaries (BEGIN_TURN packets at the client).
@@ -204,10 +223,17 @@ awk -v mode="$mode" -v save="${save:+load}" -v t0="$t0" -v tl="$t_listen" \
            mode, (save != "" ? "+save" : ""), tl - t0, ts - tl, tj - ts, jc;
     sum = 0;
     for (i = 1; i <= n; i++) {
-        d = a[i + 1] - a[i];
-        sum += d;
-        printf "  turn %d: %.1fs\n", i, d;
+        d[i] = a[i + 1] - a[i];
+        sum += d[i];
+        printf "  turn %d: %.1fs\n", i, d[i];
     }
-    if (n > 0) printf "MODE=%s  mean turn cadence: %.1fs  total client cpu=%.1fs\n",
-                      mode, sum / n, ec;
+    if (n > 0) {
+        for (i = 1; i <= n; i++)
+            for (j = i + 1; j <= n; j++)
+                if (d[j] < d[i]) { t = d[i]; d[i] = d[j]; d[j] = t }
+        med = (n % 2) ? d[(n + 1) / 2] : (d[n / 2] + d[n / 2 + 1]) / 2;
+        p95 = d[int(n * 0.95) < 1 ? 1 : int(n * 0.95)];
+        printf "MODE=%s  mean turn cadence: %.1fs  median %.1fs  p95 %.1fs  total client cpu=%.1fs\n",
+                      mode, sum / n, med, p95, ec;
+    }
 }'
