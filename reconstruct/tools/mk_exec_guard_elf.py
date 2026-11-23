@@ -39,6 +39,9 @@ CODE_OFF = EHDR_SIZE + PHDR_SIZE
 SYS_MMAP = 9
 SYS_MPROTECT = 10
 SYS_MUNMAP = 11
+SYS_MREMAP = 25
+SYS_FORK = 57
+SYS_WAIT4 = 61
 SYS_WRITE = 1
 SYS_EXIT = 60
 PROT_RW = 3
@@ -152,6 +155,101 @@ def emit() -> bytes:
     lea_r12(b"\x49\x8d\xb4\x24", 0x20)                 # lea rsi,[r12+0x20]
     code.extend(b"\xba\x03\x00\x00\x00")               # mov edx,3
     sys(SYS_WRITE)
+
+    # --- data mremap: grow+move a pure-data page -> must NOT flush ----
+    code.extend(b"\xbe\x00\x10\x00\x00")               # mov esi,0x1000
+    code.extend(b"\xba" + struct.pack("<I", PROT_RW))  # mov edx,3
+    mmap()
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x78"); rel8("fail")                 # js fail
+    code.extend(b"\x49\x89\xc6")                       # mov r14,rax
+    code.extend(b"\x41\xc7\x06\xef\xbe\xad\xde")       # mov dword [r14],0xdeadbeef
+    code.extend(b"\x4c\x89\xf7")                       # mov rdi,r14
+    code.extend(b"\xbe\x00\x10\x00\x00")               # mov esi,0x1000 (prior)
+    code.extend(b"\xba\x00\x20\x00\x00")               # mov edx,0x2000 (requested)
+    code.extend(b"\x41\xba\x01\x00\x00\x00")           # mov r10d,1 (MREMAP_MAYMOVE)
+    sys(SYS_MREMAP)
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x78"); rel8("fail")                 # js fail
+    code.extend(b"\x49\x89\xc6")                       # mov r14,rax (new gva)
+    code.extend(b"\x41\x81\x3e\xef\xbe\xad\xde")       # cmp dword [r14],0xdeadbeef
+    code.extend(b"\x75"); rel8("fail")                 # jne fail
+
+    # --- exec mremap: move a live translated stub -> must flush -------
+    code.extend(b"\xbe\x00\x10\x00\x00")               # mov esi,0x1000
+    code.extend(b"\xba" + struct.pack("<I", PROT_RW))  # mov edx,3
+    mmap()
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x78"); rel8("fail")                 # js fail
+    code.extend(b"\x49\x89\xc7")                       # mov r15,rax (stubC old gva)
+    code.extend(b"\x4c\x89\xff")                       # mov rdi,r15
+    code.extend(b"\xbe\x00\x10\x00\x00")               # mov esi,0x1000
+    code.extend(b"\xba" + struct.pack("<I", PROT_RWX)) # mov edx,7
+    sys(SYS_MPROTECT)
+    code.extend(b"\x85\xc0")                           # test eax,eax
+    code.extend(b"\x78"); rel8("fail")                 # js fail
+    code.extend(b"\x41\xc7\x07\xb8\x2a\x00\x00")       # mov dword [r15],0x2ab8
+    code.extend(b"\x41\xc7\x47\x02\x00\x00\x00\xc3")   # mov dword [r15+2],0xc3000000
+    code.extend(b"\x4c\x89\xf8")                       # mov rax,r15
+    code.extend(b"\xff\xd0")                           # call rax -> translate stubC
+    code.extend(b"\x83\xf8\x2a")                       # cmp eax,42
+    code.extend(b"\x75"); rel8("fail")                 # jne fail
+    code.extend(b"\x4c\x89\xff")                       # mov rdi,r15
+    code.extend(b"\xbe\x00\x10\x00\x00")               # mov esi,0x1000 (prior)
+    code.extend(b"\xba\x00\x20\x00\x00")               # mov edx,0x2000 (requested)
+    code.extend(b"\x41\xba\x01\x00\x00\x00")           # mov r10d,1 (MREMAP_MAYMOVE)
+    sys(SYS_MREMAP)                                    # flushes; moves gva
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x78"); rel8("fail")                 # js fail
+    code.extend(b"\x49\x89\xc5")                       # mov r13,rax (stubC new gva)
+    # report stubC old/new addresses to the host
+    code.extend(b"\x4d\x89\xbc\x24\x40\x00\x00\x00")   # mov [r12+0x40],r15
+    code.extend(b"\x4d\x89\xac\x24\x48\x00\x00\x00")   # mov [r12+0x48],r13
+    code.extend(b"\xbf\x01\x00\x00\x00")               # mov edi,1
+    lea_r12(b"\x49\x8d\xb4\x24", 0x40)                 # lea rsi,[r12+0x40]
+    code.extend(b"\xba\x10\x00\x00\x00")               # mov edx,16
+    sys(SYS_WRITE)
+    # the moved translation must work at the new gva
+    code.extend(b"\x4c\x89\xe8")                       # mov rax,r13
+    code.extend(b"\xff\xd0")                           # call rax (stubC new)
+    code.extend(b"\x83\xf8\x2a")                       # cmp eax,42
+    code.extend(b"\x75"); rel8("fail")                 # jne fail
+
+    # --- sacrificial child: the OLD gva must not run stale code -------
+    # The parent cannot call the old gva itself — the fault would end the
+    # whole run before the stubB checks. fork() instead: the child calls
+    # the dead address and must fault (exit 126); if the mremap flush had
+    # not fired the stale fragment would run and the child would exit 43.
+    code.extend(b"\xb8" + struct.pack("<I", SYS_FORK)) # mov eax,57
+    code.extend(b"\x0f\x05")                           # syscall
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x74"); rel8("child")                # jz child
+    # parent: wait4(child, &status, 0, NULL)
+    code.extend(b"\x48\x89\xc7")                       # mov rdi,rax (pid)
+    lea_r12(b"\x49\x8d\xb4\x24", 0x38)                 # lea rsi,[r12+0x38]
+    code.extend(b"\x31\xd2")                           # xor edx,edx
+    code.extend(b"\x45\x31\xd2")                       # xor r10d,r10d
+    code.extend(b"\xb8" + struct.pack("<I", SYS_WAIT4))# mov eax,61
+    code.extend(b"\x0f\x05")                           # syscall
+    code.extend(b"\x48\x85\xc0")                       # test rax,rax
+    code.extend(b"\x7e"); rel8("fail")                 # jle fail
+    code.extend(b"\x41\x8b\x84\x24\x38\x00\x00\x00")   # mov eax,[r12+0x38]
+    code.extend(b"\x3d\x00\x7e\x00\x00")               # cmp eax,0x7e00 (exit 126)
+    code.extend(b"\x75"); rel8("fail")                 # jne fail
+    # write(1, "KC\n", 3)
+    code.extend(b"\x41\xc7\x84\x24\x38\x00\x00\x00" +
+                b"\x4b\x43\x0a\x00")                   # mov dword [r12+0x38],"KC\n"
+    code.extend(b"\xbf\x01\x00\x00\x00")               # mov edi,1
+    lea_r12(b"\x49\x8d\xb4\x24", 0x38)                 # lea rsi,[r12+0x38]
+    code.extend(b"\xba\x03\x00\x00\x00")               # mov edx,3
+    sys(SYS_WRITE)
+    code.extend(b"\xeb"); rel8("parent_cont")          # jmp over child code
+    here("child")
+    code.extend(b"\x4c\x89\xf8")                       # mov rax,r15 (old stubC)
+    code.extend(b"\xff\xd0")                           # call rax -> must fault
+    code.extend(b"\xbf\x2b\x00\x00\x00")               # mov edi,43 (stale ran!)
+    sys(SYS_EXIT)
+    here("parent_cont")
 
     # --- crossing munmap: [data page1][exec stubA] -> must flush ------
     lea_r12(b"\x49\x8d\xbc\x24", 0x1000)               # lea rdi,[r12+0x1000]

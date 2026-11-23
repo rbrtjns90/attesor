@@ -136,15 +136,22 @@ def main():
                             f"counter={value} (rc={rc}, stderr={err!r})")
                     print(f"PASS {mode}: mid-fragment fault store replay")
             if args.exec_guard:
-                # Two-sided invalidation check. The fixture translates and
-                # runs two mmap'd RWX stubs, churns unrelated data mappings
-                # (mprotect/munmap — must NOT flush), re-enters stubA to
-                # prove its translation survived, then munmaps a range that
-                # crosses [data page][exec stub] (must flush), re-warms
-                # stubB so its revoke evicts LIVE code, de-execs it (must
-                # flush), and calls it — which must fault: stale native
-                # code cannot run on a page without PROT_EXEC. stdout is
-                # a 24-byte report (base, stubA, stubB) followed by "OK".
+                # Two-sided invalidation check covering mprotect, munmap
+                # and mremap. The fixture translates and runs mmap'd RWX
+                # stubs, churns unrelated data mappings (must NOT flush),
+                # re-enters stubA to prove its translation survived, then:
+                #   - data mremap (grow+move): must not flush, data must
+                #     land intact at the new gva;
+                #   - exec mremap: moves a live translated stub — must
+                #     flush; the new gva must execute, and a forked child
+                #     proves the OLD gva cannot run its stale fragment
+                #     (child must fault -> exit 126; if it ran stale code
+                #     it would exit 43);
+                #   - crossing [data][exec] munmap + stubB re-warm +
+                #     de-exec: the revoke flush must evict live code and
+                #     the final call must fault.
+                # stdout: 24B report [base,stubA,stubB] + "OK\n" +
+                #         16B report [stubC_old,stubC_new] + "KC\n".
                 for mode, options, mode_env in MODES:
                     env = dict(mode_env)
                     env["OAH_JIT_FLUSH_DEBUG"] = "1"
@@ -157,43 +164,52 @@ def main():
                         raise ValueError(
                             f"{mode} exec-guard: de-exec'd stub ran "
                             f"without faulting (out={out!r}, err={err!r})")
-                    if len(out) != 27 or out[24:] != b"OK\n":
+                    if len(out) != 46 or out[24:27] != b"OK\n" \
+                            or out[43:] != b"KC\n":
                         raise ValueError(
-                            f"{mode} exec-guard: expected 24-byte address "
-                            f"report + OK marker, got out={out!r} "
+                            f"{mode} exec-guard: expected 40-byte address "
+                            f"report + OK/KC markers, got out={out!r} "
                             f"(err={err!r})")
-                    base, stub_a, stub_b = struct.unpack("<QQQ", out[:24])
-                    if len(flushes) != 2 or any(
-                            b"mprotect/munmap" not in line for line in flushes):
+                    (base, stub_a, stub_b,
+                     stub_c_old, stub_c_new) = struct.unpack(
+                        "<QQQQQ", out[:24] + out[27:43])
+                    # Exactly the three exec-range flushes: the mremap
+                    # move, then the crossing munmap, then the de-exec.
+                    if len(flushes) != 3 or b"mremap" not in flushes[0] \
+                            or any(b"mprotect/munmap" not in line
+                                   for line in flushes[1:]):
                         raise ValueError(
-                            f"{mode} exec-guard: expected exactly the two "
-                            f"exec-range flushes, got {flushes!r} "
+                            f"{mode} exec-guard: expected one mremap + two "
+                            f"mprotect/munmap flushes, got {flushes!r} "
                             f"(stderr={err!r})")
                     stopped = [line for line in err.splitlines()
                                if b"guest stopped" in line]
-                    # OAH_INTERP_FAULT = 3, and the faulting RIP must be the
-                    # de-exec'd stub — not the crossing-munmap'd stubA.
-                    if len(stopped) != 1 or b"(3)" not in stopped[0]:
+                    # Two OAH_INTERP_FAULT (=3) stops: the child dies at the
+                    # old (mremap'd-away) stubC gva, the parent at stubB.
+                    fault_rips = set()
+                    for line in stopped:
+                        if b"(3)" not in line:
+                            continue
+                        m = re.search(rb"rip=([0-9a-f]+)", line)
+                        if m:
+                            fault_rips.add(int(m.group(1), 16))
+                    if fault_rips != {stub_c_old, stub_b}:
                         raise ValueError(
-                            f"{mode} exec-guard: expected a single "
-                            f"OAH_INTERP_FAULT stop, got {stopped!r} "
+                            f"{mode} exec-guard: expected faults at "
+                            f"{stub_c_old:#x} (moved stub) and {stub_b:#x} "
+                            f"(revoked stub), got rips "
+                            f"{[hex(r) for r in fault_rips]} "
                             f"(stderr={err!r})")
-                    fault_rip = re.search(rb"rip=([0-9a-f]+)", stopped[0])
-                    if not fault_rip or int(fault_rip.group(1), 16) != stub_b:
-                        raise ValueError(
-                            f"{mode} exec-guard: fault RIP {fault_rip and fault_rip.group(0)!r} "
-                            f"is not the revoked stub {stub_b:#x} "
-                            f"(stderr={err!r})")
-                    # The second flush must evict live code — stubB was
-                    # re-warmed after the crossing munmap precisely so a
-                    # fresh fragment exists to invalidate. (Interpreter
-                    # mode has no fragment table.)
+                    # Every flush must evict live code — each dead-code
+                    # site was re-warmed so a real fragment exists to
+                    # invalidate. (Interpreter mode has no fragment table.)
                     if mode != "interpret":
-                        live = re.search(rb"(\d+) live frags", flushes[-1])
-                        if not live or int(live.group(1)) < 1:
-                            raise ValueError(
-                                f"{mode} exec-guard: revoke flush evicted "
-                                f"no live fragments: {flushes[-1]!r}")
+                        for line in flushes:
+                            live = re.search(rb"(\d+) live frags", line)
+                            if not live or int(live.group(1)) < 1:
+                                raise ValueError(
+                                    f"{mode} exec-guard: flush evicted no "
+                                    f"live fragments: {line!r}")
                     print(f"PASS {mode}: exec-range invalidation guard")
             for kind, binary, sysroot in (
                 ("static", args.busybox, None),
