@@ -398,7 +398,7 @@ static bool jit_arena_init(void)
  * the stale file is reclaimed by normal eviction or manual clearing.
  */
 
-#define OAH_PCACHE_VERSION 6u
+#define OAH_PCACHE_VERSION 7u
 /* Cache files are tied to the translator build: a rebuilt binary may emit
  * different code for the same guest, so old files must not be reused.
  * oah_build_key() is generated into src/build_key.c each build so every
@@ -425,7 +425,7 @@ typedef struct {
     u32 exit_off[2];
     u64 exit_rip[2]; /* disk: module-relative; pend: absolute */
     u32 nbails;
-    u64 bail_rip[4]; /* non-chainable exits needing an interp step */
+    u64 bail_rip[8]; /* non-chainable exits needing an interp step */
     u8 *code;
     pcache_rel *rel;
     /* Fault-recovery boundaries. pend: absolute rips, normalized to
@@ -584,18 +584,17 @@ static pcache *pcache_open(oah_image *img, int module)
         e->exit_rip[0] = ((const u64 *)p)[2];
         e->exit_rip[1] = ((const u64 *)p)[3];
         p += 32;
-        if (p + 40 > end) {
+        if (p + 72 > end) {
             break;
         }
         e->nbails = ((const u32 *)p)[0];
-        if (e->nbails > 4) {
+        if (e->nbails > 8) {
             break;
         }
-        e->bail_rip[0] = ((const u64 *)p)[1];
-        e->bail_rip[1] = ((const u64 *)p)[2];
-        e->bail_rip[2] = ((const u64 *)p)[3];
-        e->bail_rip[3] = ((const u64 *)p)[4];
-        p += 40;
+        for (u32 j = 0; j < e->nbails; j++) {
+            e->bail_rip[j] = ((const u64 *)p)[1 + j];
+        }
+        p += 72;
         if (p + 4 > end) {
             break;
         }
@@ -844,13 +843,12 @@ oom:
         ((u32 *)trailer)[2] = all[i].exit_off[1];
         ((u64 *)trailer)[2] = all[i].exit_rip[0];
         ((u64 *)trailer)[3] = all[i].exit_rip[1];
-        u8 trailer2[40];
+        u8 trailer2[72];
         memset(trailer2, 0, sizeof(trailer2));
         ((u32 *)trailer2)[0] = all[i].nbails;
-        ((u64 *)trailer2)[1] = all[i].bail_rip[0];
-        ((u64 *)trailer2)[2] = all[i].bail_rip[1];
-        ((u64 *)trailer2)[3] = all[i].bail_rip[2];
-        ((u64 *)trailer2)[4] = all[i].bail_rip[3];
+        for (u32 j = 0; j < 8 && j < all[i].nbails; j++) {
+            ((u64 *)trailer2)[1 + j] = all[i].bail_rip[j];
+        }
         bad = fwrite(ent, 1, sizeof(ent), f) != sizeof(ent) ||
               fwrite(all[i].code, 1, all[i].code_len, f) != all[i].code_len ||
               fwrite(all[i].rel, sizeof(*all[i].rel), all[i].nrel, f) != all[i].nrel ||

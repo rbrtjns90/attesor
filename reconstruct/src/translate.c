@@ -974,9 +974,11 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
             return false;
         }
         /* S-form compute leaves N,Z,V valid in NZCV; C is the inc/dec
-         * carry, not guest CF — don't claim it. */
+         * carry, not guest CF — don't claim it. AF operands are
+         * lhs ^ res: the +-1 immediate has no bit 4, so xzr stands in
+         * for it. */
         nzcv_fields = OAH_FL_SF | OAH_FL_ZF | OAH_FL_OF;
-        return emit_merge_arith(buf, res, lhs, res, dec, true,
+        return emit_merge_arith(buf, res, lhs, 31, dec, true,
                                 fmask & ~OAH_FL_CF) &&
                emit_store_result(buf, in, res, T0);
     }
@@ -1669,10 +1671,15 @@ static bool emit_vec_ea(oah_asm_buf *buf, const oah_guest *g,
     }
     u64 cbz_off = buf->size;
     oah_asm_emit32(buf, 0xb4000000u | T4); /* cbz xT4, patched to skip stub */
+    /* The stub's spill is for the misaligned path only — emit_xmm_spill
+     * clears the translate-time dirty set, but the fast path keeps the
+     * regs dirty in NEON, so restore the tracking for the real exit. */
+    u16 saved_dirty = xmm_dirty;
     if (!emit_xmm_spill(buf, g) ||
         !frag_bail_exit(buf, next - in->length)) {
         return false;
     }
+    xmm_dirty = saved_dirty;
     oah_asm_patch32(buf, cbz_off,
                     0xb4000000u | T4 |
                     (u32)(((buf->size - cbz_off) >> 2) << 5));

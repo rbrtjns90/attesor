@@ -30,6 +30,13 @@ MODES = (("jit", [], {}),
          ("jit-nochain", [], {"OAH_JIT_NOCHAIN": "1"}),
          ("interpret", ["--interpret"], {}))
 
+# Differential matrix: the optimized path (flag liveness on), the
+# eager-flags JIT, and the interpreter — each in its own process and
+# memory image, so a run cannot contaminate another's reference state.
+DIFF_MODES = (("jit", [], {}),
+              ("jit-eager", [], {"OAH_JIT_NOFLAGS": "1"}),
+              ("interpret", ["--interpret"], {}))
+
 
 def verify(runner, directory, title, command, expected, stdin=b"", *, extra_env=None):
     for mode, options, mode_env in MODES:
@@ -78,6 +85,8 @@ def main():
     parser.add_argument("--fault-state", type=Path,
                         help="mid-fragment fault register/memory/RIP "
                              "recovery fixture")
+    parser.add_argument("--diff", type=Path,
+                        help="optimized/eager/interp differential suite")
     parser.add_argument("--exec-guard", type=Path,
                         help="executable-range invalidation fixture")
     parser.add_argument("--flag-live", type=Path,
@@ -171,6 +180,35 @@ def main():
                             f"{mode} fault-state recovery: file={value:#x} "
                             f"regs={regs} (rc={rc}, stderr={err!r})")
                     print(f"PASS {mode}: mid-fragment fault-state recovery")
+            if args.diff:
+                # One-fragment differential suite: identical bytes and
+                # initial state through the optimized JIT, the
+                # eager-flags JIT, and the interpreter — separate
+                # processes, hence separate memory images. Per-case
+                # dumps (all GPRs, masked rflags, all XMM lanes,
+                # scratch memory), the fault RIP and the shared file's
+                # committed bytes must be byte-identical across modes.
+                runs = []
+                for mode, options, mode_env in DIFF_MODES:
+                    shared = Path(directory) / "diff.bin"
+                    shared.unlink(missing_ok=True)
+                    rc, out, err = run(
+                        [runner, *options, str(args.diff.resolve())],
+                        directory, b"", extra_env=mode_env or None)
+                    rip = re.search(rb"image\+([0-9a-f]+)", err)
+                    runs.append((mode, rc, out,
+                                 rip.group(1) if rip else b"",
+                                 shared.read_bytes()
+                                 if shared.exists() else b""))
+                base = runs[0]
+                for mode, rc, out, rip, shared in runs[1:]:
+                    if (rc, out, rip, shared) != base[1:]:
+                        raise ValueError(
+                            f"{mode} differential suite diverged from "
+                            f"{base[0]}: rc={rc} vs {base[1]}, "
+                            f"rip={rip} vs {base[3]}, "
+                            f"stdout/shared differ")
+                    print(f"PASS {mode}: differential suite")
             if args.exec_guard:
                 # Two-sided invalidation check covering mprotect, munmap
                 # and mremap. The fixture translates and runs mmap'd RWX
