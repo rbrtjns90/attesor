@@ -567,9 +567,18 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             out->op = OAH_OP_SYSCALL;
             goto done;
         }
-        if (op2 == 0x1e && peek(&d) == 0xfa) {
-            take(&d);
-            out->op = OAH_OP_ENDBR64;
+        if (op2 == 0x1e) {
+            u8 modrm = take(&d);
+            if (modrm == 0xfa || modrm == 0xfb) {
+                out->op = OAH_OP_ENDBR64;
+                goto done;
+            }
+            /* CET shadow-stack ops (incssp/rdssp/wrss/wruss/mod≠3 hint NOPs):
+             * no shadow stack exists here — all are safely NOP. */
+            if ((modrm >> 6) != 3) {
+                decode_rm(&d, out, modrm, rex, address32, segment);
+            }
+            out->op = OAH_OP_NOP;
             goto done;
         }
         return false;
