@@ -50,6 +50,24 @@ control_field() { # $1=control-file $2=field
          $0 ~ ("^" f " ") {sub("^[^ ]* ", ""); print; exit}' "$1"
 }
 
+# On a merged-usr sysroot (bin/lib/sbin are symlinks into usr/) bsdtar
+# replaces those links with real dirs when a deb ships top-level
+# bin/lib/sbin entries — breaking every later exec. Re-assert the links
+# after each unpack by folding any real dir back into its usr/ target.
+MERGED_USR=0
+[ -L "$SYSROOT/bin" ] && MERGED_USR=1
+fixup_merged_dirs() {
+    [ "$MERGED_USR" = 1 ] || return 0
+    local d
+    for d in bin sbin lib lib64; do
+        if [ -d "$SYSROOT/$d" ] && [ ! -L "$SYSROOT/$d" ] && [ -d "$SYSROOT/usr/$d" ]; then
+            (cd "$SYSROOT/$d" && find . -mindepth 1 -exec ditto {} "$SYSROOT/usr/$d/{}" \;)
+            rm -rf "$SYSROOT/$d"
+            ln -s "usr/$d" "$SYSROOT/$d"
+        fi
+    done
+}
+
 for deb in "$@"; do
     cm=$(ar_member "$deb" control.tar)
     dm=$(ar_member "$deb" data.tar)
@@ -103,6 +121,7 @@ for deb in "$@"; do
         echo "!! $pkg extraction failed" >&2
         exit 1
     fi
+    fixup_merged_dirs
 
     # info/<pkg>.list — `/.` then every member as absolute path.
     {
