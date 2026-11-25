@@ -652,6 +652,13 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         out->disp = (s32)(int8_t)take(&d);
         goto done;
     }
+    if (op == 0xe3) { /* jrcxz/jecxz rel8 — cc 16 flags a count test, not flags */
+        out->op = OAH_OP_JCC_REL;
+        out->cc = 16;
+        out->opsize = address32 ? 4 : 8;
+        out->disp = (s32)(int8_t)take(&d);
+        goto done;
+    }
     if (op == 0xe9) {
         out->op = OAH_OP_JMP_REL;
         out->disp = (s32)oah_decoder_read_int(&d, 2);

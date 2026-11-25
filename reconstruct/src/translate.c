@@ -2320,15 +2320,25 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
              * back-edges repatch to direct branches. The xmm spill must
              * precede the b.cond so both paths keep the fixed skip. */
             {
-                u32 cc_cond;
-                if (!emit_flags_for_cc(buf, in.cc, &cc_cond)) {
-                    return false;
-                }
-                if (!emit_xmm_spill(buf, g) ||
-                    !oah_emit_bcond(buf, cc_cond, 24) ||
-                    !frag_exit_imm(buf, after) ||
-                    !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
-                    return false;
+                if (in.cc >= 16) { /* jrcxz/jecxz: cbz rcx/ecx */
+                    if (!emit_xmm_spill(buf, g) ||
+                        !oah_emit_cbz_cbnz(buf, in.opsize == 8, false,
+                                           xn(OAH_X86_RCX), 24) ||
+                        !frag_exit_imm(buf, after) ||
+                        !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
+                        return false;
+                    }
+                } else {
+                    u32 cc_cond;
+                    if (!emit_flags_for_cc(buf, in.cc, &cc_cond)) {
+                        return false;
+                    }
+                    if (!emit_xmm_spill(buf, g) ||
+                        !oah_emit_bcond(buf, cc_cond, 24) ||
+                        !frag_exit_imm(buf, after) ||
+                        !frag_exit_imm(buf, after + (u64)(s64)in.disp)) {
+                        return false;
+                    }
                 }
             }
             done = true;

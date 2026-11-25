@@ -1472,8 +1472,14 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
             g->rip = next;
             break;
         case OAH_OP_JCC_REL:
-            g->rip = oah_condition_holds(insn.cc, g->rflags)
-                   ? next + (u64)(s64)insn.disp : next;
+            if (insn.cc >= 16) { /* jrcxz/jecxz: branch on rcx/ecx zero */
+                u64 count = insn.opsize == 4 ? (u32)g->gpr[OAH_X86_RCX]
+                                           : g->gpr[OAH_X86_RCX];
+                g->rip = !count ? next + (u64)(s64)insn.disp : next;
+            } else {
+                g->rip = oah_condition_holds(insn.cc, g->rflags)
+                       ? next + (u64)(s64)insn.disp : next;
+            }
             break;
         case OAH_OP_MOV_RR:
             write_gpr(g, insn.dst, insn.opsize, g->gpr[insn.src]);
