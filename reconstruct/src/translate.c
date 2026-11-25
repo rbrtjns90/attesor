@@ -1973,6 +1973,33 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         return oah_emit_vec3(buf, OAH_V_EOR, 18, 18, 18) &&
                oah_emit_ins_elem(buf, 3, 18, 0, 16, 0) &&
                emit_st_xmm_reg(buf, g, 18, in->dst, T5);
+    case 0x50: { /* movmskps/movmskpd r32, xmm */
+        if (in->memory || !emit_ld_xmm_reg(buf, g, 16, in->dst, T4)) {
+            return false;
+        }
+        if (in->cc == 2) {
+            /* movmskpd: sign bit of each 64-bit lane. */
+            return oah_emit_vushr_imm(buf, 3, 16, 16, 63) &&
+                   oah_emit_umov_gpr(buf, true, T6, 16, 0x08) &&
+                   oah_emit_umov_gpr(buf, true, T7, 16, 0x18) &&
+                   oah_emit_logic_reg(buf, OAH_LOGIC_ORR, true, T6, T6,
+                                      T7, 0, 1) &&
+                   emit_store_gpr(buf, in->src, T6, 4, in->rex_present);
+        }
+        /* movmskps: sign bit of each 32-bit lane. */
+        return oah_emit_vushr_imm(buf, 2, 16, 16, 31) &&
+               oah_emit_umov_gpr(buf, false, T6, 16, 0x04) &&
+               oah_emit_umov_gpr(buf, false, T7, 16, 0x0c) &&
+               oah_emit_logic_reg(buf, OAH_LOGIC_ORR, false, T6, T6,
+                                  T7, 0, 1) &&
+               oah_emit_umov_gpr(buf, false, T7, 16, 0x14) &&
+               oah_emit_logic_reg(buf, OAH_LOGIC_ORR, false, T6, T6,
+                                  T7, 0, 2) &&
+               oah_emit_umov_gpr(buf, false, T7, 16, 0x1c) &&
+               oah_emit_logic_reg(buf, OAH_LOGIC_ORR, false, T6, T6,
+                                  T7, 0, 3) &&
+               emit_store_gpr(buf, in->src, T6, 4, in->rex_present);
+    }
     case 0xd7:  /* pmovmskb r32, xmm */
         /* Bytes -> 0/1 via ushr#7, then bit-gather each 64-bit half
          * with (x * 0x0102040810204080) >> 56. */
@@ -2293,8 +2320,16 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         case OAH_OP_RET:
             if (!emit_xmm_spill(buf, g) ||
                 !oah_emit_mem(buf, 3, false, false, true, F_NR, rsp, 0) ||
-                !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8) ||
-                !oah_emit_ret(buf)) {
+                !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8)) {
+                return false;
+            }
+            if (in.imm &&
+                (!frag_movi(buf, T7, in.imm) ||
+                 !oah_emit_add_sub_reg(buf, true, false, false, rsp, rsp,
+                                       T7, 0, 0))) {
+                return false;
+            }
+            if (!oah_emit_ret(buf)) {
                 return false;
             }
             done = true;

@@ -418,6 +418,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         bool unpack_fp = !repeat && !repeat_not_equal && (ext == 0x14 || ext == 0x15);
         bool logic_ps = !operand_override && !repeat && !repeat_not_equal &&
                         ext >= 0x54 && ext <= 0x57;
+        bool movemask_fp = ext == 0x50 && !repeat && !repeat_not_equal;
         bool vector_move = ((!operand_override && !repeat &&
                             (ext == 0x10 || ext == 0x11 || (ext >= 0x12 && ext <= 0x17 && ext != 0x14 && ext != 0x15) || ext == 0x28 || ext == 0x29))) ||
                            ((operand_override || repeat) && (ext == 0x6f || ext == 0x7f));
@@ -433,11 +434,17 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                          ext == 0xc4 || ext == 0xc5 || ext == 0xc6 ||
                          (ext >= 0xd4 && ext <= 0xef && ext != 0xe1 && ext != 0xe2 && ext != 0xe6) ||
                          ext == 0xf4 || ext == 0xf5 || (ext >= 0xf8 && ext <= 0xfe));
-        if (vector_shift_count || store_packed_nt || convert_doubles || convert_dwords || convert_ps_pd || duplicate_double || arith_packed_fp || unpack_fp || logic_ps || shuffle_ps || shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
+        if (vector_shift_count || store_packed_nt || convert_doubles || convert_dwords || convert_ps_pd || duplicate_double || arith_packed_fp || unpack_fp || logic_ps || movemask_fp || shuffle_ps || shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
             (repeat && ext == 0x7e)))) {
             take(&d);
             u8 vector_modrm = take(&d);
             decode_rm(&d, out, vector_modrm, rex, address32, segment);
+            if (movemask_fp && out->memory) {
+                return false;
+            }
+            if (movemask_fp) {
+                out->cc = operand_override ? 2 : 1;
+            }
             if (!out->memory && (ext == 0x13 || ext == 0x17 ||
                 (operand_override && (ext == 0x12 || ext == 0x16)))) {
                 return false;
@@ -613,6 +620,11 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
     }
     if (op == 0xc3) {
         out->op = OAH_OP_RET;
+        goto done;
+    }
+    if (op == 0xc2) { /* ret imm16: pop rip, then rsp += imm */
+        out->op = OAH_OP_RET;
+        out->imm = (u64)take(&d) | ((u64)take(&d) << 8);
         goto done;
     }
     if (op == 0x68 || op == 0x6a) {

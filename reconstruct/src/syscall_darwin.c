@@ -2520,9 +2520,13 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
         /* MAP_SHARED_VALIDATE == MAP_SHARED for our purposes. */
         flags = (flags & ~0x3ull) | 0x1;
     }
-    if (!size || size > (1ull << 30) || (prot & ~7ull) ||
+    if (!size || size > (1ull << 42) || (prot & ~7ull) ||
         (flags != 0x01 && flags != 0x11 && flags != 0x21 && flags != 0x31 &&
          flags != 0x02 && flags != 0x12 && flags != 0x22 && flags != 0x32)) {
+        { static int t = -1; if (t < 0) { t = getenv("OAH_MMAP_TRACE") != NULL; }
+          if (t) { fprintf(stderr, "mmap einval addr=%llx sz=%llx fl=%llx\n",
+                           (unsigned long long)address, (unsigned long long)size,
+                           (unsigned long long)flags); } }
         return -EINVAL;
     }
     const u64 mask = OAH_X86_PAGE_SIZE - 1;
@@ -2567,7 +2571,7 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
         }
         for (unsigned i = img->load_segments; i < img->nseg; i++) {
             oah_load_seg *seg = &img->segs[i];
-            if (!seg->allocation || (!seg->file_mapping && seg->prot) || address < seg->gva || address - seg->gva >= seg->size ||
+            if (!seg->allocation || address < seg->gva || address - seg->gva >= seg->size ||
                 size > seg->size - (address - seg->gva)) {
                 continue;
             }
@@ -2668,6 +2672,17 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
             }
             return (s64)address;
         }
+        { static int t = -1; if (t < 0) { t = getenv("OAH_MMAP_TRACE") != NULL; }
+          if (t) { fprintf(stderr, "mmap fixed einval addr=%llx sz=%llx nseg=%u\n",
+                           (unsigned long long)address, (unsigned long long)size,
+                           img->nseg);
+            for (unsigned j = 0; j < img->nseg; j++) {
+                fprintf(stderr, "  seg[%u] gva=%llx sz=%llx prot=%x alloc=%p file=%d\n", j,
+                        (unsigned long long)img->segs[j].gva,
+                        (unsigned long long)img->segs[j].size,
+                        img->segs[j].prot, img->segs[j].allocation,
+                        img->segs[j].file_mapping);
+            } } }
         return -EINVAL;
     }
     if (img->nseg == OAH_MAX_LOAD_SEGS) {
@@ -2912,6 +2927,56 @@ static s64 guest_mremap(oah_image *img, u64 address, u64 prior, u64 requested, u
 static bool current_guest_task(const oah_guest *g, u64 target)
 {
     return !target || (s32)target == getpid() || (g->tid && (u32)target == g->tid);
+}
+
+/* Linux rlimit resource numbers differ from Darwin's for NPROC, NOFILE,
+ * MEMLOCK, and AS; resources past RTTIME have no host equivalent. */
+static int host_rlimit_resource(int linux_resource)
+{
+    static const char map[] = {0, 1, 2, 3, 4, RLIMIT_AS, 7, 8, 6, 5};
+    if ((unsigned)linux_resource >= sizeof(map)) {
+        return -1;
+    }
+    return map[linux_resource];
+}
+
+static s64 guest_prlimit(oah_image *img, pid_t pid, int resource,
+                         u64 new_addr, u64 old_addr)
+{
+    void *output = old_addr ? oah_guest_access(img, old_addr, 16, PROT_WRITE)
+                            : NULL;
+    if (pid) {
+        return -EPERM;
+    }
+    if (old_addr && !output) {
+        return -EFAULT;
+    }
+    int res = host_rlimit_resource(resource);
+    if (res < 0) {
+        return -LINUX_ENOSYS;
+    }
+    struct rlimit limit;
+    if (getrlimit(res, &limit) != 0) {
+        return linux_error(errno);
+    }
+    if (output) {
+        const u64 values[2] = {
+            limit.rlim_cur == RLIM_INFINITY ? UINT64_MAX : limit.rlim_cur,
+            limit.rlim_max == RLIM_INFINITY ? UINT64_MAX : limit.rlim_max};
+        memcpy(output, values, sizeof(values));
+    }
+    if (new_addr) {
+        const void *input = oah_guest_access(img, new_addr, 16, PROT_READ);
+        if (!input) {
+            return -EFAULT;
+        }
+        u64 values[2];
+        memcpy(values, input, sizeof(values));
+        limit.rlim_cur = values[0] == UINT64_MAX ? RLIM_INFINITY : values[0];
+        limit.rlim_max = values[1] == UINT64_MAX ? RLIM_INFINITY : values[1];
+        return host_result(setrlimit(res, &limit));
+    }
+    return 0;
 }
 
 static s64 guest_affinity(oah_guest *g, oah_image *img, u64 task, u64 size, u64 address)
@@ -4029,6 +4094,9 @@ static s64 guest_fd_pair(oah_image *img, u64 address, u64 flags, int socket_type
     }
     int fds[2];
     if ((socket_type ? socketpair(AF_UNIX, socket_type, 0, fds) : pipe(fds)) < 0) {
+        { static int st = -1;
+          if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+          if (st) { fprintf(stderr, "fd_pair host fail errno=%d\n", errno); } }
         return linux_error(errno);
     }
     for (unsigned i = 0; i < 2; i++) {
@@ -4645,6 +4713,12 @@ static int guest_socket_option(u64 level, u64 option, int *host_level)
         case 9: return SO_KEEPALIVE;
         case 20: return SO_RCVTIMEO;
         case 21: return SO_SNDTIMEO;
+        case 16:
+            /* SO_PASSCRED: Darwin sends credentials with SCM_CREDS
+             * unconditionally; our cmsg translation handles them either
+             * way, so accepting the toggle as a no-op is correct. */
+            *host_level = -1;
+            return 0;
         default: return -1;
         }
     }
@@ -5579,13 +5653,21 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         break;
     case 53: { /* socketpair */
         u64 type = a1 & 0xf;
+        { static int st = -1;
+          if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+          if (st) { fprintf(stderr, "socketpair fam=%llu type=%llx proto=%llu\n",
+                            (unsigned long long)a0, (unsigned long long)a1,
+                            (unsigned long long)a2); } }
         if (a0 != 1) {
             result = -LINUX_EAFNOSUPPORT;
         } else if (a2) {
             result = -LINUX_EPROTONOSUPPORT;
-        } else if (type != 1 && type != 2) {
+        } else if (type != 1 && type != 2 && type != 5) {
             result = -LINUX_ESOCKTNOSUPPORT;
         } else {
+            /* Darwin has no SOCK_SEQPACKET for AF_UNIX; datagram sockets
+             * keep the same ordered, record-preserving channel semantics
+             * a connected seqpacket pair provides. */
             result = guest_fd_pair(img, a3, a1 & ~0xfull,
                                    type == 1 ? SOCK_STREAM : SOCK_DGRAM);
         }
@@ -6514,24 +6596,37 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         g->clear_tid = a0;
         result = g->tid ? g->tid : (u32)getpid();
         break;
-    case 302: { /* prlimit64, query the current process stack limit */
-        void *output = a3 ? oah_guest_access(img, a3, 16, PROT_WRITE) : NULL;
-        struct rlimit limit;
-        if (a0 || a2) {
-            result = -EPERM;
-        } else if (a1 != 3) {
-            result = -LINUX_ENOSYS;
-        } else if (a3 && !output) {
+    case 302: { /* prlimit64 */
+        result = guest_prlimit(img, (pid_t)a0, (int)a1, a2, a3);
+        break;
+    }
+    case 97: /* getrlimit */
+    case 160: /* setrlimit */ {
+        int res = host_rlimit_resource((int)a0);
+        void *buf = a1 ? oah_guest_access(img, a1, 16,
+                                          nr == 97 ? PROT_WRITE : PROT_READ)
+                       : NULL;
+        if (a1 && !buf) {
             result = -EFAULT;
-        } else if (getrlimit(RLIMIT_STACK, &limit) != 0) {
-            result = linux_error(errno);
+        } else if (res < 0) {
+            result = -LINUX_ENOSYS;
         } else {
-            const u64 values[2] = {limit.rlim_cur == RLIM_INFINITY ? UINT64_MAX : limit.rlim_cur,
-                                   limit.rlim_max == RLIM_INFINITY ? UINT64_MAX : limit.rlim_max};
-            if (output) {
-                memcpy(output, values, sizeof(values));
+            struct rlimit limit;
+            if (nr == 160) {
+                u64 values[2];
+                memcpy(values, buf, sizeof(values));
+                limit.rlim_cur = values[0] == UINT64_MAX ? RLIM_INFINITY : values[0];
+                limit.rlim_max = values[1] == UINT64_MAX ? RLIM_INFINITY : values[1];
+                result = host_result(setrlimit(res, &limit));
+            } else if (getrlimit(res, &limit) != 0) {
+                result = linux_error(errno);
+            } else {
+                const u64 values[2] = {
+                    limit.rlim_cur == RLIM_INFINITY ? UINT64_MAX : limit.rlim_cur,
+                    limit.rlim_max == RLIM_INFINITY ? UINT64_MAX : limit.rlim_max};
+                memcpy(buf, values, sizeof(values));
+                result = 0;
             }
-            result = 0;
         }
         break;
     }

@@ -1351,6 +1351,23 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                         (unsigned long long)g->gpr[OAH_X86_RBP],
                         (unsigned long long)g->gpr[OAH_X86_RSI],
                         (unsigned long long)g->gpr[OAH_X86_RDI]);
+                {
+                    const u64 *stk = oah_guest_access(
+                        img, g->gpr[OAH_X86_RSP], 64, PROT_READ);
+                    if (stk) {
+                        fprintf(stderr, " stk: %llx %llx %llx %llx\n",
+                                (unsigned long long)stk[0],
+                                (unsigned long long)stk[1],
+                                (unsigned long long)stk[2],
+                                (unsigned long long)stk[3]);
+                    }
+                    int m = oah_image_module_at(img, g->rip);
+                    if (m >= 0) {
+                        fprintf(stderr, " module=%s+%llx\n",
+                                img->modules[m].path,
+                                (unsigned long long)(g->rip - img->modules[m].base));
+                    }
+                }
                 r.status = one.status;
                 r.exit_code = one.exit_code;
                 return r;

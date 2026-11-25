@@ -202,6 +202,16 @@ def main() -> None:
     mask = sum(((INA[i] >> 7) & 1) << i for i in range(16))
     store_gpr32(1, struct.pack("<I", mask))
 
+    code.extend(ld_xmm_mem(b"\xf3", 0x6F, 0, A))
+    code.extend(ld_xmm_regreg(b"", 0x50, 1, 0))                     # movmskps ecx,xmm0
+    mask = sum(((INA[i * 4 + 3] >> 7) & 1) << i for i in range(4))
+    store_gpr32(1, struct.pack("<I", mask))
+
+    code.extend(ld_xmm_mem(b"\xf3", 0x6F, 0, A))
+    code.extend(ld_xmm_regreg(b"\x66", 0x50, 1, 0))                 # movmskpd ecx,xmm0
+    mask = sum(((INA[i * 8 + 7] >> 7) & 1) << i for i in range(2))
+    store_gpr32(1, struct.pack("<I", mask))
+
     # --- xmm<->xmm and 64-bit halves -------------------------------------------
     load2()
     code.extend(ld_xmm_regreg(b"\xf3", 0x7E, 0, 1))                 # movq xmm0,xmm1

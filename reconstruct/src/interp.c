@@ -131,7 +131,7 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         u64 address = effective_address(g, &in->address, next);
         address += in->address.segment == 0x64 ? g->fs_base
                  : in->address.segment == 0x65 ? g->gs_base : 0;
-        if ((in->aligned && (address & 15)) || op == 0xd7) {
+        if ((in->aligned && (address & 15)) || op == 0xd7 || op == 0x50) {
             return false;
         }
         other = oah_guest_access(img, address, width, store ? PROT_WRITE : PROT_READ);
@@ -690,6 +690,18 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         u32 mask = 0;
         for (unsigned i = 0; i < 16; i++) {
             mask |= (u32)(other[i] >> 7) << i;
+        }
+        write_gpr(g, in->src, 4, mask);
+        break;
+    }
+    case 0x50: {
+        /* movmskps/movmskpd: sign bit of each fp lane -> gpr. cc is the
+         * lane width in dwords (1=ps/4 lanes, 2=pd/2 lanes). */
+        u32 mask = 0;
+        u32 step = in->cc == 2 ? 8 : 4;
+        u32 lanes = in->cc == 2 ? 2 : 4;
+        for (unsigned i = 0; i < lanes; i++) {
+            mask |= (u32)(other[i * step + step - 1] >> 7) << i;
         }
         write_gpr(g, in->src, 4, mask);
         break;
@@ -1549,7 +1561,7 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
                 return r;
             }
             memcpy(&g->rip, slot, sizeof(g->rip));
-            g->gpr[OAH_X86_RSP] += 8;
+            g->gpr[OAH_X86_RSP] += 8 + insn.imm;
             break;
         }
         case OAH_OP_VECTOR:
