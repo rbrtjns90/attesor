@@ -329,10 +329,10 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         u8 modrm = take(&d);
         unsigned group = (modrm >> 3) & 7;
         decode_rm(&d, out, modrm, rex, address32, segment);
-        if (op == 0xd9 && out->memory && (group == 5 || group == 7)) {
+        if (op == 0xd9 && out->memory && group >= 4) {
             out->op = OAH_OP_FXSTATE;
-            out->rm_dest = group == 7;
-            out->opsize = 2;
+            out->rm_dest = group >= 6;
+            out->opsize = group == 4 || group == 6 ? 28 : 2;
             goto done;
         }
         bool conditional = !out->memory && modrm <= 0xdf && (op == 0xda || op == 0xdb);
@@ -603,7 +603,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         out->imm = op & 1;
         goto done;
     }
-    if (op == 0x90) {
+    if (op == 0x90 || op == 0x9b) { /* fwait: x87 ops complete synchronously */
         out->op = OAH_OP_NOP;
         goto done;
     }

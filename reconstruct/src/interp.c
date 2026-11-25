@@ -1615,6 +1615,26 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
                 } else {
                     memcpy(g->legacy_fx, area, 2);
                 }
+            } else if (insn.opsize == 28) {
+                /* fnstenv/fldenv: 64-bit env image. Only the fields our
+                 * x87 keeps live (FCW/FSW/FTW/FOP + FIP) need a real
+                 * mapping; reserved bytes store as zero. */
+                if (insn.rm_dest) {
+                    memset(area, 0, 28);
+                    memcpy(area + 0, g->legacy_fx + 0, 2);
+                    memcpy(area + 4, g->legacy_fx + 2, 2);
+                    memcpy(area + 8, g->legacy_fx + 4, 2);
+                    memcpy(area + 12, g->legacy_fx + 6, 2);
+                    memcpy(area + 16, g->legacy_fx + 8, 8);
+                    memcpy(area + 24, g->legacy_fx + 16, 4);
+                } else {
+                    memcpy(g->legacy_fx + 0, area + 0, 2);
+                    memcpy(g->legacy_fx + 2, area + 4, 2);
+                    memcpy(g->legacy_fx + 4, area + 8, 2);
+                    memcpy(g->legacy_fx + 6, area + 12, 2);
+                    memcpy(g->legacy_fx + 8, area + 16, 8);
+                    memcpy(g->legacy_fx + 16, area + 24, 4);
+                }
             } else if (insn.opsize) {
                 u32 value;
                 if (insn.rm_dest) {
