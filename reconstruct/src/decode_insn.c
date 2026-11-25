@@ -627,6 +627,17 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
         out->opsize = 8;
         goto done;
     }
+    if (op == 0x8f) { /* pop r/m — group 1A */
+        u8 modrm = take(&d);
+        if (((modrm >> 3) & 7) != 0) {
+            return false;
+        }
+        decode_rm(&d, out, modrm, rex, address32, segment);
+        out->op = OAH_OP_POP;
+        out->rm_dest = out->memory;
+        out->opsize = operand_override ? 2 : 8;
+        goto done;
+    }
     if (op == 0xeb) {
         out->op = OAH_OP_JMP_REL;
         out->disp = (s32)(int8_t)take(&d);

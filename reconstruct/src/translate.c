@@ -110,7 +110,10 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
             }
             break;
         case OAH_OP_POP:
-            if (flags & OAH_XLAT_DISPATCH_STATE) {
+            if (in.memory || (flags & OAH_XLAT_DISPATCH_STATE)) {
+                if (in.memory && !(flags & OAH_XLAT_DISPATCH_STATE)) {
+                    return false;
+                }
                 return n == 0 || oah_emit_ret(buf);
             }
             if (!oah_emit_ldr_str_uoff(buf, false, xn((oah_x86_gpr)in.dst), rsp, 0) ||
@@ -2252,6 +2255,10 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             }
             break;
         case OAH_OP_POP:
+            if (in.memory) { /* pop r/m — interp handles the store */
+                boundary_interp = true;
+                break;
+            }
             if (!oah_emit_mem(buf, 3, false, false, true,
                               xn((oah_x86_gpr)in.dst), rsp, 0) ||
                 !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8)) {

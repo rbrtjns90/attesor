@@ -1481,6 +1481,22 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
             g->rip = next;
             break;
         case OAH_OP_POP:
+            if (insn.rm_dest) { /* pop r/m: store to effective address */
+                u64 *stack = &g->gpr[OAH_X86_RSP];
+                u64 address = effective_address(g, &insn.address, next);
+                address += insn.address.segment == 0x64 ? g->fs_base
+                         : insn.address.segment == 0x65 ? g->gs_base : 0;
+                u8 *dst = oah_guest_access(img, address, insn.opsize, PROT_WRITE);
+                u8 *src = oah_guest_access(img, *stack, insn.opsize, PROT_READ);
+                if (!dst || !src) {
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+                memcpy(dst, src, insn.opsize);
+                *stack += insn.opsize;
+                g->rip = next;
+                break;
+            }
             if (!pop64(g, img, insn.dst)) {
                 r.status = OAH_INTERP_FAULT;
                 return r;
