@@ -2196,6 +2196,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                 return false;
             }
             info->insns = n;
+            info->src_len = (u32)(cur - rip);
             info->interp_next = 0;
             info->mem_flags = frag_mem;
             return true;
@@ -2455,6 +2456,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             }
             info->nexits = 0; /* interp step must run before the next frag */
             info->insns = n;
+            info->src_len = (u32)(cur - rip);
             info->interp_next = 1;
             info->mem_flags = frag_mem;
             return true;
@@ -2467,6 +2469,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         }
         if (done) {
             info->insns = n + 1;
+            info->src_len = (u32)(after - rip);
             info->interp_next = 0;
             info->mem_flags = frag_mem;
             return true;
@@ -2478,6 +2481,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         return false;
     }
     info->insns = n;
+    info->src_len = (u32)(cur - rip);
     info->interp_next = 0;
     info->mem_flags = frag_mem;
     return true;

@@ -152,6 +152,9 @@ typedef struct {
     u64 owner; /* g->jit_owner: emitted code bakes that thread's bases */
     u32 insns;
     u32 flags;
+    u32 src_len;   /* guest bytes the fragment covers */
+    u64 src_hash;  /* hash of those bytes at translate time */
+    u8 src_ck;     /* source seg is writable: rehash before dispatch */
     u32 code_off;
     u32 code_len;
     u32 stub_off; /* checkpoint stub; chained exits branch here */
@@ -931,9 +934,43 @@ static u32 jit_emit_stub(u8 *at, u32 frag_insns, u32 target_off)
     return (u32)n * 4;
 }
 
+/* Hash of the guest bytes a fragment was translated from. Guest exec pages
+ * map to host read (never write-protected), so stores into writable+exec
+ * guest pages — JIT'd regex engines et al. — never fault and never flush
+ * the cache. The dispatcher rehashes writable-backed fragments to catch
+ * that staleness; read-only mappings can't change and skip the check. */
+static u64 jit_src_hash(oah_image *img, u64 rip, u64 len)
+{
+    u64 h = 0xcbf29ce484222325ull ^ (len * 0x9e3779b97f4a7c15ull);
+    while (len) {
+        u64 avail = len;
+        const u8 *p = oah_guest_span(img, rip, &avail);
+        if (!p || !avail) {
+            return h ^ (rip + len);
+        }
+        for (u64 i = 0; i < avail; i++) {
+            h = (h ^ p[i]) * 0x100000001b3ull;
+        }
+        rip += avail;
+        len -= avail;
+    }
+    return h;
+}
+
+static bool jit_src_writable(oah_image *img, u64 rip)
+{
+    for (unsigned i = 0; i < img->nseg; i++) {
+        const oah_load_seg *s = &img->segs[i];
+        if (rip >= s->gva && rip - s->gva < s->size) {
+            return (s->prot & PROT_WRITE) != 0;
+        }
+    }
+    return false;
+}
+
 /* Copy code into the executable arena and index it. Shared by translation,
  * AOT prewarm, and persistent-cache materialization. */
-static const oah_frag_entry *jit_install(u64 rip, u64 owner,
+static const oah_frag_entry *jit_install(oah_image *img, u64 rip, u64 owner,
                                          const oah_frag_info *info,
                                          const u8 *code, size_t code_len)
 {
@@ -948,6 +985,8 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
         .rip = rip,
         .owner = owner,
         .insns = info->insns,
+        .src_len = info->src_len,
+        .src_ck = jit_src_writable(img, rip),
         .flags = (info->interp_next ? OAH_FRAG_FALLBACK : 0) |
                  info->mem_flags,
         .code_off = (u32)jit_arena_used,
@@ -963,6 +1002,7 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
     for (u32 i = 0; i < e.nbails && i < 8; i++) {
         e.bail_rip[i] = info->bail_rip[i];
     }
+    e.src_hash = e.src_ck ? jit_src_hash(img, rip, e.src_len) : 0;
     if (info->nbounds) {
         e.bounds = malloc(info->nbounds * sizeof(*e.bounds));
         if (e.bounds) {
@@ -983,6 +1023,8 @@ static const oah_frag_entry *jit_install(u64 rip, u64 owner,
     jit_insert(&e);
     return jit_lookup(rip, owner);
 }
+
+static u64 in_block_len(oah_image *img, u64 rip, u32 insns);
 
 /* Materialize a persisted fragment: rebase relocations onto the module's
  * current load address (and live FS/GS bases), then install. */
@@ -1019,6 +1061,7 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
     }
     oah_frag_info info = {.insns = e->insns ? e->insns : 1,
                           .interp_next = e->interp_next};
+    info.src_len = (u32)in_block_len(img, rip, info.insns);
     for (u32 i = 0; i < e->nexits && i < 2; i++) {
         if (e->exit_off[i] > e->code_len || e->code_len - e->exit_off[i] < 4) {
             break;
@@ -1042,7 +1085,7 @@ static const oah_frag_entry *jit_materialize(oah_image *img,
         info.bound_rip[info.nbounds] = brip;
         info.nbounds++;
     }
-    const oah_frag_entry *res = jit_install(rip, g->jit_owner, &info, code,
+    const oah_frag_entry *res = jit_install(img, rip, g->jit_owner, &info, code,
                                             e->code_len);
     free(code);
     return res;
@@ -1053,7 +1096,10 @@ static const oah_frag_entry *jit_translate(oah_image *img, const oah_guest *g,
                                            u64 rip)
 {
     int module = oah_image_module_at(img, rip);
-    if (module >= 0) {
+    /* Writable-backed code (JIT'd regex pages etc.) is revalidated by
+     * src_hash at dispatch; persisted frags keyed to a file module can
+     * resurrect the stale copy, so only read-only mappings use pcache. */
+    if (module >= 0 && !jit_src_writable(img, rip)) {
         u64 off = rip - img->modules[module].base;
         pcache *pc = pcache_open(img, module);
         const pcache_ent *e = pc ? pcache_find(pc, off) : NULL;
@@ -1102,10 +1148,10 @@ static const oah_frag_entry *jit_translate(oah_image *img, const oah_guest *g,
             }
         }
     }
-    const oah_frag_entry *frag = jit_install(rip, g->jit_owner, &info,
+    const oah_frag_entry *frag = jit_install(img, rip, g->jit_owner, &info,
                                              buf.data, buf.size);
     stats_bytes += buf.size;
-    if (frag && module >= 0) {
+    if (frag && module >= 0 && !jit_src_writable(img, rip)) {
         pcache_pend(img, module, rip, buf.data, buf.size, &info);
     }
     oah_asm_buf_destroy(&buf);
@@ -1146,7 +1192,7 @@ static void jit_prewarm(oah_image *img, const oah_guest *g)
             if (oah_translate_frag(&buf, img, g, rip, &info) && buf.size) {
                 stats_bytes += buf.size;
                 if (buf.size <= jit_arena_size - jit_arena_used) {
-                    jit_install(rip, g->jit_owner, &info, buf.data, buf.size);
+                    jit_install(img, rip, g->jit_owner, &info, buf.data, buf.size);
                 }
                 if (seg->module >= 0) {
                     pcache_pend(img, seg->module, rip, buf.data, buf.size,
@@ -1260,6 +1306,15 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                       g->rip >= g->replay_from && g->rip <= g->replay_until;
         const oah_frag_entry *frag =
             (poisoned || replay) ? NULL : jit_lookup(g->rip, g->jit_owner);
+        if (frag && frag->src_ck &&
+            jit_src_hash(img, g->rip, frag->src_len) != frag->src_hash) {
+            /* Guest rewrote exec memory without a flush path (RWX/JIT'd
+             * code pages never fault on store). The whole table is
+             * suspect — stale arena code stays reachable through old
+             * chain links — so flush and retranslate everything fresh. */
+            oah_jit_cache_flush("smc");
+            frag = NULL;
+        }
         if (!frag && !poisoned && !replay) {
             frag = jit_translate(img, g, g->rip);
             /* Persist translations incrementally: a long-running guest
@@ -1657,6 +1712,18 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                         fprintf(stderr, " %02x", bc[bi]);
                     }
                     fputc('\n', stderr);
+                    for (unsigned si = 0; si < img->nseg; si++) {
+                        const oah_load_seg *s = &img->segs[si];
+                        if (entry_rip >= s->gva &&
+                            entry_rip - s->gva < s->size) {
+                            fprintf(stderr,
+                                    " seg%u gva=%llx size=%llx prot=%d"
+                                    " module=%d file=%d\n",
+                                    si, (unsigned long long)s->gva,
+                                    (unsigned long long)s->size, s->prot,
+                                    s->module, s->file_mapping);
+                        }
+                    }
                     if (flag_only) {
                         g_ref = *g;
                         break;

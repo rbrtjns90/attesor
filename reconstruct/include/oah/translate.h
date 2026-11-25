@@ -86,6 +86,7 @@ typedef struct {
 
 typedef struct {
     u32 insns;       /* guest instructions emitted */
+    u32 src_len;     /* guest bytes covered: [rip, rip+src_len) */
     u32 interp_next; /* nonzero: run one interpreter step at the exit RIP */
     u32 nrelocs;     /* relocatable immediates recorded */
     u32 reloc_overflow; /* nonzero: too many relocs — do not persist */
