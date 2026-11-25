@@ -30,6 +30,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/termios.h>
+#include <termios.h>
 #include <sys/xattr.h>
 #include <sys/time.h>
 #include <time.h>
@@ -113,6 +115,149 @@ static volatile sig_atomic_t host_alarm_pending;
 static volatile sig_atomic_t host_child_pending;
 static bool signal_handlers_installed;
 static bool posix_timer_created;
+/* Emulated controlling tty: Darwin never auto-acquires a pty slave as ctty
+ * on open the way Linux does for a session leader, so /dev/tty is backed by
+ * a dup'd fd recorded at slave-open/TIOCSCTTY time. */
+static char guest_ctty_path[64];
+static bool guest_session_leader;
+
+/* termios layout differs everywhere between the ABIs: Linux uses u32 flags
+ * + 19 c_cc + u32 speeds (44 bytes) with its own flag bits and c_cc order;
+ * Darwin uses u64 flags/speeds + 20 c_cc in a different order. Translate
+ * field by field; bits with no counterpart are dropped. */
+typedef struct {
+    u32 c_iflag, c_oflag, c_cflag, c_lflag;
+    u8 c_line, c_cc[19];
+} linux_termios; /* 36 bytes — the TCGETS/TCSETS ABI; speeds are termios2-only */
+
+typedef struct { u32 lin; tcflag_t dar; } termios_bit;
+
+static void termios_flags_to_host(u32 lin, tcflag_t *dar, const termios_bit *map, size_t count)
+{
+    tcflag_t out = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (lin & map[i].lin) {
+            out |= map[i].dar;
+        }
+    }
+    *dar = out;
+}
+
+static u32 termios_flags_to_guest(tcflag_t dar, const termios_bit *map, size_t count)
+{
+    u32 out = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (dar & map[i].dar) {
+            out |= map[i].lin;
+        }
+    }
+    return out;
+}
+
+static const termios_bit termios_iflag[] = {
+    {0x1, IGNBRK}, {0x2, BRKINT}, {0x4, IGNPAR}, {0x8, PARMRK},
+    {0x10, INPCK}, {0x20, ISTRIP}, {0x40, INLCR}, {0x80, IGNCR},
+    {0x100, ICRNL}, {0x400, IXON}, {0x800, IXANY}, {0x1000, IXOFF},
+    {0x2000, IMAXBEL}, {0x4000, IUTF8},
+};
+
+static const termios_bit termios_oflag[] = {
+    {0x1, OPOST}, {0x4, ONLCR}, {0x8, OCRNL}, {0x10, ONOCR}, {0x20, ONLRET},
+};
+
+static const termios_bit termios_cflag[] = {
+    {0x10, CS6}, {0x20, CS7}, {0x30, CS8}, {0x40, CSTOPB}, {0x80, CREAD},
+    {0x100, PARENB}, {0x200, PARODD}, {0x400, HUPCL}, {0x800, CLOCAL},
+    {0x80000000, CCTS_OFLOW | CRTS_IFLOW},
+};
+
+static const termios_bit termios_lflag[] = {
+    {0x1, ISIG}, {0x2, ICANON}, {0x8, ECHO}, {0x10, ECHOE}, {0x20, ECHOK},
+    {0x40, ECHONL}, {0x80, NOFLSH}, {0x100, TOSTOP}, {0x200, ECHOCTL},
+    {0x400, ECHOPRT}, {0x800, ECHOKE}, {0x1000, FLUSHO}, {0x4000, PENDIN},
+    {0x8000, IEXTEN}, {0x10000, EXTPROC},
+};
+
+/* guest c_cc index -> host c_cc index (-1: no counterpart). */
+static const int termios_cc_to_host[] = {
+    8, 9, 3, 5, 0, 17, 16, -1, 12, 13, 10, 1, 6, 15, 4, 14, 2, -1, -1,
+};
+
+#define MAP_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+static const u32 baud_rate[] = {
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800,
+    9600, 19200, 38400,
+};
+static const u32 baud_rate_ext[] = {
+    57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000,
+    1152000, 1500000, 2000000,
+};
+
+static u32 termios_baud_from_speed(speed_t speed)
+{
+    for (size_t i = 0; i < MAP_LEN(baud_rate); i++) {
+        if (baud_rate[i] == speed) {
+            return (u32)i;
+        }
+    }
+    for (size_t i = 0; i < MAP_LEN(baud_rate_ext); i++) {
+        if (baud_rate_ext[i] == speed) {
+            return 0x1000 | (u32)(i + 1); /* CBAUDEX base */
+        }
+    }
+    return 0xf; /* B38400 default */
+}
+
+static speed_t termios_speed_from_baud(u32 baud)
+{
+    u32 index = baud & 0x100f;
+    if ((index & 0x1000) && (index & 0xf) <= MAP_LEN(baud_rate_ext)) {
+        return baud_rate_ext[(index & 0xf) - 1];
+    }
+    return index < MAP_LEN(baud_rate) ? baud_rate[index] : 38400;
+}
+
+static void termios_to_host(const linux_termios *lt, struct termios *ht)
+{
+    memset(ht, 0, sizeof(*ht));
+    termios_flags_to_host(lt->c_iflag, &ht->c_iflag,
+                          termios_iflag, MAP_LEN(termios_iflag));
+    termios_flags_to_host(lt->c_oflag, &ht->c_oflag,
+                          termios_oflag, MAP_LEN(termios_oflag));
+    termios_flags_to_host(lt->c_cflag, &ht->c_cflag,
+                          termios_cflag, MAP_LEN(termios_cflag));
+    termios_flags_to_host(lt->c_lflag, &ht->c_lflag,
+                          termios_lflag, MAP_LEN(termios_lflag));
+    for (size_t i = 0; i < MAP_LEN(termios_cc_to_host); i++) {
+        if (termios_cc_to_host[i] >= 0) {
+            ht->c_cc[termios_cc_to_host[i]] = lt->c_cc[i];
+        }
+    }
+    speed_t speed = termios_speed_from_baud(lt->c_cflag);
+    ht->c_ispeed = speed;
+    ht->c_ospeed = speed;
+}
+
+static void termios_to_guest(const struct termios *ht, linux_termios *lt)
+{
+    memset(lt, 0, sizeof(*lt));
+    lt->c_iflag = termios_flags_to_guest(ht->c_iflag,
+                                       termios_iflag, MAP_LEN(termios_iflag));
+    lt->c_oflag = termios_flags_to_guest(ht->c_oflag,
+                                       termios_oflag, MAP_LEN(termios_oflag));
+    lt->c_cflag = termios_flags_to_guest(ht->c_cflag,
+                                       termios_cflag, MAP_LEN(termios_cflag));
+    lt->c_lflag = termios_flags_to_guest(ht->c_lflag,
+                                       termios_lflag, MAP_LEN(termios_lflag));
+    for (size_t i = 0; i < MAP_LEN(termios_cc_to_host); i++) {
+        if (termios_cc_to_host[i] >= 0) {
+            lt->c_cc[i] = ht->c_cc[termios_cc_to_host[i]];
+        }
+    }
+    u32 baud = termios_baud_from_speed(ht->c_ospeed ? ht->c_ospeed : ht->c_ispeed);
+    lt->c_cflag = (lt->c_cflag & ~0x100fu) | baud;
+}
 
 typedef struct guest_child {
     pid_t pid;
@@ -661,6 +806,7 @@ static void guest_fork_child_cleanup(void)
 {
     workers = 0;
     futex_waiters = NULL;
+    guest_session_leader = false; /* ctty is inherited; leadership is not */
     pthread_mutex_init(&guest_lock, NULL);
     pthread_mutex_lock(&guest_lock);
 }
@@ -1183,6 +1329,12 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
      * may open the slave without a TIOCSPTLCK ioctl (xterm's child retry
      * path). Unlock at master-open time to match Linux. */
     bool is_ptmx = !strcmp(path, "/dev/ptmx");
+    /* Linux /dev/tty is the caller's controlling terminal; Darwin's is the
+     * host session's, and a guest session leader's slave open does not
+     * register a ctty there. Return the recorded guest ctty when set. */
+    if (!strcmp(path, "/dev/tty") && guest_ctty_path[0]) {
+        return open(guest_ctty_path, host_flags, (mode_t)mode);
+    }
     /* Linux pts slaves are /dev/pts/N; Darwin names them /dev/ttysNNN.
      * TIOCGPTN hands guests the unit number, which they open as
      * /dev/pts/N — translate it to the Darwin slave device. */
@@ -1192,6 +1344,13 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
             char slave[64];
             snprintf(slave, sizeof(slave), "/dev/ttys%03d", unit);
             int fd = open(slave, host_flags, (mode_t)mode);
+            /* A session leader without a ctty acquires the slave as its
+             * controlling terminal on a plain open (no O_NOCTTY). Darwin
+             * never does this, so record it for /dev/tty emulation. */
+            if (fd >= 0 && guest_session_leader && !guest_ctty_path[0] &&
+                !(host_flags & O_NOCTTY)) {
+                strlcpy(guest_ctty_path, slave, sizeof(guest_ctty_path));
+            }
             if (fd >= 0 || (errno != ENOENT && errno != ENOTDIR)) {
                 return guest_lockable_fd(fd, host_flags);
             }
@@ -2092,6 +2251,13 @@ static s64 guest_stat(oah_image *img, int dirfd, const char *path, u64 addr, u64
     }
     if (flags & ~0x1900ull) { /* AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW. */
         return -EINVAL;
+    }
+    char pts[64];
+    int unit = -1;
+    if (path && !strncmp(path, "/dev/pts/", 9) &&
+        sscanf(path + 9, "%d", &unit) == 1) {
+        snprintf(pts, sizeof(pts), "/dev/ttys%03d", unit);
+        path = pts;
     }
     struct stat st;
     int result;
@@ -5189,9 +5355,71 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             }
             break;
         }
+        if (a1 == 0x5441) { /* TIOCGPTPEER: slave fd for this master */
+            const char *name = ptsname((int)a0);
+            if (!name) {
+                result = -ENOTTY;
+                break;
+            }
+            int sflags = (int)(a2 & 3);
+            u64 rest = a2 & ~3ull;
+            for (unsigned i = 0; i < sizeof(open_flags) / sizeof(open_flags[0]); i++) {
+                if (rest & open_flags[i].guest) {
+                    sflags |= open_flags[i].host;
+                    rest &= ~open_flags[i].guest;
+                }
+            }
+            if (rest) {
+                result = -EINVAL;
+                break;
+            }
+            result = host_result(guest_lockable_fd(open(name, sflags, 0),
+                                                 sflags));
+            break;
+        }
+        if (a1 == 0x5451 || a1 == 0x5450) { /* FIOCLEX, FIONCLEX */
+            result = host_result(ioctl((int)a0,
+                                       a1 == 0x5451 ? FIOCLEX : FIONCLEX));
+            break;
+        }
+        if (a1 >= 0x5401 && a1 <= 0x5404) {
+            /* TCGETS, TCSETS, TCSETSW, TCSETSF over translated termios. */
+            static const unsigned long host_req[] = {
+                TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF,
+            };
+            bool get = a1 == 0x5401;
+            linux_termios *lt = oah_guest_access(img, a2, sizeof(*lt),
+                                                 get ? PROT_WRITE : PROT_READ);
+            if (!lt) {
+                result = -EFAULT;
+                break;
+            }
+            struct termios ht;
+            if (get) {
+                result = host_result(ioctl((int)a0, TIOCGETA, &ht));
+                if (result >= 0) {
+                    termios_to_guest(&ht, lt);
+                }
+            } else {
+                termios_to_host(lt, &ht);
+                result = host_result(ioctl((int)a0, host_req[a1 - 0x5401], &ht));
+            }
+            break;
+        }
         struct winsize *size = oah_guest_access(img, a2, sizeof(*size), PROT_WRITE);
         if (a1 == 0x540e) { /* TIOCSCTTY */
             result = host_result(ioctl((int)a0, TIOCSCTTY, 0));
+            if (result >= 0 &&
+                fcntl((int)a0, F_GETPATH, guest_ctty_path) < 0) {
+                guest_ctty_path[0] = 0;
+            }
+            break;
+        }
+        if (a1 == 0x5422) { /* TIOCNOTTY */
+            result = host_result(ioctl((int)a0, TIOCNOTTY));
+            if (result >= 0) {
+                guest_ctty_path[0] = 0;
+            }
             break;
         }
         if (a1 == 0x5414) { /* TIOCSWINSZ — same 4x u16 layout on both. */
@@ -5219,6 +5447,13 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         int host_flags = faccess_flags & 0x200 ? AT_EACCESS : 0;
         const char *prel;
         char canon[256];
+        char pts[64];
+        int unit = -1;
+        if (path && !strncmp(path, "/dev/pts/", 9) &&
+            sscanf(path + 9, "%d", &unit) == 1) {
+            snprintf(pts, sizeof(pts), "/dev/ttys%03d", unit);
+            path = pts;
+        }
         if (!path) {
             result = -EFAULT;
         } else if (mode & ~7ull || faccess_flags & ~0x700ull) {
@@ -5466,6 +5701,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         break;
     case 112: /* setsid */
         result = host_result(setsid());
+        if (result >= 0) {
+            /* Fresh session: no controlling tty until the next slave open
+             * or TIOCSCTTY (Linux drops the inherited ctty here). */
+            guest_session_leader = true;
+            guest_ctty_path[0] = 0;
+        }
         break;
     case 109: { /* setpgid, scoped to the guest process and its children */
         pid_t pid = (pid_t)a0, group = (pid_t)a1;
@@ -5687,6 +5928,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         u64 flags = nr == 452 ? a3 : 0;
         int fd = nr == 90 ? AT_FDCWD : darwin_dirfd(a0);
         char mut[PATH_MAX];
+        int unit = -1;
+        if (path && !strncmp(path, "/dev/pts/", 9) &&
+            sscanf(path + 9, "%d", &unit) == 1) {
+            snprintf(mut, sizeof(mut), "/dev/ttys%03d", unit);
+            path = mut;
+        }
         int mr = resolve_mut_path(img, path, mut, sizeof(mut));
         result = !path ? -EFAULT : mr < 0 ? mr : flags & ~0x100ull ? -EINVAL :
                  host_result(fchmodat(fd, mr ? mut : path, (mode_t)(nr == 90 ? a1 : a2),
@@ -5700,6 +5947,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                   ? owner_record_path(img, (int)a0, "", true, fp, sizeof(fp))
                   : 0;
         result = orp < 0 ? orp : orp ? record_guest_owner(fp, a1, a2, false)
+               : a0 < OAH_FD_PATH_MAX &&
+                 !strncmp(fd_path[a0], "/dev/ttys", 9) ? 0
                                      : host_result(fchown((int)a0, (uid_t)a1,
                                                           (gid_t)a2));
         break;
@@ -5912,7 +6161,15 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                             hp += rl;
                         }
                     }
-                    snprintf(linkbuf, sizeof(linkbuf), "%s", hp);
+                    int unit = -1;
+                    if (!strncmp(hp, "/dev/ttys", 9) &&
+                        sscanf(hp + 9, "%d", &unit) == 1) {
+                        /* Report pty slaves by their guest /dev/pts name so
+                         * ttyname() and chown paths stay in guest terms. */
+                        snprintf(linkbuf, sizeof(linkbuf), "/dev/pts/%d", unit);
+                    } else {
+                        snprintf(linkbuf, sizeof(linkbuf), "%s", hp);
+                    }
                     target = linkbuf;
                 } else if (end != prel + 8 && !*end && fdn >= 0) {
                     result = -ENOENT;
@@ -6177,6 +6434,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                   owner_record_path(img, AT_FDCWD, path, false, rp, sizeof(rp));
         if (!path) {
             result = -EFAULT;
+        } else if (!strncmp(path, "/dev/pts/", 9)) {
+            result = 0; /* pty slaves belong to the opener; no host node */
         } else if (orp < 0) {
             result = orp;
         } else if (orp > 0 && guest_root(img)) {
@@ -6200,6 +6459,8 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                                     rp, sizeof(rp));
         if (!path) {
             result = -EFAULT;
+        } else if (!strncmp(path, "/dev/pts/", 9)) {
+            result = 0; /* pty slaves belong to the opener; no host node */
         } else if (a4 & ~0x1100ull) {
             result = -EINVAL;
         } else if (orp < 0) {

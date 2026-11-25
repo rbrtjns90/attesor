@@ -1572,6 +1572,12 @@ void oah_translate_enable_sse(bool on)
  * together they match x86 packss* (dest narrows low, source high). */
 #define OAH_V_SQXTN(sz)  (0x0e214800u | ((u32)(sz) << 22))
 #define OAH_V_SQXTN2(sz) (0x4e214800u | ((u32)(sz) << 22))
+/* pmaddwd idiom: SMULL widens the low word products to dwords, SMULL2 the
+ * high ones, then ADDP pairs them — dst.s[i] = a.h[2i]*b.h[2i] +
+ * a.h[2i+1]*b.h[2i+1]. */
+#define OAH_V_SMULL_4H   0x0e60c000u
+#define OAH_V_SMULL2_8H  0x4e60c000u
+#define OAH_V_ADDP_4S    0x4ea0bc00u
 
 /* --- XMM-in-NEON residency --------------------------------------------------
  * Within a fragment each guest xmm[i] lives in a host NEON register so
@@ -1770,6 +1776,18 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
         }
     case 0xda: enc = OAH_V_UMIN; goto alu;     /* pminub */
     case 0xde: enc = OAH_V_UMAX; goto alu;     /* pmaxub */
+    case 0xf5:  /* pmaddwd: sign-widen word products, pairwise add */
+        if (!emit_ld_xmm_reg(buf, g, 16, in->src, T4) ||
+            !emit_ld_rm128(buf, g, in, next, 17)) {
+            return false;
+        }
+        /* v18 = lo products; v16 = hi products (input consumed, dead);
+         * addp(v18,v16) pairs them into dword lanes. Only v16-18 are
+         * scratch — v19+ hold resident guest xmm8-15. */
+        oah_asm_emit32(buf, OAH_V_SMULL_4H | (17u << 16) | (16u << 5) | 18);
+        oah_asm_emit32(buf, OAH_V_SMULL2_8H | (17u << 16) | (16u << 5) | 16);
+        oah_asm_emit32(buf, OAH_V_ADDP_4S | (16u << 16) | (18u << 5) | 16);
+        return emit_st_xmm_reg(buf, g, 16, in->src, T4);
     case 0x71:  /* psrlw /2, psraw /4, psllw /6 */
     case 0x72:  /* psrld /2, psrad /4, pslld /6 */
     case 0x73:  /* psrlq /2, psrldq /3, psllq /6, pslldq /7 */

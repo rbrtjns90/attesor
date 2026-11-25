@@ -426,6 +426,17 @@ static bool run_vector(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
             memcpy(xmm + offset, &product, sizeof(product));
         }
         break;
+    case 0xf5:
+        for (unsigned offset = 0; offset < 16; offset += 4) {
+            s16 a0, a1, b0, b1;
+            memcpy(&a0, xmm + offset, sizeof(a0));
+            memcpy(&a1, xmm + offset + 2, sizeof(a1));
+            memcpy(&b0, other + offset, sizeof(b0));
+            memcpy(&b1, other + offset + 2, sizeof(b1));
+            s32 product = (s32)a0 * b0 + (s32)a1 * b1;
+            memcpy(xmm + offset, &product, sizeof(product));
+        }
+        break;
     case 0xd4:
     case 0xf9:
     case 0xfa:

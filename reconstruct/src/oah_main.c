@@ -228,6 +228,17 @@ int main(int argc, char **argv, char **envp)
     }
 
 #if defined(__APPLE__)
+    /* A host-rooted argv[0] (oah /path/to/sysroot/usr/bin/foo) must not
+     * reach the guest: programs that derive install paths from argv[0]
+     * (LibreOffice's $SYSBINDIR) would build host paths the sysroot then
+     * cannot resolve. Strip the sysroot prefix to the guest path. */
+    if (img.sysroot && program_argv[0]) {
+        size_t slen = strlen(img.sysroot);
+        if (!strncmp(program_argv[0], img.sysroot, slen) &&
+            program_argv[0][slen] == '/') {
+            program_argv[0] += slen;
+        }
+    }
     img.interpret = interpret;
     img.instruction_limit = instruction_limit;
     if (_NSGetExecutablePath(executable, &executable_size) == 0 && realpath(executable, launcher)) {

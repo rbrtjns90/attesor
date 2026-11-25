@@ -142,6 +142,11 @@ def main() -> None:
              lambda: unlanes([min(x, y) for x, y in zip(lanes(INA, 1), lanes(INB, 1))], 1))
     emit_alu("pmaxub", 0xDE,
              lambda: unlanes([max(x, y) for x, y in zip(lanes(INA, 1), lanes(INB, 1))], 1))
+    aw, bw = sbytes(INA, 2), sbytes(INB, 2)
+    emit_alu("pmaddwd", 0xF5,
+             lambda: unlanes([aw[2 * i] * bw[2 * i] +
+                              aw[2 * i + 1] * bw[2 * i + 1]
+                              for i in range(4)], 4))
     load2()
     code.extend(ld_xmm_regreg(b"", 0x12, 0, 1))               # movhlps (unprefixed)
     store_xmm(0, INB[8:16] + INA[8:16])        # dst.d0=src.d1, dst.d1 kept

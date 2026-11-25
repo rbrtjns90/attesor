@@ -383,8 +383,8 @@ def main():
                 for path, expected in HASHES.items():
                     if hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
                         raise ValueError(f"fixture does not match the pinned Debian image: {path}")
-                cat = str(root / "usr/bin/cat").encode()
-                missing = (1, b"", cat + b": missing.txt: No such file or directory\n")
+                missing = (1, b"",
+                           b"/usr/bin/cat: missing.txt: No such file or directory\n")
                 for name, argv, stdin, expected in tool_cases() + [
                     ("cat", ["missing.txt"], b"", missing),
                     ("printf", ["%.2f\n", "1.25"], b"", (0, b"1.25\n", b"")),
@@ -405,7 +405,7 @@ def main():
                     verify(runner, directory, "glibc timeout terminates its child",
                            [*timeout, "0.05", "/usr/bin/sleep", "2"], (124, b"", b""))
                 strict = {"OAH_SYSROOT_STRICT": "1"}
-                cat = str(root / "usr/bin/cat").encode()
+                cat = b"/usr/bin/cat"
                 verify(runner, directory, "strict mode hides host paths",
                        ["--sysroot", str(root), str(root / "usr/bin/cat"),
                         "/System/Library/CoreServices/SystemVersion.plist"],

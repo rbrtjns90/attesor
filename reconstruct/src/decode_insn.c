@@ -432,7 +432,7 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
                          (ext >= 0x54 && ext <= 0x57) || ext == 0x28 || ext == 0x29 || ext == 0x6d || (ext >= 0x70 && ext <= 0x73) ||
                          ext == 0xc4 || ext == 0xc5 || ext == 0xc6 ||
                          (ext >= 0xd4 && ext <= 0xef && ext != 0xe1 && ext != 0xe2 && ext != 0xe6) ||
-                         ext == 0xf4 || (ext >= 0xf8 && ext <= 0xfe));
+                         ext == 0xf4 || ext == 0xf5 || (ext >= 0xf8 && ext <= 0xfe));
         if (vector_shift_count || store_packed_nt || convert_doubles || convert_dwords || convert_ps_pd || duplicate_double || arith_packed_fp || unpack_fp || logic_ps || shuffle_ps || shuffle_words || scalar_move || scalar_fp || compare_fp || (!repeat_not_equal && (vector_move || vector_66 ||
             (repeat && ext == 0x7e)))) {
             take(&d);
