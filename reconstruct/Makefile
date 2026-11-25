@@ -127,6 +127,9 @@ tests/exec_guard_guest.x86_64: tools/mk_exec_guard_elf.py
 tests/flag_live_guest.x86_64: tools/mk_flag_live_elf.py
 	python3 tools/mk_flag_live_elf.py $@
 
+tests/smc_chain_guest.x86_64: tools/mk_smc_chain_elf.py
+	python3 tools/mk_smc_chain_elf.py $@
+
 tests/vec_align_guest.x86_64: tools/mk_vec_align_elf.py
 	python3 tools/mk_vec_align_elf.py $@
 
@@ -156,7 +159,7 @@ test: test-unit oah tests/hello.x86_64
 
 endif
 
-test-macos: oah tests/hello.x86_64 tests/sse_guest.x86_64 tests/thread_guest.x86_64 tests/fault_store_guest.x86_64 tests/fault_state_guest.x86_64 tests/exec_guard_guest.x86_64 tests/flag_live_guest.x86_64 tests/vec_align_guest.x86_64 tests/diff_guest.x86_64 tests/test_elf_map
+test-macos: oah tests/hello.x86_64 tests/sse_guest.x86_64 tests/thread_guest.x86_64 tests/fault_store_guest.x86_64 tests/fault_state_guest.x86_64 tests/exec_guard_guest.x86_64 tests/flag_live_guest.x86_64 tests/smc_chain_guest.x86_64 tests/vec_align_guest.x86_64 tests/diff_guest.x86_64 tests/test_elf_map
 	@test "$(HOST_OS)" = Darwin || { echo "test-macos requires macOS"; exit 1; }
 	./tests/test_elf_map
 	python3 tools/test_macos.py --runner ./oah --hello tests/hello.x86_64 \
@@ -167,6 +170,7 @@ test-macos: oah tests/hello.x86_64 tests/sse_guest.x86_64 tests/thread_guest.x86
 	    --diff tests/diff_guest.x86_64 \
 	    --exec-guard tests/exec_guard_guest.x86_64 \
 	    --flag-live tests/flag_live_guest.x86_64 \
+    --smc-chain tests/smc_chain_guest.x86_64 \
 	    --vec-align tests/vec_align_guest.x86_64 \
 	    $(if $(BUSYBOX_STATIC),--busybox "$(BUSYBOX_STATIC)") \
 	    $(if $(ALPINE_SYSROOT),--alpine-sysroot "$(ALPINE_SYSROOT)") \

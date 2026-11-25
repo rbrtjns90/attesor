@@ -91,6 +91,8 @@ def main():
                         help="executable-range invalidation fixture")
     parser.add_argument("--flag-live", type=Path,
                         help="zero-count shift flag-liveness fixture")
+    parser.add_argument("--smc-chain", type=Path,
+                        help="self-modifying code under fragment chaining")
     parser.add_argument("--vec-align", type=Path,
                         help="vector memory fault-semantics fixture")
     parser.add_argument("--busybox", type=Path)
@@ -308,6 +310,35 @@ def main():
                             f"OK + exit 0, got rc={rc} out={out!r} "
                             f"err={err!r}")
                     print(f"PASS {mode}: zero-count shift flag liveness")
+            if args.smc_chain:
+                # Writable-backed fragments carry a source hash that
+                # dispatch re-checks, but a chain link patched into such
+                # a fragment would skip the check entirely: the guest
+                # could rewrite the target and keep running stale arena
+                # code through the link. The fixture writes caller and
+                # callee stubs into an RWX page, warms the caller->callee
+                # chain, then rewrites the callee twice — each call must
+                # see the new bytes (a stale link returns the old
+                # constant -> exit 66). JIT modes must also report an
+                # "smc" flush per rewrite under OAH_JIT_FLUSH_DEBUG.
+                for mode, options, mode_env in MODES:
+                    env = dict(mode_env)
+                    env["OAH_JIT_FLUSH_DEBUG"] = "1"
+                    rc, out, err = run(
+                        [runner, *options, str(args.smc_chain.resolve())],
+                        directory, b"", extra_env=env)
+                    if rc != 0 or out != b"OK\n":
+                        raise ValueError(
+                            f"{mode} smc-chain: expected OK + exit 0, "
+                            f"got rc={rc} out={out!r} err={err!r}")
+                    if mode != "interpret":
+                        smc = [line for line in err.splitlines()
+                               if line.startswith(b"jit flush (smc)")]
+                        if len(smc) != 2:
+                            raise ValueError(
+                                f"{mode} smc-chain: expected two smc "
+                                f"flushes, got {smc!r} (stderr={err!r})")
+                    print(f"PASS {mode}: self-modifying code under chaining")
             if args.vec_align:
                 # aarch64 NEON never faults on unaligned addresses, so
                 # the JIT must guard aligned vector memory forms itself:
@@ -417,6 +448,7 @@ def main():
                     ("python_threads.py", b"six workers joined\n"),
                     ("python_readiness.py", b"epoll and eventfd readiness checks passed\n"),
                     ("python_mmsg.py", b"mmsg semantics checks passed\n"),
+                    ("python_scm_rights.py", b"scm rights descriptor passing works\n"),
                 ):
                     verify(runner, directory, f"Debian {fixture}",
                            ["--max-insns", "500000000", "--sysroot", str(root),

@@ -1372,9 +1372,14 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
              * Chaining a load-bearing exit into a store-bearing target
              * would put replayed loads after committed stores — they
              * would re-read new bytes — so such links stay unpatched
-             * and the store fragment is always entered fresh. */
-            bool hazard = (chain_prev->flags & OAH_FRAG_HAS_LOAD) &&
-                          (frag->flags & OAH_FRAG_HAS_STORE);
+             * and the store fragment is always entered fresh.
+             * Writable-backed targets (src_ck) stay unpatched too: a
+             * chain link into one would bypass the dispatch-time source
+             * hash and keep executing stale code after the guest
+             * rewrites it. */
+            bool hazard = ((chain_prev->flags & OAH_FRAG_HAS_LOAD) &&
+                           (frag->flags & OAH_FRAG_HAS_STORE)) ||
+                          frag->src_ck;
             for (u32 i = 0; !hazard && i < chain_prev->nexits; i++) {
                 if (chain_prev->exit_off[i] &&
                     chain_prev->exit_rip[i] == frag->rip) {

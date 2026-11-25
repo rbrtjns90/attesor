@@ -4184,10 +4184,11 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
         host.msg_name = &name;
         host.msg_namelen = name_needed;
     }
-    /* Control messages: cmsghdr layout matches (LP64 both sides); only the
-     * level/type values differ. Guest fds are host fds, so SCM_RIGHTS is a
-     * passthrough. SCM_CREDENTIALS is dropped — Darwin attaches peer creds
-     * implicitly (SO_PEERCRED answers them). */
+    /* Control messages: the guest cmsghdr is Linux's 16-byte header
+     * ({u64 len, u32 level, u32 type}); Darwin's is 12 bytes with a
+     * u32 len. Translate each cmsg and lay the host buffer out with the
+     * host CMSG_* macros — never copy the guest layout verbatim. Guest
+     * fds are host fds, so SCM_RIGHTS is a passthrough. */
     u8 host_control[1024];
     size_t host_control_used = 0;
     if (!receiving && data.control_length) {
@@ -4209,15 +4210,17 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
             const u8 *cdata = gctl + off + 16;
             size_t dlen = (size_t)clen - 16;
             if (level == 1 && type == 1) { /* SCM_RIGHTS */
-                size_t need = 16 + ((dlen + 7) & ~(size_t)7);
+                size_t need = CMSG_SPACE(dlen);
                 if (host_control_used + need > sizeof(host_control)) {
                     return -EINVAL;
                 }
                 struct cmsghdr *h = (struct cmsghdr *)(host_control + host_control_used);
-                h->cmsg_len = 16 + dlen;
+                h->cmsg_len = CMSG_LEN(dlen);
                 h->cmsg_level = SOL_SOCKET;
                 h->cmsg_type = SCM_RIGHTS;
-                memcpy(host_control + host_control_used + 16, cdata, dlen);
+                memcpy(CMSG_DATA(h), cdata, dlen);
+                memset(host_control + host_control_used + CMSG_LEN(dlen), 0,
+                       need - CMSG_LEN(dlen));
                 host_control_used += need;
             }
             off += (clen + 7) & ~(u64)7;
@@ -4274,7 +4277,7 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
             }
         }
         u64 guest_control_used = 0;
-        if (host.msg_control && host.msg_controllen >= 16 &&
+        if (host.msg_control && host.msg_controllen >= CMSG_LEN(0) &&
             !(flags & 2 /* MSG_PEEK */)) {
             u8 *gctl_out = oah_guest_access(img, data.control,
                                             data.control_length, PROT_WRITE);
@@ -4294,7 +4297,7 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
                 } else {
                     continue;
                 }
-                size_t dlen = (size_t)c->cmsg_len - 16;
+                size_t dlen = (size_t)c->cmsg_len - CMSG_LEN(0);
                 size_t need = 16 + ((dlen + 7) & ~(size_t)7);
                 if (guest_control_used + need > data.control_length) {
                     data.flags |= 8; /* MSG_CTRUNC */
@@ -4305,7 +4308,7 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
                 memcpy(g, &glen, 8);
                 memcpy(g + 8, &level, 4);
                 memcpy(g + 12, &type, 4);
-                memcpy(g + 16, (const u8 *)c + 16, dlen);
+                memcpy(g + 16, CMSG_DATA(c), dlen);
                 memset(g + 16 + dlen, 0, need - 16 - dlen);
                 guest_control_used += need;
             }
