@@ -128,6 +128,9 @@ void *oah_guest_access(const oah_image *img, u64 gva, u64 len, u32 prot);
  * the interpreter without double-applying its stores. */
 extern __thread bool oah_suppress_guest_stores;
 const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len);
+/* Like oah_guest_span but fetches through adjacent exec-capable segs when
+ * an instruction straddles a seg boundary; may return buf. */
+const u8 *oah_guest_code(const oah_image *img, u64 gva, u64 *len, u8 *buf);
 
 /* Translate a guest pointer; NULL if not in a guest mapping. */
 void *oah_guest_to_host(const oah_image *img, u64 gva, u64 len);

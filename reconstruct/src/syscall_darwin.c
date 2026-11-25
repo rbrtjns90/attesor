@@ -2143,6 +2143,15 @@ static const struct { u32 guest; int host; } open_flags[] = {
  * their module so translated fragments can persist across runs. */
 #define OAH_FD_PATH_MAX 1024
 static char fd_path[OAH_FD_PATH_MAX][PATH_MAX];
+/* memfd_create emulation: Darwin has no file sealing, so seals are tracked
+ * here and enforced at the ftruncate/mmap call sites. */
+static u8 fd_seals[OAH_FD_PATH_MAX];
+static bool fd_is_memfd[OAH_FD_PATH_MAX];
+#define OAH_F_SEAL_SEAL  0x01
+#define OAH_F_SEAL_SHRINK 0x02
+#define OAH_F_SEAL_GROW  0x04
+#define OAH_F_SEAL_WRITE 0x08
+#define OAH_F_SEAL_FUTURE_WRITE 0x10
 
 static void track_fd_path(int fd)
 {
@@ -2158,6 +2167,8 @@ static void untrack_fd_path(int fd)
 {
     if (fd >= 0 && fd < OAH_FD_PATH_MAX) {
         fd_path[fd][0] = 0;
+        fd_seals[fd] = 0;
+        fd_is_memfd[fd] = false;
     }
 }
 
@@ -2205,9 +2216,18 @@ static s64 guest_open(oah_image *img, int dirfd, u64 address, u64 flags, u64 mod
             if (end == prel + 8 || *end) {
                 return -ENOENT;
             }
-            return host_result(fcntl((int)fdn,
-                                     host_flags & O_CLOEXEC ? F_DUPFD_CLOEXEC
-                                                            : F_DUPFD, 0));
+            s64 r = host_result(fcntl((int)fdn,
+                                      host_flags & O_CLOEXEC ? F_DUPFD_CLOEXEC
+                                                             : F_DUPFD, 0));
+            if (r >= 0 && fdn < OAH_FD_PATH_MAX && r < OAH_FD_PATH_MAX) {
+                fd_seals[(int)r] = fd_seals[fdn];
+                fd_is_memfd[(int)r] = fd_is_memfd[fdn];
+            }
+            { static int t = -1;
+              if (t < 0) { t = getenv("OAH_MFD_TRACE") != NULL; }
+              if (t) { fprintf(stderr, "proc/self/fd open fd=%ld flags=%x -> %lld\n",
+                               fdn, host_flags, (long long)r); } }
+            return r;
         } else {
             return procfs_open(img, prel, host_flags, mode);
         }
@@ -2541,7 +2561,8 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
         if (fstat(fd, &metadata) != 0) {
             return linux_error(errno);
         }
-        if (!S_ISREG(metadata.st_mode)) {
+        /* Darwin POSIX shm objects (memfd backing) report S_IFMT == 0. */
+        if (!S_ISREG(metadata.st_mode) && (metadata.st_mode & S_IFMT)) {
             return -ENODEV;
         }
     } else if (fd != -1 || offset) {
@@ -2670,6 +2691,11 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
             if (file) {
                 tag_mapped_module(img, address, size, fd);
             }
+            { static int t = -1; if (t < 0) { t = getenv("OAH_MMAP_TRACE") != NULL; }
+              if (t) { fprintf(stderr, "mmap fixed addr=%llx sz=%llx prot=%llx -> ok\n",
+                               (unsigned long long)address,
+                               (unsigned long long)size,
+                               (unsigned long long)prot); } }
             return (s64)address;
         }
         { static int t = -1; if (t < 0) { t = getenv("OAH_MMAP_TRACE") != NULL; }
@@ -2689,6 +2715,12 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
         return -ENOMEM;
     }
     u8 *backing;
+    if (file && (flags & 0x01) && fd >= 0 && fd < OAH_FD_PATH_MAX &&
+        fd_seals[fd] & (OAH_F_SEAL_WRITE | OAH_F_SEAL_FUTURE_WRITE) &&
+        prot & PROT_WRITE) {
+        return fd_seals[fd] & OAH_F_SEAL_FUTURE_WRITE ? -EBUSY
+                                                      : -EPERM;
+    }
     if (file && (flags & 0x01)) {
         /* MAP_SHARED on a file: hand the guest a genuinely shared host
          * mapping so writes reach the file (gdbm database updates). */
@@ -2699,6 +2731,10 @@ static s64 guest_mmap(oah_image *img, u64 address, u64 size, u64 prot, u64 flags
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
     if (backing == MAP_FAILED) {
+        { static int t = -1; if (t < 0) { t = getenv("OAH_MFD_TRACE") != NULL; }
+          if (t && file) { fprintf(stderr, "mmap file fd=%d sz=%llx prot=%llx off=%llx -> fail %d\n",
+                                   fd, (unsigned long long)size, (unsigned long long)prot,
+                                   (unsigned long long)offset, errno); } }
         return linux_error(errno);
     }
     if (file && !(flags & 0x01) && !load_file(backing, size, fd, offset)) {
@@ -5111,6 +5147,16 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     u64 a2 = g->gpr[OAH_X86_RDX], a3 = g->gpr[OAH_X86_R10];
     u64 a4 = g->gpr[OAH_X86_R8], a5 = g->gpr[OAH_X86_R9];
     s64 result;
+    { static int mfd_t = -1;
+      if (mfd_t < 0) { mfd_t = getenv("OAH_MFD_TRACE") != NULL; }
+      if (mfd_t &&
+          ((a0 < OAH_FD_PATH_MAX && fd_is_memfd[(int)a0]) ||
+           (nr == 9 && a4 < OAH_FD_PATH_MAX && fd_is_memfd[(int)a4]))) {
+          fprintf(stderr, "mfd syscall %llu fd=%llu a1=%llx a2=%llx\n",
+                  (unsigned long long)nr,
+                  (unsigned long long)(nr == 9 ? a4 : a0),
+                  (unsigned long long)a1, (unsigned long long)a2);
+      } }
     g->gpr[OAH_X86_RCX] = g->rip;
     g->gpr[OAH_X86_R11] = g->rflags;
 
@@ -5276,6 +5322,11 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 10: /* mprotect */
     case 11: /* munmap */
         result = memory_change(img, a0, a1, nr == 11 ? 0 : a2, nr == 11);
+        { static int t = -1; if (t < 0) { t = getenv("OAH_MMAP_TRACE") != NULL; }
+          if (t) { fprintf(stderr, "%s addr=%llx len=%llx prot=%llx -> %lld\n",
+                           nr == 11 ? "munmap" : "mprotect",
+                           (unsigned long long)a0, (unsigned long long)a1,
+                           (unsigned long long)a2, (long long)result); } }
         break;
     case OAH_X86_NR_BRK:
         result = (s64)guest_brk(img, a0);
@@ -5580,8 +5631,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
     case 32: /* dup */
         result = host_result(dup((int)a0));
         if (result >= 0 && (int)a0 < OAH_FD_PATH_MAX &&
-            result < OAH_FD_PATH_MAX && fd_path[(int)a0][0]) {
-            memcpy(fd_path[(int)result], fd_path[(int)a0], PATH_MAX);
+            result < OAH_FD_PATH_MAX) {
+            if (fd_path[(int)a0][0]) {
+                memcpy(fd_path[(int)result], fd_path[(int)a0], PATH_MAX);
+            }
+            fd_seals[(int)result] = fd_seals[(int)a0];
+            fd_is_memfd[(int)result] = fd_is_memfd[(int)a0];
         }
         if (result >= 0) {
             if (!duplicate_readiness_fd((int)a0, (int)result)) {
@@ -5601,9 +5656,12 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
             forget_directory(target);
             forget_readiness_fd(target);
             untrack_fd_path(target);
-            if (source < OAH_FD_PATH_MAX && target < OAH_FD_PATH_MAX &&
-                fd_path[source][0]) {
-                memcpy(fd_path[target], fd_path[source], PATH_MAX);
+            if (source < OAH_FD_PATH_MAX && target < OAH_FD_PATH_MAX) {
+                if (fd_path[source][0]) {
+                    memcpy(fd_path[target], fd_path[source], PATH_MAX);
+                }
+                fd_seals[target] = fd_seals[source];
+                fd_is_memfd[target] = fd_is_memfd[source];
             }
             if (!duplicate_readiness_fd(source, target)) {
                 close(target);
@@ -5932,7 +5990,20 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                  host_result(truncate(mr ? mut : path, (off_t)a1));
         break;
     }
-    case 77: result = host_result(ftruncate((int)a0, (off_t)a1)); break;
+    case 77: /* ftruncate */
+        if ((int)a0 >= 0 && (int)a0 < OAH_FD_PATH_MAX &&
+            fd_seals[(int)a0] & (OAH_F_SEAL_GROW | OAH_F_SEAL_SHRINK)) {
+            struct stat st;
+            if (fstat((int)a0, &st) == 0 &&
+                ((a1 > (u64)st.st_size && fd_seals[(int)a0] & OAH_F_SEAL_GROW) ||
+                 (a1 < (u64)st.st_size &&
+                  fd_seals[(int)a0] & OAH_F_SEAL_SHRINK))) {
+                result = -EPERM;
+                break;
+            }
+        }
+        result = host_result(ftruncate((int)a0, (off_t)a1));
+        break;
     case 82: case 264: case 316: { /* rename, renameat, renameat2 */
         const char *source = guest_path(img, nr == 82 ? a0 : a1);
         const char *target = guest_path(img, nr == 82 ? a1 : a3);
@@ -6378,6 +6449,39 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                     result = -ENOMEM;
                 }
             }
+            if (result >= 0 && (int)a0 < OAH_FD_PATH_MAX &&
+                result < OAH_FD_PATH_MAX) {
+                fd_seals[(int)result] = fd_seals[(int)a0];
+                fd_is_memfd[(int)result] = fd_is_memfd[(int)a0];
+            }
+        } else if (a1 == 1033 || a1 == 1034) { /* F_ADD_SEALS, F_GET_SEALS */
+            int fdn = (int)a0;
+            if (fdn >= 0 && fdn < OAH_FD_PATH_MAX && !fd_is_memfd[fdn]) {
+                /* A memfd arriving via SCM_RIGHTS or inherited through
+                 * execve is unknown to the table. Darwin shm objects
+                 * report S_IFMT == 0 in st_mode — probe for that. */
+                struct stat st;
+                if (fstat(fdn, &st) == 0 && !(st.st_mode & S_IFMT)) {
+                    fd_is_memfd[fdn] = true;
+                }
+            }
+            if (fdn < 0 || fdn >= OAH_FD_PATH_MAX || !fd_is_memfd[fdn]) {
+                result = -EINVAL;
+            } else if (a1 == 1034) {
+                result = fd_seals[fdn];
+            } else if (a2 & ~0x1full) {
+                result = -EINVAL;
+            } else if (fd_seals[fdn] & OAH_F_SEAL_SEAL) {
+                result = -EPERM;
+            } else {
+                fd_seals[fdn] |= (u8)a2;
+                result = 0;
+            }
+            { static int t = -1;
+              if (t < 0) { t = getenv("OAH_MFD_TRACE") != NULL; }
+              if (t) { fprintf(stderr, "fcntl seal fd=%d cmd=%llu arg=%llx -> %lld\n",
+                               fdn, (unsigned long long)a1,
+                               (unsigned long long)a2, (long long)result); } }
         } else if (a1 == 1 || a1 == 2) {
             result = host_result(fcntl((int)a0, a1 == 1 ? F_GETFD : F_SETFD, (int)a2));
         } else if (a1 == 3) {
@@ -6636,12 +6740,19 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         snprintf(shm_name, sizeof(shm_name), "/attesor-mfd-%d-%d",
                  getpid(), mfd_seq++);
         int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        { static int t = -1; if (t < 0) { t = getenv("OAH_MFD_TRACE") != NULL; }
+          if (t) { fprintf(stderr, "memfd_create flags=%llx -> fd=%d errno=%d\n",
+                           (unsigned long long)a1, fd, fd < 0 ? errno : 0); } }
         if (fd < 0) {
             result = linux_error(errno);
         } else {
             shm_unlink(shm_name);
             if (a1 & 1) { /* MFD_CLOEXEC */
                 fcntl(fd, F_SETFD, FD_CLOEXEC);
+            }
+            if (fd < OAH_FD_PATH_MAX) {
+                fd_is_memfd[fd] = true;
+                fd_seals[fd] = 0;
             }
             result = fd;
         }

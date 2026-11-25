@@ -14,6 +14,11 @@ static oah_gpr xn(oah_x86_gpr g)
     return (oah_gpr)oah_host_xn_for_x86_gpr(g);
 }
 
+enum {
+    F_RF = 19, F_NR = 20,
+    T0 = 16, T1 = 17, T2 = 21, T3 = 22, T4 = 23, T5 = 24, T6 = 25, T7 = 26
+};
+
 static bool emit_mov_imm(oah_asm_buf *buf, oah_x86_gpr g, u8 opsize, u64 imm)
 {
     oah_gpr d = xn(g);
@@ -48,7 +53,8 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
 
     while (n < 64) {
         u64 available = OAH_X86_MAX_INSN;
-        const u8 *pc = oah_guest_span(img, cur, &available);
+        u8 fetch[OAH_X86_MAX_INSN];
+        const u8 *pc = oah_guest_code(img, cur, &available, fetch);
         oah_insn in;
         u64 after;
         bool is_64;
@@ -104,7 +110,13 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
             if (flags & OAH_XLAT_DISPATCH_STATE) {
                 return n == 0 || oah_emit_ret(buf);
             }
-            if (!oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) ||
+            if (xn((oah_x86_gpr)in.dst) == rsp) {
+                if (!oah_emit_mov_reg(buf, true, T7, rsp) ||
+                    !oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) ||
+                    !oah_emit_ldr_str_uoff(buf, true, T7, rsp, 0)) {
+                    return false;
+                }
+            } else if (!oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) ||
                 !oah_emit_ldr_str_uoff(buf, true, xn((oah_x86_gpr)in.dst), rsp, 0)) {
                 return false;
             }
@@ -116,9 +128,13 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
                 }
                 return n == 0 || oah_emit_ret(buf);
             }
-            if (!oah_emit_ldr_str_uoff(buf, false, xn((oah_x86_gpr)in.dst), rsp, 0) ||
-                !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8)) {
-                return false;
+            {
+                u8 dst = xn((oah_x86_gpr)in.dst);
+                if (!oah_emit_ldr_str_uoff(buf, false, dst, rsp, 0) ||
+                    (dst != rsp &&
+                     !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8))) {
+                    return false;
+                }
             }
             break;
         case OAH_OP_SYSCALL:
@@ -188,11 +204,6 @@ bool oah_translate_block_flags(oah_asm_buf *buf, oah_image *img, u64 rip,
  *   x20     next guest RIP    x16,x17,x21–x28  scratch
  * Every fragment sets x20 before RET.
  */
-
-enum {
-    F_RF = 19, F_NR = 20,
-    T0 = 16, T1 = 17, T2 = 21, T3 = 22, T4 = 23, T5 = 24, T6 = 25, T7 = 26
-};
 
 static bool frag_lsl(oah_asm_buf *buf, bool is64, u8 rd, u8 rn, u32 sh)
 {
@@ -785,6 +796,12 @@ static bool frag_exit(oah_asm_buf *buf, const oah_guest *g, u64 next)
 static bool emit_push64(oah_asm_buf *buf, u8 val)
 {
     u8 rsp = xn(OAH_X86_RSP);
+    /* push rsp stores the pre-push value: snapshot before the bump. */
+    if (val == rsp) {
+        return oah_emit_mov_reg(buf, true, T7, rsp) &&
+               oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) &&
+               oah_emit_mem(buf, 3, true, false, false, T7, rsp, 0);
+    }
     return oah_emit_add_sub_imm(buf, true, true, rsp, rsp, 8) &&
            oah_emit_mem(buf, 3, true, false, false, val, rsp, 0);
 }
@@ -2133,7 +2150,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
         bool term = false;
         for (; k < (unsigned)max_insns && k < OAH_FLAG_SCAN_MAX && !term; k++) {
             u64 avail = OAH_X86_MAX_INSN;
-            const u8 *p = oah_guest_span(img, c, &avail);
+            u8 fetch[OAH_X86_MAX_INSN];
+            const u8 *p = oah_guest_code(img, c, &avail, fetch);
             oah_insn *pi = &frag_pins[k];
             if (!p || !oah_guest_access(img, c, 1, PROT_EXEC) ||
                 !oah_decode_insn(p, p + avail, pi)) {
@@ -2157,7 +2175,8 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
     }
     while (n < (unsigned)max_insns) {
         u64 available = OAH_X86_MAX_INSN;
-        const u8 *pc = oah_guest_span(img, cur, &available);
+        u8 fetch[OAH_X86_MAX_INSN];
+        const u8 *pc = oah_guest_code(img, cur, &available, fetch);
         oah_insn in;
         u64 after;
 
@@ -2311,10 +2330,15 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                 boundary_interp = true;
                 break;
             }
-            if (!oah_emit_mem(buf, 3, false, false, true,
-                              xn((oah_x86_gpr)in.dst), rsp, 0) ||
-                !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8)) {
-                return false;
+            /* pop rsp loads the new stack pointer itself — the +8 bump
+             * would corrupt the pivot. */
+            {
+                u8 dst = xn((oah_x86_gpr)in.dst);
+                if (!oah_emit_mem(buf, 3, false, false, true, dst, rsp, 0) ||
+                    (dst != rsp &&
+                     !oah_emit_add_sub_imm(buf, true, false, rsp, rsp, 8))) {
+                    return false;
+                }
             }
             break;
         case OAH_OP_RET:

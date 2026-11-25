@@ -320,6 +320,8 @@ void oah_jit_cache_flush(const char *why)
 static __thread sigjmp_buf *jit_fault_env;
 static __thread u64 jit_fault_addr;
 static __thread u64 jit_fault_pc;
+static __thread u64 jit_last_rips[16];
+static __thread unsigned jit_last_i;
 static struct sigaction jit_old_segv, jit_old_bus;
 
 static void jit_fault_handler(int sig, siginfo_t *si, void *opaque)
@@ -1368,6 +1370,23 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                                 (unsigned long long)(g->rip - img->modules[m].base));
                     }
                 }
+                {
+                    fprintf(stderr, " last-frags:");
+                    for (unsigned i = 0; i < 16; i++) {
+                        u64 v = jit_last_rips[(jit_last_i + i) & 15];
+                        if (v) fprintf(stderr, " %llx", (unsigned long long)v);
+                    }
+                    fprintf(stderr, "\n");
+                    for (unsigned i = 12; i < 16; i++) {
+                        u64 v = jit_last_rips[(jit_last_i + i) & 15];
+                        const u8 *c = v ? oah_guest_access(img, v, 32, PROT_READ) : NULL;
+                        if (c) {
+                            fprintf(stderr, " code@%llx:", (unsigned long long)v);
+                            for (int j = 0; j < 32; j++) fprintf(stderr, " %02x", c[j]);
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                }
                 r.status = one.status;
                 r.exit_code = one.exit_code;
                 return r;
@@ -1405,6 +1424,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             }
         }
         chain_prev = (oah_frag_entry *)frag;
+        jit_last_rips[jit_last_i++ & 15] = g->rip;
         oah_pack_runtime_x(ctx, g);
         ctx[16] = g->rflags;
         ctx[17] = g->rip;

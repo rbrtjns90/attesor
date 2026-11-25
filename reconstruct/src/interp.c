@@ -6,6 +6,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -867,6 +868,11 @@ static bool run_scalar(oah_guest *g, oah_image *img, const oah_insn *in, u64 nex
         if (op == OAH_SC_CALL && !push64(g, img, next)) {
             return false;
         }
+        if (!oah_guest_access(img, rm, 1, PROT_EXEC)) {
+            fprintf(stderr, "wild %s from rip=%llx target=%llx\n",
+                    op == OAH_SC_CALL ? "call" : "jmp",
+                    (unsigned long long)g->rip, (unsigned long long)rm);
+        }
         g->rip = rm;
         return true;
     }
@@ -1438,7 +1444,8 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
         }
 #endif
         u64 available = OAH_X86_MAX_INSN;
-        const u8 *pc = oah_guest_span(img, g->rip, &available);
+        u8 fetch[OAH_X86_MAX_INSN];
+        const u8 *pc = oah_guest_code(img, g->rip, &available, fetch);
         oah_insn insn;
         u64 next;
         oah_sys_status ss;
@@ -1512,17 +1519,28 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
         case OAH_OP_POP:
             if (insn.rm_dest) { /* pop r/m: store to effective address */
                 u64 *stack = &g->gpr[OAH_X86_RSP];
-                u64 address = effective_address(g, &insn.address, next);
-                address += insn.address.segment == 0x64 ? g->fs_base
-                         : insn.address.segment == 0x65 ? g->gs_base : 0;
-                u8 *dst = oah_guest_access(img, address, insn.opsize, PROT_WRITE);
-                u8 *src = oah_guest_access(img, *stack, insn.opsize, PROT_READ);
-                if (!dst || !src) {
+                const u8 *src = oah_guest_access(img, *stack, insn.opsize,
+                                                 PROT_READ);
+                if (!src) {
                     r.status = OAH_INTERP_FAULT;
                     return r;
                 }
-                memcpy(dst, src, insn.opsize);
+                /* POP evaluates the destination address after the stack
+                 * pointer is bumped: pop [rsp] stores the old top into the
+                 * second slot, which SpiderMonkey frame teardown relies on. */
+                u64 value;
+                memcpy(&value, src, insn.opsize);
                 *stack += insn.opsize;
+                u64 address = effective_address(g, &insn.address, next);
+                address += insn.address.segment == 0x64 ? g->fs_base
+                         : insn.address.segment == 0x65 ? g->gs_base : 0;
+                u8 *dst = oah_guest_access(img, address, insn.opsize,
+                                           PROT_WRITE);
+                if (!dst) {
+                    r.status = OAH_INTERP_FAULT;
+                    return r;
+                }
+                memcpy(dst, &value, insn.opsize);
                 g->rip = next;
                 break;
             }
@@ -1560,7 +1578,29 @@ oah_interp_result oah_interp_run(oah_guest *g, oah_image *img, u64 max_insns)
                 r.status = OAH_INTERP_FAULT;
                 return r;
             }
-            memcpy(&g->rip, slot, sizeof(g->rip));
+            {
+                u64 from = g->rip;
+                memcpy(&g->rip, slot, sizeof(g->rip));
+                if (!oah_guest_access(img, g->rip, 1, PROT_EXEC)) {
+                    fprintf(stderr, "wild ret from rip=%llx target=%llx\n",
+                            (unsigned long long)from,
+                            (unsigned long long)g->rip);
+                    const u8 *code = oah_guest_access(img, from - 32, 48, PROT_READ);
+                    if (code) {
+                        fprintf(stderr, " code@%llx-32:", (unsigned long long)from);
+                        for (int i = 0; i < 48; i++) fprintf(stderr, " %02x", code[i]);
+                        fprintf(stderr, "\n");
+                    }
+                    const u64 *sp = oah_guest_access(img, g->gpr[OAH_X86_RSP], 64, PROT_READ);
+                    if (sp) {
+                        fprintf(stderr, " rsp@%llx: %llx %llx %llx %llx %llx %llx\n",
+                                (unsigned long long)g->gpr[OAH_X86_RSP],
+                                (unsigned long long)sp[0], (unsigned long long)sp[1],
+                                (unsigned long long)sp[2], (unsigned long long)sp[3],
+                                (unsigned long long)sp[4], (unsigned long long)sp[5]);
+                    }
+                }
+            }
             g->gpr[OAH_X86_RSP] += 8 + insn.imm;
             break;
         }

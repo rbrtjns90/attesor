@@ -175,7 +175,10 @@ const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len)
 {
     for (unsigned i = 0; i < img->nseg; i++) {
         const oah_load_seg *seg = &img->segs[i];
-        if ((seg->prot & PROT_READ) && gva >= seg->gva && gva - seg->gva < seg->size) {
+        /* Instruction fetch: x86 PROT_EXEC implies readable, so exec-only
+         * segments (JIT'd code pools) are valid spans. */
+        if ((seg->prot & (PROT_READ | PROT_EXEC)) && gva >= seg->gva &&
+            gva - seg->gva < seg->size) {
             u64 offset = gva - seg->gva;
             u64 remaining = seg->size - offset;
             if (*len > remaining) {
@@ -185,6 +188,31 @@ const u8 *oah_guest_span(const oah_image *img, u64 gva, u64 *len)
         }
     }
     return NULL;
+}
+
+const u8 *oah_guest_code(const oah_image *img, u64 gva, u64 *len, u8 *buf)
+{
+    u64 want = *len;
+    const u8 *p = oah_guest_span(img, gva, &want);
+    if (!p || want == *len) {
+        return p;
+    }
+    /* An insn can straddle a seg boundary (code at the last byte of one
+     * guest page continues into the next mapping). Copy across adjacent
+     * exec-capable segs so the decoder sees the whole instruction. */
+    u64 have = want;
+    memcpy(buf, p, have);
+    while (have < *len) {
+        u64 n = *len - have;
+        p = oah_guest_span(img, gva + have, &n);
+        if (!p) {
+            break;
+        }
+        memcpy(buf + have, p, n);
+        have += n;
+    }
+    *len = have;
+    return buf;
 }
 
 __thread bool oah_suppress_guest_stores;
@@ -236,11 +264,14 @@ static void *guest_access_lookup(const oah_image *img, u64 gva, u64 len, u32 pro
                 img ? (unsigned long long)img->heap_guard : 0,
                 img ? (unsigned long long)img->brk : 0);
 
-        for (unsigned i = 0; img && i < img->nseg && i < 40; i++) {
-            fprintf(stderr, "  seg[%u] gva=%llx size=%llx prot=%x host=%p\n", i,
-                    (unsigned long long)img->segs[i].gva,
-                    (unsigned long long)img->segs[i].size,
-                    img->segs[i].prot, img->segs[i].host);
+        for (unsigned i = 0; img && i < img->nseg; i++) {
+            s64 delta = (s64)(img->segs[i].gva - gva);
+            if (delta > -(s64)0x100000 && delta < (s64)0x100000) {
+                fprintf(stderr, "  seg[%u] gva=%llx size=%llx prot=%x host=%p\n", i,
+                        (unsigned long long)img->segs[i].gva,
+                        (unsigned long long)img->segs[i].size,
+                        img->segs[i].prot, img->segs[i].host);
+            }
         }
     }
     return NULL;
