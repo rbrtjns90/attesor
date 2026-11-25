@@ -1540,8 +1540,12 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                     skip_tsc = true;
                 }
             }
-            /* Run the reference one insn at a time; compare each step. */
+            /* Run the reference one insn at a time; compare each step.
+             * Suppress ref-side stores — the JIT already committed them
+             * on this shared image, and replaying would double-apply
+             * RMW ops and produce false divergences. */
             u64 steps = frag->insns + ((frag->flags & OAH_FRAG_FALLBACK) ? 1 : 0);
+            oah_suppress_guest_stores = true;
             for (u64 s = 0; s < steps; s++) {
                 u64 ref_rip = g_ref.rip;
                 /* The jit side already executed boundary syscalls; replaying
@@ -1557,6 +1561,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                 oah_interp_result ref = oah_interp_run(&g_ref, img, 1);
                 if (ref.status != OAH_INTERP_LIMIT &&
                     ref.status != OAH_INTERP_OK) {
+                    oah_suppress_guest_stores = false;
                     fprintf(stderr,
                             "ref-side stop status=%d entry=%llx ref_rip=%llx jit_rip=%llx\n",
                             ref.status, (unsigned long long)entry_rip,
@@ -1580,6 +1585,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                 }
                 (void)ref_rip;
             }
+            oah_suppress_guest_stores = false;
             if (skip_tsc) {
                 g_ref.gpr[OAH_X86_RAX] = g->gpr[OAH_X86_RAX];
                 g_ref.gpr[OAH_X86_RDX] = g->gpr[OAH_X86_RDX];
@@ -1587,16 +1593,35 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             for (int i = 0; i < 16; i++) {
                 if (g->gpr[i] != g_ref.gpr[i] || g->rip != g_ref.rip ||
                     g->rflags != g_ref.rflags) {
+                    bool flag_only = g->rip == g_ref.rip &&
+                                     g->gpr[0] == g_ref.gpr[0] &&
+                                     g->gpr[1] == g_ref.gpr[1] &&
+                                     g->gpr[2] == g_ref.gpr[2] &&
+                                     g->gpr[3] == g_ref.gpr[3] &&
+                                     g->gpr[4] == g_ref.gpr[4] &&
+                                     g->gpr[5] == g_ref.gpr[5] &&
+                                     g->gpr[6] == g_ref.gpr[6] &&
+                                     g->gpr[7] == g_ref.gpr[7] &&
+                                     g->gpr[8] == g_ref.gpr[8] &&
+                                     g->gpr[9] == g_ref.gpr[9] &&
+                                     g->gpr[10] == g_ref.gpr[10] &&
+                                     g->gpr[11] == g_ref.gpr[11] &&
+                                     g->gpr[12] == g_ref.gpr[12] &&
+                                     g->gpr[13] == g_ref.gpr[13] &&
+                                     g->gpr[14] == g_ref.gpr[14] &&
+                                     g->gpr[15] == g_ref.gpr[15];
                     fprintf(stderr,
                             "JIT divergence @%llx: g%d jit=%llx ref=%llx "
-                            "rip jit=%llx ref=%llx flags jit=%llx ref=%llx\n",
+                            "rip jit=%llx ref=%llx flags jit=%llx ref=%llx"
+                            "%s\n",
                             (unsigned long long)entry_rip, i,
                             (unsigned long long)g->gpr[i],
                             (unsigned long long)g_ref.gpr[i],
                             (unsigned long long)g->rip,
                             (unsigned long long)g_ref.rip,
                             (unsigned long long)g->rflags,
-                            (unsigned long long)g_ref.rflags);
+                            (unsigned long long)g_ref.rflags,
+                            flag_only ? " (flags-only, resyncing)" : "");
                     u64 blen = 40;
                     const u8 *bc = oah_guest_span(img, entry_rip, &blen);
                     fputs(" bytes:", stderr);
@@ -1604,6 +1629,10 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                         fprintf(stderr, " %02x", bc[bi]);
                     }
                     fputc('\n', stderr);
+                    if (flag_only) {
+                        g_ref = *g;
+                        break;
+                    }
                     *g = g_ref;
                     r.status = OAH_INTERP_FAULT;
                     return r;

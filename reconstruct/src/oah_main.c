@@ -115,6 +115,7 @@ int main(int argc, char **argv, char **envp)
     size_t exec_env_count = 0;
 #endif
     u64 instruction_limit = ~0ull;
+    u64 jit_limit = 0;
     int guest_arg = 1;
     while (guest_arg < argc) {
         const char *option = argv[guest_arg];
@@ -130,6 +131,16 @@ int main(int argc, char **argv, char **envp)
             errno = 0;
             instruction_limit = strtoull(value, &end, 10);
             if (*value < '0' || *value > '9' || *end || errno || !instruction_limit) {
+                usage(argv[0]);
+                return 2;
+            }
+            guest_arg += 2;
+        } else if (strcmp(option, "--jit-limit") == 0 && guest_arg + 1 < argc) {
+            const char *value = argv[guest_arg + 1];
+            char *end;
+            errno = 0;
+            jit_limit = strtoull(value, &end, 10);
+            if (*value < '0' || *value > '9' || *end || errno || !jit_limit) {
                 usage(argv[0]);
                 return 2;
             }
@@ -257,9 +268,39 @@ int main(int argc, char **argv, char **envp)
     /* The cached fragment JIT needs identity-mapped guest memory (ET_DYN on
      * Darwin). Everything else uses the per-block native path. */
     bool jit_identity = img.load_gva == (u64)(uintptr_t)img.load_mapping;
-    run = interpret ? oah_interp_run(&guest, &img, instruction_limit)
-        : jit_identity ? oah_jit_run_cached(&guest, &img, instruction_limit, aot)
-                       : oah_jit_run_native(&guest, &img, instruction_limit);
+    if (jit_limit && !interpret) {
+        run = oah_jit_run_cached(&guest, &img, jit_limit, aot);
+        if (run.status == OAH_INTERP_LIMIT) {
+            u64 jit_insns = run.insns;
+            u64 remaining = instruction_limit > jit_insns
+                            ? instruction_limit - jit_insns : 0;
+            if (getenv("OAH_STOP_TRACE")) {
+                const u64 *r = guest.gpr;
+                fprintf(stderr,
+                        "jit->interp @%llu rip=%llx rax=%llx rcx=%llx"
+                        " rdx=%llx rbx=%llx rsp=%llx rbp=%llx rsi=%llx"
+                        " rdi=%llx\n"
+                        "  r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx"
+                        " r13=%llx r14=%llx r15=%llx\n",
+                        (unsigned long long)jit_insns,
+                        (unsigned long long)guest.rip,
+                        (unsigned long long)r[0], (unsigned long long)r[1],
+                        (unsigned long long)r[2], (unsigned long long)r[3],
+                        (unsigned long long)r[4], (unsigned long long)r[5],
+                        (unsigned long long)r[6], (unsigned long long)r[7],
+                        (unsigned long long)r[8], (unsigned long long)r[9],
+                        (unsigned long long)r[10], (unsigned long long)r[11],
+                        (unsigned long long)r[12], (unsigned long long)r[13],
+                        (unsigned long long)r[14], (unsigned long long)r[15]);
+            }
+            run = oah_interp_run(&guest, &img, remaining);
+            run.insns += jit_insns;
+        }
+    } else {
+        run = interpret ? oah_interp_run(&guest, &img, instruction_limit)
+            : jit_identity ? oah_jit_run_cached(&guest, &img, instruction_limit, aot)
+                           : oah_jit_run_native(&guest, &img, instruction_limit);
+    }
 #else
     run = interpret ? oah_jit_run(&guest, &img, instruction_limit)
                     : oah_jit_run_native(&guest, &img, instruction_limit);
