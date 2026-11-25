@@ -1493,6 +1493,487 @@ static int owner_record_path(const oah_image *img, int dirfd,
     return 1;
 }
 
+/* Linux x86-64 stat is 144 bytes and differs from Darwin's stat. */
+typedef struct {
+    u64 dev, ino, nlink;
+    u32 mode, uid, gid, pad;
+    u64 rdev;
+    s64 size, blksize, blocks;
+    s64 atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+    s64 reserved[3];
+} linux_stat;
+
+_Static_assert(sizeof(linux_stat) == 144, "x86-64 Linux stat layout");
+
+/* ==================== virtual /proc ====================
+ * A growing set of guests probe /proc (LibreOffice opens
+ * /proc/version at startup, Boehm GC reads /proc/stat, glib reads
+ * /proc/mounts, dbus reads /proc/sys/net/core/somaxconn). Nothing in
+ * the sysroot backs those paths, so synthesize them: files are served
+ * through an unlinked temp fd, directories through an empty temp dir.
+ * /proc/self and /proc/<our-pid> collapse to the same synthesized
+ * target; other pids report ENOENT. */
+
+static bool proc_path_rel(const char *path, const char **rel)
+{
+    if (!strcmp(path, "/proc")) {
+        *rel = "";
+        return true;
+    }
+    if (!strncmp(path, "/proc/", 6)) {
+        *rel = path + 6;
+        return true;
+    }
+    return false;
+}
+
+/* Fold self/thread-self/<our-pid> prefixes into "self/...". */
+static const char *proc_rel_canon(const char *rel, char *buf, size_t cap)
+{
+    if (!strncmp(rel, "self/", 5) || !strcmp(rel, "self")) {
+        return rel;
+    }
+    if (!strncmp(rel, "thread-self/", 12)) {
+        snprintf(buf, cap, "self/%s", rel + 12);
+        return buf;
+    }
+    char *end;
+    unsigned long pid = strtoul(rel, &end, 10);
+    if (end != rel && pid == (unsigned long)getpid()) {
+        if (!*end) {
+            return "self";
+        }
+        if (*end == '/') {
+            snprintf(buf, cap, "self/%s", end + 1);
+            return buf;
+        }
+    }
+    return rel;
+}
+
+static bool proc_is_dir(const char *rel)
+{
+    static const char *dirs[] = {
+        "", "self", "self/fd", "self/task", "sys", "sys/kernel",
+        "sys/kernel/random", "sys/vm", "sys/fs", "sys/net", "sys/net/core",
+        "sys/crypto",
+    };
+    for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        if (!strcmp(rel, dirs[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool proc_is_link(const char *rel)
+{
+    return !strcmp(rel, "self/exe") || !strncmp(rel, "self/fd/", 8);
+}
+
+/* Fills buf with the synthesized content of a /proc file. Returns the
+ * length or -ENOENT for an unknown path. */
+static s64 procfs_synth(const oah_image *img, const char *rel,
+                        u8 *buf, size_t cap)
+{
+    size_t n;
+    pid_t pid = getpid();
+    const char *exe = oah_proc_self_exe();
+    if (!exe || !*exe) {
+        exe = "oah";
+    }
+    const char *comm = strrchr(exe, '/');
+    comm = comm ? comm + 1 : exe;
+    char short_comm[16];
+    snprintf(short_comm, sizeof(short_comm), "%.15s", comm);
+
+#define PROC_S(...) do { \
+        int w = snprintf((char *)buf + n, cap - n, __VA_ARGS__); \
+        if (w < 0) return -EIO; \
+        if ((size_t)w >= cap - n) return -EOVERFLOW; \
+        n += (size_t)w; \
+    } while (0)
+
+    n = 0;
+    if (!strcmp(rel, "version")) {
+        PROC_S("Linux version 6.1.0-31-amd64 (debian-kernel@lists.debian.org) "
+               "(gcc-12 (Debian 12.2.0-14) 12.2.0, GNU ld (GNU Binutils for "
+               "Debian) 2.40) #1 SMP PREEMPT_DYNAMIC Debian 6.1.128-1 "
+               "(2025-02-07)\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "meminfo")) {
+        u64 memsize = 4ull << 30;
+        size_t sz = sizeof(memsize);
+        if (sysctlbyname("hw.memsize", &memsize, &sz, NULL, 0) < 0) {
+            memsize = 4ull << 30;
+        }
+        u64 total = memsize / 1024, free_amt = total / 4;
+        PROC_S("MemTotal:       %8llu kB\n"
+               "MemFree:        %8llu kB\n"
+               "MemAvailable:   %8llu kB\n"
+               "Buffers:               0 kB\n"
+               "Cached:         %8llu kB\n"
+               "SwapCached:            0 kB\n"
+               "Active:         %8llu kB\n"
+               "Inactive:       %8llu kB\n"
+               "SwapTotal:             0 kB\n"
+               "SwapFree:              0 kB\n"
+               "HugePages_Total:       0\n",
+               (unsigned long long)total, (unsigned long long)free_amt,
+               (unsigned long long)(total / 2), (unsigned long long)free_amt,
+               (unsigned long long)(total / 4), (unsigned long long)free_amt);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "cpuinfo")) {
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu < 1) {
+            ncpu = 1;
+        }
+        for (int i = 0; i < ncpu; i++) {
+            PROC_S("processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\n"
+                   "model\t\t: 158\nmodel name\t: Virtual CPU @ 2.40GHz\n"
+                   "stepping\t: 10\ncpu MHz\t\t: 2400.000\ncache size\t: 4096 KB\n"
+                   "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep "
+                   "mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 "
+                   "ss ht syscall nx pdpe1gb rdtscp lm constant_tsc "
+                   "rep_good nopl xtopology cpuid tsc_known_freq pni "
+                   "pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic "
+                   "movbe popcnt aes xsave avx f16c rdrand hypervisor "
+                   "lahf_lm abm 3dnowprefetch fsgsbase bmi1 hle avx2 "
+                   "bmi2 erms invpcid rtm rdseed adx clflushopt\n\n", i);
+        }
+        return (s64)n;
+    }
+    if (!strcmp(rel, "stat")) {
+        int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu < 1) {
+            ncpu = 1;
+        }
+        PROC_S("cpu  0 0 0 0 0 0 0 0 0 0\n");
+        for (int i = 0; i < ncpu; i++) {
+            PROC_S("cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
+        }
+        PROC_S("intr 0\nctxt 0\nbtime %lld\nprocesses %d\n"
+               "procs_running 1\nprocs_blocked 0\n",
+               (long long)time(NULL) - 3600, pid);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "uptime")) {
+        PROC_S("3600.00 14000.00\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "loadavg")) {
+        PROC_S("0.10 0.20 0.30 1/100 %d\n", pid);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "mounts")) {
+        PROC_S("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+               "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+               "/dev/vda1 / ext4 rw,relatime,errors=remount-ro 0 1\n"
+               "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+               "tmpfs /tmp tmpfs rw,relatime 0 0\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "filesystems")) {
+        PROC_S("nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n"
+               "\text4\n\text3\n\text2\n\tvfat\n\tiso9660\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/cmdline")) {
+        n = strlen(exe);
+        if (n + 2 > cap) {
+            return -EOVERFLOW;
+        }
+        memcpy(buf, exe, n);
+        buf[n++] = 0;
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/environ")) {
+        return 0; /* empty */
+    }
+    if (!strcmp(rel, "self/comm")) {
+        PROC_S("%s\n", short_comm);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/stat")) {
+        PROC_S("%d (%s) S %d %d %d 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 "
+               "%lld %llu 256 18446744073709551615 4194304 4194304 "
+               "140736000000000 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n",
+               (int)pid, short_comm, (int)getppid(), (int)pid, (int)pid,
+               (long long)(time(NULL) - 10), (unsigned long long)(64 << 20));
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/status")) {
+        u32 uid = img->guest_uid[0], gid = img->guest_gid[0];
+        PROC_S("Name:\t%s\nState:\tS (sleeping)\nTgid:\t%d\nNgid:\t0\nPid:\t%d\n"
+               "PPid:\t%d\nTracerPid:\t0\nUid:\t%u\t%u\t%u\t%u\n"
+               "Gid:\t%u\t%u\t%u\t%u\nUtrace:\t0\n"
+               "FDSize:\t256\nGroups:\t%u \n"
+               "VmPeak:\t  131072 kB\nVmSize:\t  131072 kB\nVmRSS:\t    8192 kB\n"
+               "Threads:\t1\nSigQ:\t1/64000\n"
+               "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+               "CapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\n"
+               "Seccomp:\t0\nSpeculation_Store_Bypass:\tnot vulnerable\n",
+               short_comm, (int)pid, (int)pid, (int)getppid(),
+               uid, uid, uid, uid, gid, gid, gid, gid, gid);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/maps")) {
+        for (unsigned i = 0; i < img->nseg; i++) {
+            const oah_load_seg *s = &img->segs[i];
+            char perms[5] = "----";
+            perms[0] = s->prot & PROT_READ ? 'r' : '-';
+            perms[1] = s->prot & PROT_WRITE ? 'w' : '-';
+            perms[2] = s->prot & PROT_EXEC ? 'x' : '-';
+            perms[3] = 'p';
+            PROC_S("%08llx-%08llx %s %08llx 00:00 0\n",
+                   (unsigned long long)s->gva,
+                   (unsigned long long)(s->gva + s->size),
+                   perms, 0ull);
+        }
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/limits")) {
+        struct rlimit rl;
+        u64 nofile = 1024;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            nofile = rl.rlim_cur == RLIM_INFINITY ? ~0ull : (u64)rl.rlim_cur;
+        }
+        PROC_S("Limit                     Soft Limit           Hard Limit           Units\n"
+               "Max cpu time              unlimited            unlimited            seconds\n"
+               "Max file size             unlimited            unlimited            bytes\n"
+               "Max data size             unlimited            unlimited            bytes\n"
+               "Max stack size            8388608              unlimited            bytes\n"
+               "Max core file size        0                    unlimited            bytes\n"
+               "Max resident set          unlimited            unlimited            bytes\n"
+               "Max processes             64000                64000                processes\n"
+               "Max open files            %-20llu %-20llu files\n"
+               "Max locked memory         65536                65536                bytes\n"
+               "Max address space         unlimited            unlimited            bytes\n"
+               "Max file locks            unlimited            unlimited            locks\n"
+               "Max pending signals       64000                64000                signals\n"
+               "Max msgqueue size         819200               819200               bytes\n"
+               "Max nice priority         0                    0                    \n"
+               "Max realtime priority     0                    0                    \n"
+               "Max realtime timeout      unlimited            unlimited            us\n",
+               (unsigned long long)nofile, (unsigned long long)nofile);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/cgroup")) {
+        PROC_S("0::/\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "cgroup")) {
+        PROC_S("#subsys_name\thierarchy\tnum_cgroups\tenabled\n"
+               "cpuset\t0\t1\t1\ncpu\t0\t1\t1\nmemory\t0\t1\t1\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/loginuid")) {
+        PROC_S("4294967295\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/oom_score_adj") || !strcmp(rel, "self/oom_score")) {
+        PROC_S("0\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "self/personality")) {
+        PROC_S("00000000\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/ostype")) {
+        PROC_S("Linux\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/osrelease")) {
+        PROC_S("6.1.0-31-amd64\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/hostname")) {
+        char host[256] = "attesor";
+        gethostname(host, sizeof(host) - 1);
+        PROC_S("%s\n", host);
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/ngroups_max")) {
+        PROC_S("65536\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/pid_max")) {
+        PROC_S("4194304\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/threads-max")) {
+        PROC_S("128000\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/random/boot_id")) {
+        /* Stable per-machine id: dbus-daemon falls back to this. */
+        PROC_S("61747473-6f72-0000-8000-000000000000\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/net/core/somaxconn")) {
+        PROC_S("4096\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/vm/max_map_count")) {
+        PROC_S("262144\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/vm/overcommit_memory")) {
+        PROC_S("0\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/fs/file-max") || !strcmp(rel, "sys/fs/nr_open")) {
+        PROC_S("1073741816\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/crypto/fips_enabled")) {
+        PROC_S("0\n");
+        return (s64)n;
+    }
+    if (!strcmp(rel, "sys/kernel/yama/ptrace_scope")) {
+        PROC_S("0\n");
+        return (s64)n;
+    }
+    return -ENOENT;
+#undef PROC_S
+}
+
+/* Paths under /proc/self that accept writes (into the void). */
+static bool proc_writable(const char *rel)
+{
+    return !strcmp(rel, "self/oom_score_adj") ||
+           !strcmp(rel, "self/loginuid") ||
+           !strcmp(rel, "self/coredump_filter");
+}
+
+/* Serve a /proc open. Files go through an unlinked temp fd so reads,
+ * seeks, and fstat behave naturally; dirs through an empty temp dir
+ * (getdents yields an empty listing). Returns fd or -errno; caller has
+ * already confirmed the path lives under /proc. */
+static s64 procfs_open(const oah_image *img, const char *rel,
+                       int host_flags, u64 mode)
+{
+    char canon[256];
+    rel = proc_rel_canon(rel, canon, sizeof(canon));
+    bool wants_write = (host_flags & O_ACCMODE) != O_RDONLY;
+    if (host_flags & O_DIRECTORY) {
+        if (!proc_is_dir(rel) && strcmp(rel, "self/exe")) {
+            return proc_is_link(rel) || procfs_synth(img, rel, (u8[1]){0}, 1) != -ENOENT
+                       ? -ENOTDIR : -ENOENT;
+        }
+        wants_write = false;
+    }
+    if (proc_is_dir(rel)) {
+        if (wants_write) {
+            return -EISDIR;
+        }
+        char tmpl[] = "/tmp/oah-procdir-XXXXXX";
+        if (!mkdtemp(tmpl)) {
+            return -ENOMEM;
+        }
+        int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
+        int keep = errno;
+        rmdir(tmpl);
+        return fd < 0 ? linux_error(keep) : fd;
+    }
+    if (proc_is_link(rel)) {
+        /* readlink handles these; opening the link itself means "target". */
+        return -ENOENT;
+    }
+    if (wants_write && !proc_writable(rel)) {
+        return -EACCES;
+    }
+    u8 *content = malloc(1u << 20);
+    if (!content) {
+        return -ENOMEM;
+    }
+    s64 len = procfs_synth(img, rel, content, 1u << 20);
+    if (len < 0) {
+        free(content);
+        if (wants_write && proc_writable(rel)) {
+            len = 0; /* writable node with no synth entry: start empty */
+        } else {
+            return len;
+        }
+    }
+    char tmpl[] = "/tmp/oah-proc-XXXXXX";
+    int fd = mkstemp(tmpl);
+    int keep = errno;
+    unlink(tmpl);
+    if (fd < 0) {
+        free(content);
+        return linux_error(keep);
+    }
+    bool bad = len && write(fd, content, (size_t)len) != len;
+    free(content);
+    if (bad || lseek(fd, 0, SEEK_SET) < 0) {
+        keep = errno;
+        close(fd);
+        return linux_error(keep);
+    }
+    if (host_flags & O_NONBLOCK) {
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+    }
+    if (host_flags & O_CLOEXEC) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    return fd;
+}
+
+/* Fill a linux_stat for a virtual /proc path. Returns 0, -ENOENT, or
+ * -EFALLTHROUGH sentinel meaning "let normal resolution run" (used for
+ * /proc/self/exe with follow-symlink semantics). */
+#define PROC_STAT_PASSTHROUGH ((s64)-77777)
+
+static s64 procfs_stat(const oah_image *img, const char *rel,
+                       linux_stat *out, bool nofollow)
+{
+    char canon[256];
+    rel = proc_rel_canon(rel, canon, sizeof(canon));
+    u32 mode;
+    s64 size = 0;
+    if (proc_is_dir(rel)) {
+        mode = S_IFDIR | 0555;
+    } else if (proc_is_link(rel)) {
+        if (!nofollow && !strcmp(rel, "self/exe")) {
+            return PROC_STAT_PASSTHROUGH; /* stat the real exe */
+        }
+        mode = S_IFLNK | 0777;
+        size = 64;
+    } else {
+        u8 scratch[4096];
+        s64 len = procfs_synth(img, rel, scratch, sizeof(scratch));
+        if (len < 0) {
+            /* Content may exceed the scratch cap — retry at full size. */
+            u8 *big = malloc(1u << 20);
+            if (!big) {
+                return -ENOMEM;
+            }
+            len = procfs_synth(img, rel, big, 1u << 20);
+            free(big);
+            if (len < 0) {
+                return len;
+            }
+        }
+        mode = S_IFREG | 0444;
+        size = len;
+    }
+    u64 ino = 5381;
+    for (const char *p = rel; *p; p++) {
+        ino = ino * 33 ^ (u8)*p;
+    }
+    u64 now = (u64)time(NULL);
+    *out = (linux_stat){
+        .dev = 0x13, .ino = ino, .nlink = (mode & S_IFMT) == S_IFDIR ? 2 : 1,
+        .mode = mode, .uid = img->guest_uid[0], .gid = img->guest_gid[0],
+        .size = size, .blksize = 4096, .blocks = (size + 511) / 512,
+        .atime_sec = (s64)now, .mtime_sec = (s64)now, .ctime_sec = (s64)now,
+    };
+    return 0;
+}
+
 static const struct { u32 guest; int host; } open_flags[] = {
     {0x40, O_CREAT}, {0x80, O_EXCL}, {0x100, O_NOCTTY}, {0x200, O_TRUNC},
     {0x400, O_APPEND}, {0x800, O_NONBLOCK}, {0x10000, O_DIRECTORY},
@@ -1550,6 +2031,28 @@ static s64 guest_open(oah_image *img, int dirfd, u64 address, u64 flags, u64 mod
         }
         return -EINVAL;
     }
+    const char *prel;
+    char canon[256];
+    if (path[0] == '/' && proc_path_rel(path, &prel)) {
+        prel = proc_rel_canon(prel, canon, sizeof(canon));
+        if (!strcmp(prel, "self/exe")) {
+            /* open follows the link to the real executable. */
+            path = oah_proc_self_exe();
+        } else if (!strncmp(prel, "self/fd/", 8) &&
+                   !(host_flags & O_NOFOLLOW)) {
+            /* open("/proc/self/fd/N") is dup(N). */
+            char *end;
+            long fdn = strtol(prel + 8, &end, 10);
+            if (end == prel + 8 || *end) {
+                return -ENOENT;
+            }
+            return host_result(fcntl((int)fdn,
+                                     host_flags & O_CLOEXEC ? F_DUPFD_CLOEXEC
+                                                            : F_DUPFD, 0));
+        } else {
+            return procfs_open(img, prel, host_flags, mode);
+        }
+    }
     s64 result = host_result(open_guest_path(img, dirfd, path, host_flags, mode));
     if (result >= 0) {
         track_fd_path((int)result);
@@ -1563,18 +2066,6 @@ static s64 guest_open(oah_image *img, int dirfd, u64 address, u64 flags, u64 mod
     }
     return result;
 }
-
-/* Linux x86-64 stat is 144 bytes and differs from Darwin's stat. */
-typedef struct {
-    u64 dev, ino, nlink;
-    u32 mode, uid, gid, pad;
-    u64 rdev;
-    s64 size, blksize, blocks;
-    s64 atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
-    s64 reserved[3];
-} linux_stat;
-
-_Static_assert(sizeof(linux_stat) == 144, "x86-64 Linux stat layout");
 
 static u64 linux_device(dev_t number)
 {
@@ -1606,6 +2097,20 @@ static s64 guest_stat(oah_image *img, int dirfd, const char *path, u64 addr, u64
     int result;
     const char *owner_path = NULL;
     char resolved[PATH_MAX];
+    const char *prel;
+    if (path && path[0] == '/' && proc_path_rel(path, &prel)) {
+        linux_stat pst;
+        s64 pr = procfs_stat(img, prel, &pst, (flags & 0x100) != 0);
+        if (pr == PROC_STAT_PASSTHROUGH) {
+            path = oah_proc_self_exe(); /* stat follows to the real exe */
+        } else {
+            if (pr < 0) {
+                return pr;
+            }
+            memcpy(output, &pst, sizeof(pst));
+            return 0;
+        }
+    }
     if (!path || (!*path && (flags & 0x1000) && dirfd != -100)) {
         result = fstat(dirfd, &st);
         /* statx(AT_EMPTY_PATH)/fstat on a sysroot-opened fd: recover the
@@ -2495,6 +3000,14 @@ static s64 guest_poll(oah_image *img, u64 address, u64 count, int timeout)
                 revents |= LINUX_POLLWRBAND;
             }
             result += revents != 0;
+            {
+                static int st = -1;
+                if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+                if (st) {
+                    fprintf(stderr, "poll fd=%d events=%x revents=%x\n",
+                            fds[i].fd, events, revents);
+                }
+            }
             memcpy(guest + i * sizeof(linux_pollfd) + offsetof(linux_pollfd, revents),
                    &revents, sizeof(revents));
         }
@@ -2921,8 +3434,10 @@ static s64 guest_epoll_ctl(oah_image *img, int queue, u64 operation, int fd, u64
     memcpy(&value.events, event, 4);
     memcpy(&value.data, event + 4, 8);
     const u32 filters = X86_EPOLLIN | X86_EPOLLOUT | X86_EPOLLRDHUP;
-    if (!(value.events & filters) ||
-        value.events & ~(filters | X86_EPOLLERR | X86_EPOLLHUP | X86_EPOLLONESHOT | X86_EPOLLET)) {
+    /* A flag-only mask (EPOLLET with no ready bits) is legal — dbus's
+     * socket set adds watches disabled this way, then enables via MOD.
+     * It registers no kevent filters and stays inert until then. */
+    if (value.events & ~(filters | X86_EPOLLERR | X86_EPOLLHUP | X86_EPOLLONESHOT | X86_EPOLLET)) {
         return -LINUX_EOPNOTSUPP;
     }
     epoll_watch *destination = existing ? existing : malloc(sizeof(*destination));
@@ -2946,6 +3461,14 @@ static s64 guest_epoll_ctl(oah_image *img, int queue, u64 operation, int fd, u64
     value.next = existing ? existing->next : NULL;
     *destination = value;
     *link = destination;
+    {
+        static int st = -1;
+        if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+        if (st) {
+            fprintf(stderr, "epoll_ctl q=%d op=%llu fd=%d events=%x\n",
+                    queue, (unsigned long long)operation, fd, value.events);
+        }
+    }
     return 0;
 }
 
@@ -2989,6 +3512,19 @@ static s64 guest_epoll_wait(oah_image *img, int queue, u64 address, int count, i
     int available = kevent(live_queue, NULL, 0, events, count,
                            milliseconds >= 0 ? &duration : NULL);
     finish_blocking_call(released);
+    {
+        static int st = -1;
+        if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+        if (st) {
+            fprintf(stderr, "epoll_wait q=%d -> %d", live_queue, available);
+            for (int i = 0; i < available && i < 8; i++) {
+                fprintf(stderr, " [fd=%d filt=%d flags=%x data=%lld]",
+                        (int)events[i].ident, events[i].filter,
+                        events[i].flags, (long long)events[i].data);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     s64 result = host_result(available);
     if (available > 0) {
         u8 *output = oah_guest_access(img, address, (u64)count * 12, PROT_WRITE);
@@ -3325,8 +3861,56 @@ static s64 guest_socket_address(oah_image *img, int fd, u64 address, u64 size, b
         if (length >= sizeof(local.sun_path)) {
             return -LINUX_ENAMETOOLONG;
         }
-        memcpy(local.sun_path, path, length);
-        local.sun_len = (u8)(offsetof(struct sockaddr_un, sun_path) + length + 1);
+        /* Guest socket paths resolve inside the sysroot so guest peers
+         * rendezvous on one filesystem location. Resolved paths that
+         * exceed sun_path map to a deterministic /tmp name instead —
+         * both sides derive it identically. Connect falls back to the
+         * verbatim host path so guest apps can reach real host sockets
+         * (e.g. the X server at /tmp/.X11-unix/X0). */
+        char guest_path[109];
+        memcpy(guest_path, path, length);
+        guest_path[length] = 0;
+        char resolved[sizeof(local.sun_path)];
+        char hashed[sizeof(local.sun_path)];
+        const char *use = guest_path;
+        bool have_resolved = false;
+        if (sysroot_path(img, guest_path)) {
+            char full[PATH_MAX];
+            int w = snprintf(full, sizeof(full), "%s%s", img->sysroot, guest_path);
+            if (w > 0 && w < (int)sizeof(resolved)) {
+                strcpy(resolved, full);
+                have_resolved = true;
+            }
+            u64 h = 1469598103934665603ull;
+            for (const u8 *p = (const u8 *)full; *p; p++) {
+                h = (h ^ *p) * 1099511628211ull;
+            }
+            snprintf(hashed, sizeof(hashed), "/tmp/.oah-%016llx",
+                     (unsigned long long)h);
+            if (binding) {
+                if (have_resolved) {
+                    ensure_parents(resolved);
+                    use = resolved;
+                } else {
+                    use = hashed;
+                }
+            } else if (have_resolved && access(resolved, F_OK) == 0) {
+                use = resolved;
+            } else if (access(hashed, F_OK) == 0) {
+                use = hashed;
+            }
+        }
+        size_t use_len = strlen(use);
+        memcpy(local.sun_path, use, use_len + 1);
+        local.sun_len = (u8)(offsetof(struct sockaddr_un, sun_path) + use_len + 1);
+        {
+            static int st = -1;
+            if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+            if (st) {
+                fprintf(stderr, "unix %s fd=%d path=%s -> %s\n",
+                        binding ? "bind" : "connect", fd, guest_path, use);
+            }
+        }
         bool released = !binding && begin_blocking_call();
         int result = binding ? bind(fd, (const struct sockaddr *)&local, local.sun_len) :
                                connect(fd, (const struct sockaddr *)&local, local.sun_len);
@@ -3445,8 +4029,7 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
         return -EFAULT;
     }
     memcpy(&data, header, sizeof(data));
-    if ((!receiving && data.control_length) ||
-        (flags & ~(receiving ? 0x40000042ull : 0x4040ull))) {
+    if (flags & ~(receiving ? 0x40000042ull : 0x4040ull)) {
         return -LINUX_EOPNOTSUPP;
     }
     struct sockaddr_storage name = {0};
@@ -3509,6 +4092,56 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
         host.msg_name = &name;
         host.msg_namelen = name_needed;
     }
+    /* Control messages: cmsghdr layout matches (LP64 both sides); only the
+     * level/type values differ. Guest fds are host fds, so SCM_RIGHTS is a
+     * passthrough. SCM_CREDENTIALS is dropped — Darwin attaches peer creds
+     * implicitly (SO_PEERCRED answers them). */
+    u8 host_control[1024];
+    size_t host_control_used = 0;
+    if (!receiving && data.control_length) {
+        const u8 *gctl = oah_guest_access(img, data.control,
+                                          data.control_length, PROT_READ);
+        if (!gctl) {
+            return -EFAULT;
+        }
+        u64 off = 0;
+        while (off + 16 <= data.control_length) {
+            u64 clen;
+            u32 level, type;
+            memcpy(&clen, gctl + off, 8);
+            memcpy(&level, gctl + off + 8, 4);
+            memcpy(&type, gctl + off + 12, 4);
+            if (clen < 16 || off + clen > data.control_length) {
+                return -EINVAL;
+            }
+            const u8 *cdata = gctl + off + 16;
+            size_t dlen = (size_t)clen - 16;
+            if (level == 1 && type == 1) { /* SCM_RIGHTS */
+                size_t need = 16 + ((dlen + 7) & ~(size_t)7);
+                if (host_control_used + need > sizeof(host_control)) {
+                    return -EINVAL;
+                }
+                struct cmsghdr *h = (struct cmsghdr *)(host_control + host_control_used);
+                h->cmsg_len = 16 + dlen;
+                h->cmsg_level = SOL_SOCKET;
+                h->cmsg_type = SCM_RIGHTS;
+                memcpy(host_control + host_control_used + 16, cdata, dlen);
+                host_control_used += need;
+            }
+            off += (clen + 7) & ~(u64)7;
+        }
+        if (off != data.control_length) {
+            return -EINVAL;
+        }
+        if (host_control_used) {
+            host.msg_control = host_control;
+            host.msg_controllen = host_control_used;
+        }
+    }
+    if (receiving && data.control && data.control_length) {
+        host.msg_control = host_control;
+        host.msg_controllen = sizeof(host_control);
+    }
     int host_flags = (flags & 0x40 ? MSG_DONTWAIT : 0) | (flags & 2 ? MSG_PEEK : 0);
     s64 result = host_result(receiving ? recvmsg(fd, &host, host_flags) :
                                        sendmsg(fd, &host, host_flags));
@@ -3548,9 +4181,47 @@ static s64 guest_socket_message(oah_image *img, int fd, u64 address, u64 flags, 
                 data.name_length = host.msg_namelen;
             }
         }
-        data.control_length = 0;
+        u64 guest_control_used = 0;
+        if (host.msg_control && host.msg_controllen >= 16 &&
+            !(flags & 2 /* MSG_PEEK */)) {
+            u8 *gctl_out = oah_guest_access(img, data.control,
+                                            data.control_length, PROT_WRITE);
+            if (!gctl_out) {
+                return -EFAULT;
+            }
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&host);
+                 c && c->cmsg_len >= sizeof(*c) &&
+                 c->cmsg_len <= host.msg_controllen;
+                 c = CMSG_NXTHDR(&host, c)) {
+                u32 level = 0, type = 0;
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
+                    level = 1; type = 1;
+                } else if (c->cmsg_level == SOL_SOCKET &&
+                           c->cmsg_type == SCM_TIMESTAMP) {
+                    level = 1; type = 29; /* SO_TIMESTAMP */
+                } else {
+                    continue;
+                }
+                size_t dlen = (size_t)c->cmsg_len - 16;
+                size_t need = 16 + ((dlen + 7) & ~(size_t)7);
+                if (guest_control_used + need > data.control_length) {
+                    data.flags |= 8; /* MSG_CTRUNC */
+                    break;
+                }
+                u8 *g = gctl_out + guest_control_used;
+                u64 glen = 16 + dlen;
+                memcpy(g, &glen, 8);
+                memcpy(g + 8, &level, 4);
+                memcpy(g + 12, &type, 4);
+                memcpy(g + 16, (const u8 *)c + 16, dlen);
+                memset(g + 16 + dlen, 0, need - 16 - dlen);
+                guest_control_used += need;
+            }
+        }
+        data.control_length = guest_control_used;
         data.flags = (host.msg_flags & MSG_CTRUNC ? 8 : 0) |
-                     (host.msg_flags & MSG_TRUNC ? 32 : 0);
+                     (host.msg_flags & MSG_TRUNC ? 32 : 0) |
+                     (data.flags & 8);
         memcpy(header, &data, sizeof(data));
     }
     return result;
@@ -3737,6 +4408,39 @@ static int guest_socket_option(u64 level, u64 option, int *host_level)
 static s64 guest_socket_options(oah_image *img, int fd, u64 level, u64 option,
                                 u64 address, u64 length, bool setting)
 {
+    if (level == 1 && option == 17 && !setting) {
+        /* SO_PEERCRED → ucred{pid,uid,gid}. The peer is another guest
+         * process, so ids must be in guest terms — guests that see
+         * themselves as root present their peer as root too. */
+        u8 ucred[12] = {0};
+        uid_t uid;
+        gid_t gid;
+        if (getpeereid(fd, &uid, &gid) < 0) {
+            return linux_error(errno);
+        }
+        if (guest_root(img)) {
+            uid = img->guest_uid[0];
+            gid = img->guest_gid[0];
+        }
+        memcpy(ucred + 4, &uid, 4);
+        memcpy(ucred + 8, &gid, 4);
+#ifdef LOCAL_PEEREPID
+        pid_t epid = 0;
+        socklen_t elen = sizeof(epid);
+        if (getsockopt(fd, 0, LOCAL_PEEREPID, &epid, &elen) == 0) {
+            memcpy(ucred, &epid, 4);
+        }
+#endif
+        void *out = oah_guest_access(img, address, 12, PROT_WRITE);
+        void *sz = oah_guest_access(img, length, 4, PROT_WRITE);
+        if (!out || !sz) {
+            return -EFAULT;
+        }
+        memcpy(out, ucred, 12);
+        u32 s = 12;
+        memcpy(sz, &s, 4);
+        return 0;
+    }
     int host_level;
     int host_option = guest_socket_option(level, option, &host_level);
     if (host_option < 0) {
@@ -3902,6 +4606,11 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
         }
     }
     if (!result) {
+        if (getenv("OAH_EXEC_TRACE")) {
+            for (size_t i = 0; args[i]; i++) {
+                fprintf(stderr, "[exec-trace] arg[%zu]=%s\n", i, args[i]);
+            }
+        }
         /* Translator configuration lives in the host environment; carry the
          * OAH_* variables into the exec'd child so settings like strict
          * sysroot mode, cache selection, and tracing survive guest execve. */
@@ -4392,10 +5101,25 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         u64 faccess_flags = nr == 21 ? 0 : a3;
         int dirfd = nr == 21 ? AT_FDCWD : darwin_dirfd(a0);
         int host_flags = faccess_flags & 0x200 ? AT_EACCESS : 0;
+        const char *prel;
+        char canon[256];
         if (!path) {
             result = -EFAULT;
         } else if (mode & ~7ull || faccess_flags & ~0x700ull) {
             result = -EINVAL;
+        } else if (path[0] == '/' && proc_path_rel(path, &prel)) {
+            prel = proc_rel_canon(prel, canon, sizeof(canon));
+            bool exists = proc_is_dir(prel) || proc_is_link(prel) ||
+                procfs_synth(img, prel, (u8[1]){0}, 1) != -ENOENT;
+            if (!exists) {
+                result = -ENOENT;
+            } else if (mode & 4) { /* R_OK: all proc nodes are readable */
+                result = 0;
+            } else if (mode & 2) { /* W_OK */
+                result = proc_writable(prel) ? 0 : -EACCES;
+            } else { /* X_OK */
+                result = proc_is_dir(prel) ? 0 : -EACCES;
+            }
         } else {
             char rp[PATH_MAX];
             int rr = resolve_read_path(img, path, rp, sizeof(rp), !(faccess_flags & 0x100));
@@ -5045,6 +5769,51 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
                 result = (s64)n;
             }
             break;
+        }
+        /* Other virtual /proc links: self, thread-self, self/fd/N. */
+        if (path) {
+            const char *prel;
+            char linkbuf[PATH_MAX];
+            const char *target = NULL;
+            if (!strcmp(path, "/proc/self")) {
+                snprintf(linkbuf, sizeof(linkbuf), "%d", (int)getpid());
+                target = linkbuf;
+            } else if (!strcmp(path, "/proc/thread-self")) {
+                snprintf(linkbuf, sizeof(linkbuf), "%d/task/%d",
+                         (int)getpid(), (int)getpid());
+                target = linkbuf;
+            } else if (proc_path_rel(path, &prel) &&
+                       !strncmp(prel, "self/fd/", 8)) {
+                char *end;
+                long fdn = strtol(prel + 8, &end, 10);
+                if (end != prel + 8 && !*end && fdn >= 0 &&
+                    fdn < OAH_FD_PATH_MAX && fd_path[fdn][0]) {
+                    const char *hp = fd_path[fdn];
+                    /* Report the guest path: strip the sysroot prefix. */
+                    if (img->sysroot) {
+                        size_t rl = strlen(img->sysroot);
+                        if (!strncmp(hp, img->sysroot, rl) && hp[rl] == '/') {
+                            hp += rl;
+                        }
+                    }
+                    snprintf(linkbuf, sizeof(linkbuf), "%s", hp);
+                    target = linkbuf;
+                } else if (end != prel + 8 && !*end && fdn >= 0) {
+                    result = -ENOENT;
+                    break;
+                }
+            }
+            if (target) {
+                size_t n = strlen(target);
+                if (!size || !buffer) {
+                    result = !size ? -EINVAL : -EFAULT;
+                } else {
+                    if (n > size) { n = size; }
+                    memcpy(buffer, target, n);
+                    result = (s64)n;
+                }
+                break;
+            }
         }
         char rp[PATH_MAX];
         int rr = resolve_read_path(img, path, rp, sizeof(rp), false);

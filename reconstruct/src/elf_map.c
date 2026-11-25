@@ -526,7 +526,19 @@ bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot
                 *option++ = 0;
                 option += strspn(option, " \t");
             }
-            strcpy(program->scripts[depth].path, resolved);
+            /* Script paths become guest-visible arguments ($0, argv[0]):
+             * report the guest path, not the host-rooted one. */
+            {
+                const char *guest_path = resolved;
+                if (sysroot) {
+                    size_t rl = strlen(sysroot);
+                    if (!strncmp(guest_path, sysroot, rl) &&
+                        guest_path[rl] == '/') {
+                        guest_path += rl;
+                    }
+                }
+                strcpy(program->scripts[depth].path, guest_path);
+            }
             program->scripts[depth].interpreter = interpreter;
             program->scripts[depth].option = *option ? option : NULL;
             path = interpreter;
