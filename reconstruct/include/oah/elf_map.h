@@ -71,6 +71,10 @@ typedef struct {
     u32 guest_gid[3];
     u32 guest_groups[64];
     int guest_ngroups;
+    /* Emulated capabilities (v3, 40 bits): tracked like the ids so
+     * capset/capget round-trip. No real privilege boundary exists. */
+    u64 guest_caps[3];  /* effective, permitted, inheritable */
+    u8 guest_caps_set, guest_keepcaps;
 } oah_image;
 
 /* Load a little-endian x86-64 static ELF and populate its guest mappings.

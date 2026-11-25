@@ -233,6 +233,38 @@ int main(int argc, char **argv, char **envp)
     if (_NSGetExecutablePath(executable, &executable_size) == 0 && realpath(executable, launcher)) {
         img.launcher = launcher;
     }
+    /* guest execve carries ids/caps through this env var (set by the
+     * parent translator) so setuid-dropped children stay dropped. */
+    const char *ids = getenv("OAH_GUEST_IDS");
+    if (ids) {
+        unsigned long long v[96];
+        int n = 0;
+        const char *p = ids;
+        while (*p && n < 96) {
+            char *end;
+            v[n++] = strtoull(p, &end, 10);
+            if (end == p) break;
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (n >= 7) {
+            for (int i = 0; i < 3; i++) {
+                img.guest_uid[i] = (u32)v[i];
+                img.guest_gid[i] = (u32)v[i + 3];
+            }
+            img.guest_ngroups = (int)v[6] > 64 ? 64 : (int)v[6];
+            for (int i = 0; i < img.guest_ngroups; i++) {
+                img.guest_groups[i] = 7 + i < n ? (u32)v[7 + i] : 0;
+            }
+            int c = 7 + img.guest_ngroups;
+            if (c + 4 < n) {
+                img.guest_caps_set = (u8)v[c];
+                img.guest_keepcaps = (u8)v[c + 1];
+                for (int i = 0; i < 3; i++) {
+                    img.guest_caps[i] = v[c + 2 + i];
+                }
+            }
+        }
+    }
     /* Sensible Linux defaults when the ambient env is a host env
      * (Finder/Launcher launches). A macOS PATH lacks /usr/games, so
      * execvp-style helpers like freeciv-server can't be found.

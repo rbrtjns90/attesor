@@ -2770,6 +2770,16 @@ static s64 guest_prctl(oah_image *img, u64 operation, u64 argument)
     if (operation == 23) { /* PR_CAPBSET_READ */
         return argument <= 40 ? 0 : -EINVAL;
     }
+    if (operation == 7) { /* PR_GET_KEEPCAPS */
+        return img->guest_keepcaps;
+    }
+    if (operation == 8) { /* PR_SET_KEEPCAPS */
+        if (argument > 1) {
+            return -EINVAL;
+        }
+        img->guest_keepcaps = (u8)argument;
+        return 0;
+    }
     if (operation == 15) { /* PR_SET_NAME */
         u64 available = 15;
         const u8 *input = oah_guest_span(img, argument, &available);
@@ -2786,6 +2796,88 @@ static s64 guest_prctl(oah_image *img, u64 operation, u64 argument)
         return error ? linux_error(error) : 0;
     }
     return -LINUX_ENOSYS;
+}
+
+/* Linux capability emulation: caps are process state, not a privilege
+ * check, so track them and report euid-0 = full set. v3 uses two
+ * 32-bit blocks; v1 uses one. */
+static u64 guest_capability_mask(const oah_image *img, int which)
+{
+    if (img->guest_caps_set) {
+        return img->guest_caps[which];
+    }
+    return img->guest_uid[1] == 0 ? (1ull << 40) - 1 : 0;
+}
+
+static s64 guest_capability(oah_image *img, u64 header_addr, u64 data_addr,
+                            bool setting)
+{
+    u32 header[2];
+    const void *input = oah_guest_access(img, header_addr, sizeof(header), PROT_READ);
+    if (!input) {
+        return -EFAULT;
+    }
+    memcpy(header, input, sizeof(header));
+    {
+        static int st = -1;
+        if (st < 0) st = getenv("OAH_SOCK_TRACE") != NULL;
+        if (st) {
+            fprintf(stderr, "cap set=%d version=%x pid=%d data=%llx\n",
+                    setting, header[0], (s32)header[1],
+                    (unsigned long long)data_addr);
+        }
+    }
+    if ((s32)header[1] < 0) {
+        return -EINVAL;
+    }
+    unsigned blocks;
+    switch (header[0]) {
+    case 0x20080522: /* _LINUX_CAPABILITY_VERSION_3 */
+        blocks = 2;
+        break;
+    case 0x20071026: /* VERSION_2 is withdrawn; probe still accepts it */
+    case 0x19980330: /* VERSION_1 */
+        blocks = 1;
+        break;
+    default:
+        /* The kernel answers an unknown version with EINVAL plus the
+         * preferred version written back — libcap's probe depends on it. */
+        {
+            u32 latest = 0x20080522;
+            void *back = oah_guest_access(img, header_addr, sizeof(latest), PROT_WRITE);
+            if (back) {
+                memcpy(back, &latest, sizeof(latest));
+            }
+        }
+        return -EINVAL;
+    }
+    if (!data_addr) {
+        return setting ? -EFAULT : 0; /* version probe */
+    }
+    u32 data[6] = {0}; /* 2 blocks x {effective, permitted, inheritable} */
+    if (setting) {
+        const void *raw = oah_guest_access(img, data_addr, blocks * 12, PROT_READ);
+        if (!raw) {
+            return -EFAULT;
+        }
+        memcpy(data, raw, blocks * 12);
+        for (int i = 0; i < 3; i++) {
+            img->guest_caps[i] = (u64)data[i] | ((u64)data[i + 3] << 32);
+        }
+        img->guest_caps_set = 1;
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        u64 mask = guest_capability_mask(img, i);
+        data[i] = (u32)mask;
+        data[i + 3] = (u32)(mask >> 32);
+    }
+    void *output = oah_guest_access(img, data_addr, blocks * 12, PROT_WRITE);
+    if (!output) {
+        return -EFAULT;
+    }
+    memcpy(output, data, blocks * 12);
+    return 0;
 }
 
 static s64 guest_system_info(oah_image *img, u64 address)
@@ -4623,6 +4715,27 @@ static s64 guest_exec(oah_image *img, u64 path_arg, u64 argv_arg, u64 env_arg)
                 host_env[host_env_count++] = *envp;
             }
         }
+        /* Guest-visible ids/caps are process state the exec'd child must
+         * inherit — the new oah image would otherwise come up as root. */
+        char ids_buffer[640];
+        if (guest_root(img)) {
+            size_t n = snprintf(ids_buffer, sizeof(ids_buffer),
+                                "OAH_GUEST_IDS=%u,%u,%u,%u,%u,%u",
+                                img->guest_uid[0], img->guest_uid[1], img->guest_uid[2],
+                                img->guest_gid[0], img->guest_gid[1], img->guest_gid[2]);
+            n += snprintf(ids_buffer + n, sizeof(ids_buffer) - n, ",%d",
+                          img->guest_ngroups);
+            for (int i = 0; i < img->guest_ngroups; i++) {
+                n += snprintf(ids_buffer + n, sizeof(ids_buffer) - n, ",%u",
+                              img->guest_groups[i]);
+            }
+            snprintf(ids_buffer + n, sizeof(ids_buffer) - n, ",%u,%u,%llu,%llu,%llu",
+                     img->guest_caps_set, img->guest_keepcaps,
+                     (unsigned long long)img->guest_caps[0],
+                     (unsigned long long)img->guest_caps[1],
+                     (unsigned long long)img->guest_caps[2]);
+            host_env[host_env_count++] = ids_buffer;
+        }
         host_env[host_env_count] = NULL;
         struct itimerval timer;
         const struct itimerval stopped = {0};
@@ -5983,6 +6096,9 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         break;
     case 102: result = guest_root(img) ? img->guest_uid[0] : getuid(); break;
     case 104: result = guest_root(img) ? img->guest_gid[0] : getgid(); break;
+    case 125: case 126: /* capget, capset */
+        result = guest_capability(img, a0, a1, nr == 126);
+        break;
     case 107: result = guest_root(img) ? img->guest_uid[1] : geteuid(); break;
     case 108: result = guest_root(img) ? img->guest_gid[1] : getegid(); break;
     case 105: case 106: /* setuid, setgid: root sets all three ids */
