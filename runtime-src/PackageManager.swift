@@ -878,6 +878,9 @@ final class AppState: ObservableObject {
         env["XAUTHORITY"] = NSHomeDirectory() + "/.Xauthority"
         env["DISPLAY"] = ":0"
         env["OAH_CACHE_DIR"] = Repo.root.path + "/runtime/var/cache/jit"
+        // Host TMPDIR (/var/folders/...) can't resolve inside the sysroot;
+        // guest mktemp/users would fail with ENOENT.
+        env["TMPDIR"] = "/tmp"
         // Guest worker threads (SDL audio/hotplug) run on the cached JIT
         // instead of the interpreter — much shorter guest_lock holds.
         env["OAH_WORKER_JIT"] = "1"

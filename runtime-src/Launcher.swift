@@ -73,6 +73,8 @@ func launch(_ file: URL, requested: Mode) throws {
     // Guest-side PATH: /usr/games so spawn-style helpers like
     // freeciv-server resolve; host PATH is meaningless in the sysroot.
     env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"
+    // Host TMPDIR (/var/folders/...) can't resolve inside the sysroot.
+    env["TMPDIR"] = "/tmp"
     // Route SDL2/libasound audio to the emulated card (CoreAudio).
     env["SDL_AUDIODRIVER"] = "alsa"
     env["AUDIODEV"] = "hw:0,0"
