@@ -735,6 +735,7 @@ static bool emit_flags_for_cc(oah_asm_buf *buf, u8 cc, u32 *cond)
     return true;
 }
 
+static __thread u16 xmm_resident, xmm_dirty;
 static bool emit_xmm_spill(oah_asm_buf *buf, const oah_guest *g);
 
 /* Terminate the fragment: x20 = next rip (or computed), then ret.
@@ -1291,15 +1292,21 @@ static bool frag_translate_scalar(oah_asm_buf *buf, const oah_guest *g,
                 return false;
             }
         }
-        /* Skip the out-of-line bail stub, then emit it. */
+        /* Skip the out-of-line bail stub, then emit it. The stub's spill
+         * runs only on the bail path, but emit_xmm_spill clears the
+         * translate-time dirty set — restore it so regs still dirty in
+         * NEON are flushed by the fragment's real exit (same pattern as
+         * the vector alignment stub in emit_vec_ea). */
         u64 over = buf->size;
         u64 stub;
         oah_asm_emit32(buf, 0x14000000u); /* b <after stub> */
         stub = buf->size;
+        u16 saved_dirty = xmm_dirty;
         if (!emit_xmm_spill(buf, g) ||
             !frag_bail_exit(buf, next - in->length)) {
             return false;
         }
+        xmm_dirty = saved_dirty;
         while (nbail) {
             unsigned i = --nbail;
             oah_asm_patch32(buf, bail_off[i],
@@ -1578,7 +1585,6 @@ void oah_translate_enable_sse(bool on)
  * g->xmm. Guest memory therefore matches interpreter state at every exit
  * and interp boundary, and a mid-fragment fault replays correctly because
  * recovery re-derives the vector state from the committed shadow. */
-static __thread u16 xmm_resident, xmm_dirty;
 /* One slot beyond MAX so a bound_start index is always valid even when
  * the persisted bound table is already full (oversized OAH_JIT_FRAGLEN). */
 static __thread u16 bound_res_snap[OAH_FRAG_MAX_BOUNDS + 1],
@@ -1977,7 +1983,7 @@ static bool frag_translate_vector(oah_asm_buf *buf, const oah_guest *g,
  * interpreter with committed stores suppressed, so a replayed load
  * must never precede a committed store — it would re-read new bytes.
  * Conservative: anything ambiguous counts as both directions. */
-static bool insn_writes_mem(const oah_insn *in)
+bool oah_insn_writes_mem(const oah_insn *in)
 {
     switch (in->op) {
     case OAH_OP_PUSH:
@@ -2011,7 +2017,7 @@ static bool insn_writes_mem(const oah_insn *in)
     }
 }
 
-static bool insn_reads_mem(const oah_insn *in)
+bool oah_insn_reads_mem(const oah_insn *in)
 {
     switch (in->op) {
     case OAH_OP_POP:
@@ -2031,7 +2037,7 @@ static bool insn_reads_mem(const oah_insn *in)
         /* rm load, or RMW — a plain mov store does not read */
         return in->memory && !(in->rm_dest && in->scalar == OAH_SC_MOV);
     case OAH_OP_VECTOR:
-        return in->memory && !insn_writes_mem(in);
+        return in->memory && !oah_insn_writes_mem(in);
     default:
         return false;
     }
@@ -2185,7 +2191,7 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
          * store must start a new fragment — a fault replayed past it
          * would re-read bytes the committed store already changed. */
         if (!boundary_interp && (frag_mem & OAH_FRAG_HAS_LOAD) &&
-            insn_writes_mem(&in)) {
+            oah_insn_writes_mem(&in)) {
             if (!frag_exit(buf, g, cur)) {
                 return false;
             }
@@ -2453,10 +2459,10 @@ bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
             info->mem_flags = frag_mem;
             return true;
         }
-        if (insn_reads_mem(&in)) {
+        if (oah_insn_reads_mem(&in)) {
             frag_mem |= OAH_FRAG_HAS_LOAD;
         }
-        if (insn_writes_mem(&in)) {
+        if (oah_insn_writes_mem(&in)) {
             frag_mem |= OAH_FRAG_HAS_STORE;
         }
         if (done) {

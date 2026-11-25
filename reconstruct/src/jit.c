@@ -1529,34 +1529,57 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                     memcpy(verify_mem_jit, w, verify_mem_len);
                 }
             }
-            /* RDTSC is non-deterministic — sync timestamp regs afterward. */
+            /* RDTSC is non-deterministic — sync timestamp regs afterward.
+             * A memory-touching boundary insn (lock cmpxchg et al.) can't
+             * be replayed on memory the JIT already committed — the ref
+             * would read the JIT's result. Those are verified by running
+             * the same interpreter step on both sides, so just resync. */
             bool skip_tsc = false;
+            bool bound_mem = false;
             if (frag->flags & OAH_FRAG_FALLBACK) {
                 u64 avail = OAH_X86_MAX_INSN;
                 const u8 *pc = oah_guest_span(img, interp_rip, &avail);
                 oah_insn in;
-                if (pc && oah_decode_insn(pc, pc + avail, &in) &&
-                    in.op == OAH_OP_RDTSC) {
-                    skip_tsc = true;
+                if (pc && oah_decode_insn(pc, pc + avail, &in)) {
+                    skip_tsc = in.op == OAH_OP_RDTSC;
+                    bound_mem = in.memory;
                 }
             }
             /* Run the reference one insn at a time; compare each step.
-             * Suppress ref-side stores — the JIT already committed them
-             * on this shared image, and replaying would double-apply
-             * RMW ops and produce false divergences. */
-            u64 steps = frag->insns + ((frag->flags & OAH_FRAG_FALLBACK) ? 1 : 0);
+             * frag->insns can be 0 for boundary fragments — drive those
+             * by rip-equality instead (a jit exit rip can coincide with a
+             * mid-fragment rip, so rip-equality is unsafe when an insn
+             * count exists). Suppress ref-side stores — the JIT already
+             * committed them on this shared image, and replaying would
+             * double-apply RMW ops and produce false divergences. */
+            u64 steps = frag->insns +
+                ((frag->flags & OAH_FRAG_FALLBACK) && !bound_mem ? 1 : 0);
+            bool rip_driven = steps == 0;
+            if (rip_driven) {
+                steps = 64;
+            }
+
+            /* An insn that both reads and writes memory (xchg [m],r,
+             * add [m],r, ...) replays on top of the JIT's own store —
+             * the ref reads the JIT result, never the original. Those
+             * frags can't be verified this way; resync instead. */
+            bool frag_rmw = false;
             oah_suppress_guest_stores = true;
-            for (u64 s = 0; s < steps; s++) {
+            for (u64 s = 0; s < steps && (!rip_driven || g_ref.rip != g->rip); s++) {
                 u64 ref_rip = g_ref.rip;
                 /* The jit side already executed boundary syscalls; replaying
                  * them would double their side effects. Sync instead. */
                 u64 avail = OAH_X86_MAX_INSN;
                 const u8 *rpc = oah_guest_span(img, ref_rip, &avail);
                 oah_insn rin;
-                if (rpc && oah_decode_insn(rpc, rpc + avail, &rin) &&
-                    rin.op == OAH_OP_SYSCALL) {
-                    g_ref = *g;
-                    break;
+                if (rpc && oah_decode_insn(rpc, rpc + avail, &rin)) {
+                    if (rin.op == OAH_OP_SYSCALL) {
+                        g_ref = *g;
+                        break;
+                    }
+                    if (oah_insn_reads_mem(&rin) && oah_insn_writes_mem(&rin)) {
+                        frag_rmw = true;
+                    }
                 }
                 oah_interp_result ref = oah_interp_run(&g_ref, img, 1);
                 if (ref.status != OAH_INTERP_LIMIT &&
@@ -1586,6 +1609,11 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                 (void)ref_rip;
             }
             oah_suppress_guest_stores = false;
+            if (bound_mem || frag_rmw) {
+                /* The boundary insn ran interp on the jit side too —
+                 * its effects are identical by construction. */
+                g_ref = *g;
+            }
             if (skip_tsc) {
                 g_ref.gpr[OAH_X86_RAX] = g->gpr[OAH_X86_RAX];
                 g_ref.gpr[OAH_X86_RDX] = g->gpr[OAH_X86_RDX];
@@ -1593,7 +1621,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
             for (int i = 0; i < 16; i++) {
                 if (g->gpr[i] != g_ref.gpr[i] || g->rip != g_ref.rip ||
                     g->rflags != g_ref.rflags) {
-                    bool flag_only = g->rip == g_ref.rip &&
+                    bool flag_only =
                                      g->gpr[0] == g_ref.gpr[0] &&
                                      g->gpr[1] == g_ref.gpr[1] &&
                                      g->gpr[2] == g_ref.gpr[2] &&
@@ -1621,7 +1649,7 @@ static oah_interp_result jit_run_cached_inner(oah_guest *g, oah_image *img,
                             (unsigned long long)g_ref.rip,
                             (unsigned long long)g->rflags,
                             (unsigned long long)g_ref.rflags,
-                            flag_only ? " (flags-only, resyncing)" : "");
+                            flag_only ? " (boundary-only, resyncing)" : "");
                     u64 blen = 40;
                     const u8 *bc = oah_guest_span(img, entry_rip, &blen);
                     fputs(" bytes:", stderr);

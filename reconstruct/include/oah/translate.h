@@ -2,6 +2,7 @@
 #define OAH_TRANSLATE_H
 
 #include "oah/assembler_buffer.h"
+#include "oah/decode_insn.h"
 #include "oah/elf_map.h"
 #include "oah/guest.h"
 #include "oah/interp.h"
@@ -102,6 +103,10 @@ typedef struct {
 
 bool oah_translate_frag(oah_asm_buf *buf, oah_image *img, const oah_guest *g,
                         u64 rip, oah_frag_info *info);
+
+/* Memory direction, conservative: anything ambiguous counts as both. */
+bool oah_insn_reads_mem(const oah_insn *in);
+bool oah_insn_writes_mem(const oah_insn *in);
 
 /* Gate SSE translation: callers enable it only for entry ABIs where the
  * xmm shadow address emitted via OAH_RELOC_XMMBASE stays valid at run
