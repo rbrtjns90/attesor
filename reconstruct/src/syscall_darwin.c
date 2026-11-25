@@ -2133,22 +2133,56 @@ static s64 memory_change(oah_image *img, u64 addr, u64 len, u64 prot, bool unmap
         }
         return -EINVAL;
     }
-    for (unsigned i = 0; i < img->nseg; i++) {
-        oah_load_seg *seg = &img->segs[i];
-        if (addr < seg->gva || addr - seg->gva >= seg->size ||
-            len > seg->size - (addr - seg->gva)) {
-            continue;
+    /* Linux mprotect may span multiple VMAs (e.g. ld.so applies RELRO
+     * across consecutive segments), so walk the range splitting each
+     * covered segment rather than requiring one to contain it whole.
+     * Any unmapped gap fails like Linux's ENOMEM. */
+    u64 cur = addr;
+    const u64 end = addr + len;
+    while (cur < end) {
+        unsigned i;
+        oah_load_seg *seg = NULL;
+        for (i = 0; i < img->nseg; i++) {
+            if (cur >= img->segs[i].gva &&
+                cur - img->segs[i].gva < img->segs[i].size) {
+                seg = &img->segs[i];
+                break;
+            }
         }
-        u64 left = addr - seg->gva;
-        unsigned extra = (left != 0) + (len != seg->size - left);
+        if (!seg) {
+            if (getenv("OAH_SEG_DEBUG")) {
+                fprintf(stderr, "mprotect gap at gva=%llx (range %llx-%llx) segs:",
+                        (unsigned long long)cur, (unsigned long long)addr,
+                        (unsigned long long)end);
+                for (unsigned j = 0; j < img->nseg; j++) {
+                    fprintf(stderr, " [%llx+%llx]",
+                            (unsigned long long)img->segs[j].gva,
+                            (unsigned long long)img->segs[j].size);
+                }
+                fprintf(stderr, "\n");
+            }
+            return -ENOMEM;
+        }
+        u64 left = cur - seg->gva;
+        u64 span = seg->size - left;
+        if (span > end - cur) {
+            span = end - cur;
+        }
+        unsigned extra = (left != 0) + (span != seg->size - left);
         if ((extra && i >= img->load_segments && !seg->allocation) ||
             extra > OAH_MAX_LOAD_SEGS - img->nseg) {
-            return -EINVAL;
+            if (getenv("OAH_SEG_DEBUG")) {
+                fprintf(stderr, "mprotect unsplittable seg i=%u gva=%llx+%llx span=%llx nseg=%u\n",
+                        i, (unsigned long long)seg->gva,
+                        (unsigned long long)seg->size,
+                        (unsigned long long)span, img->nseg);
+            }
+            return -ENOMEM;
         }
-        split_mapping(img, i, addr, len, (u32)prot);
-        return 0;
+        split_mapping(img, i, cur, span, (u32)prot);
+        cur += span;
     }
-    return -EINVAL;
+    return 0;
 }
 
 static s64 guest_mremap(oah_image *img, u64 address, u64 prior, u64 requested, u64 flags)

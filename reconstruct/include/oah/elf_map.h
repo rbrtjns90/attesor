@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define OAH_MAX_LOAD_SEGS 1024
+#define OAH_MAX_LOAD_SEGS 4096
 #define OAH_MAX_MODULES 64
 #define OAH_X86_PAGE_SIZE 4096u
 

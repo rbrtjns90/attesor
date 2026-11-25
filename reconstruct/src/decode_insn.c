@@ -533,10 +533,15 @@ bool oah_decode_insn(const u8 *pc, const u8 *end, oah_insn *out)
             out->op = OAH_OP_NOP;
             goto done;
         }
-        if (op2 == 0xae && peek(&d) == 0xf8 && !operand_override && !repeat && !repeat_not_equal) {
-            take(&d);
-            out->op = OAH_OP_STORE_FENCE;
-            goto done;
+        if (op2 == 0xae && !operand_override && !repeat && !repeat_not_equal) {
+            u8 third = peek(&d);
+            /* lfence/mfence/sfence (mod=11, /5-/7): one fence op covers
+             * all three for our memory model. */
+            if (third == 0xe8 || third == 0xf0 || third == 0xf8) {
+                take(&d);
+                out->op = OAH_OP_STORE_FENCE;
+                goto done;
+            }
         }
         if (op2 == 0xae && !operand_override && !repeat && !repeat_not_equal) {
             u8 modrm = take(&d);
