@@ -293,6 +293,14 @@ int oah_sysroot_open(const char *sysroot, const char *path, int flags, u32 mode)
  * stays literal (lstat semantics, for rename/unlink/lstat callers).
  * Nonexistent leaf components are appended literally so O_CREAT and
  * mkdir land in the right directory. Returns 0 or -errno. */
+/* Guest-visible path of the running executable, for /proc/self/exe. */
+static char oah_proc_self_exe_path[PATH_MAX];
+
+const char *oah_proc_self_exe(void)
+{
+    return oah_proc_self_exe_path;
+}
+
 static int resolve_in_root(const char *root, const char *path, char *out,
                            size_t cap, bool leaf_follow)
 {
@@ -312,6 +320,13 @@ static int resolve_in_root(const char *root, const char *path, char *out,
             pending[root_len] == '/') {
             memmove(pending, pending + root_len, plen - root_len + 1);
         }
+    }
+    /* /proc/self/exe is synthesized per process — substitute the mapped
+     * executable's guest path so open/stat land on the real file. */
+    if (oah_proc_self_exe_path[0] &&
+        (!strcmp(pending, "/proc/self/exe") ||
+         !strcmp(pending, "/proc/thread-self/exe"))) {
+        snprintf(pending, sizeof(pending), "%s", oah_proc_self_exe_path);
     }
     int links = 0;
     while (*pending) {
@@ -786,6 +801,17 @@ bool oah_map_elf_sysroot(oah_image *img, const char *path, const char *sysroot)
          * the guest chdirs (strict mode confines relative paths too). */
         char abs[PATH_MAX];
         img->sysroot = realpath(sysroot, abs) ? strdup(abs) : sysroot;
+        /* /proc/self/exe reports the guest path, not the host-rooted one
+         * the launcher passed. */
+        const char *exe = exe_host[0] ? exe_host : path;
+        size_t root_len = strlen(img->sysroot);
+        if (!strncmp(exe, img->sysroot, root_len) &&
+            (exe[root_len] == '/' || !exe[root_len])) {
+            exe += root_len;
+            if (!*exe) { exe = "/"; }
+        }
+        snprintf(oah_proc_self_exe_path, sizeof(oah_proc_self_exe_path),
+                 "%s", exe);
     }
     int module = oah_image_module_register(
         img, exe_host[0] ? exe_host : path);

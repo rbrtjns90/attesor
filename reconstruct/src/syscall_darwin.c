@@ -5030,6 +5030,22 @@ oah_sys_status oah_guest_syscall(oah_guest *g, oah_image *img)
         u64 size = nr == 89 ? a2 : a3;
         char *buffer = oah_guest_access(img, nr == 89 ? a1 : a2, size, PROT_WRITE);
         int fd = nr == 89 ? -100 : (int)a0;
+        /* Virtual symlink: reports the guest path of the running exe —
+         * glibc expands $ORIGIN in RPATHs through it. */
+        const char *self_exe = oah_proc_self_exe();
+        if (path && self_exe[0] && img->sysroot &&
+            (!strcmp(path, "/proc/self/exe") ||
+             !strcmp(path, "/proc/thread-self/exe"))) {
+            size_t n = strlen(self_exe);
+            if (!size || !buffer) {
+                result = !size ? -EINVAL : -EFAULT;
+            } else {
+                if (n > size) { n = size; }
+                memcpy(buffer, self_exe, n);
+                result = (s64)n;
+            }
+            break;
+        }
         char rp[PATH_MAX];
         int rr = resolve_read_path(img, path, rp, sizeof(rp), false);
         result = rr < 0 ? rr : !size ? -EINVAL : !path || !buffer ? -EFAULT :

@@ -92,6 +92,9 @@ bool oah_sysroot_readpath(const char *sysroot, const char *path,
                           char *resolved, size_t capacity);
 bool oah_sysroot_hostpath(const char *sysroot, const char *path,
                           char *resolved, size_t capacity);
+/* Guest-visible path of the mapped executable ("" before mapping), for
+ * the synthesized /proc/self/exe link. */
+const char *oah_proc_self_exe(void);
 #if defined(__APPLE__)
 #define OAH_SCRIPT_DEPTH 4
 #define OAH_SCRIPT_PREFIX (2 * OAH_SCRIPT_DEPTH + 1)
