@@ -44,7 +44,7 @@ if [ "${#pkgs[@]}" -eq 0 ]; then
 fi
 
 run_guest() {
-    env OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
+    env OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive TMPDIR=/tmp OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
         "$OAH" --sysroot "$S" "$@"
 }
 

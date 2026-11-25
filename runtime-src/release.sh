@@ -46,7 +46,10 @@ cp "$repo/reconstruct/oah" "$payload/reconstruct/"
 cp "$src"/*.sh "$payload/runtime-src/" 2>/dev/null || true
 cp "$runtime/icons/Penguin.icns" "$payload/runtime/icons/"
 cp -R "$runtime/Apps/Attesor Linux Launcher.app" "$payload/runtime/Apps/"
-cp -pR "$runtime/sysroots" "$payload/runtime/"
+# The payload ships a minimal deb-built sysroot under the canonical
+# debian-expanded name — everything else downloads on demand through the
+# native package-manager pipeline. Dev sysroots are never shipped.
+"$src/bootstrap-sysroot.sh" "$payload/runtime/sysroots/debian-expanded"
 # Guest homes in a development sysroot can contain saves and user settings.
 # Clear only the staged copies before packaging.
 for guest in "$payload/runtime/sysroots"/*; do

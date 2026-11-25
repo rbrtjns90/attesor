@@ -78,7 +78,10 @@ for deb in "$@"; do
 
     # preinst, if shipped, must run before files land — the translator
     # executes it like dpkg would, with DPKG_MAINTSCRIPT_* env set.
-    if [ -f "$TMP/ctl/preinst" ]; then
+    # OAH_SKIP_PREINST=1: bootstrap mode — a fresh sysroot has no /bin/sh
+    # until dash unpacks, so preinsts cannot run yet; they're conflict
+    # checks and safe to skip on an empty root.
+    if [ -f "$TMP/ctl/preinst" ] && [ "${OAH_SKIP_PREINST:-0}" != 1 ]; then
         ver=$(control_field "$ctl" Version)
         arch=$(control_field "$ctl" Architecture)
         preinst_dir=$(mktemp -d "$SYSROOT/.attesor-preinst.XXXXXX")
@@ -87,7 +90,7 @@ for deb in "$@"; do
             DPKG_MAINTSCRIPT_VERSION="$ver" DPKG_MAINTSCRIPT_ARCH="$arch" \
             OAH_CACHE_DIR=$A/runtime/var/cache/jit LC_ALL=C \
             "$A/reconstruct/oah" --sysroot "$SYSROOT" \
-            "$SYSROOT/usr/bin/dash" "/${preinst_dir##*/}/preinst" install || {
+            "$SYSROOT/bin/sh" "/${preinst_dir##*/}/preinst" install || {
                 echo "!! $pkg preinst failed" >&2
                 rm -rf "$preinst_dir"
                 exit 1
@@ -174,7 +177,7 @@ if ls "$TMP"/*.stanza >/dev/null 2>&1; then
 fi
 
 echo "== configuring under translator (dpkg --configure -a)"
-OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
+OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive TMPDIR=/tmp OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
     "$A/reconstruct/oah" --sysroot "$SYSROOT" \
     "$SYSROOT/usr/bin/dpkg" --configure -a
 

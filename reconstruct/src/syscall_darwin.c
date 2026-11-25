@@ -1215,14 +1215,6 @@ static int open_guest_path(oah_image *img, int dirfd, const char *path, int host
         return -1;
     }
     if (sysroot_path(img, path)) {
-        /* dpkg can pass an already-rooted maintainer-script path to /bin/sh.
-         * Interpret it as a guest path, still resolving beneath the sysroot. */
-        if (sysroot_strict(img)) {
-            size_t root_len = strlen(img->sysroot);
-            if (!strncmp(path, img->sysroot, root_len) && path[root_len] == '/') {
-                path += root_len;
-            }
-        }
         bool writing = (host_flags & O_ACCMODE) != O_RDONLY ||
                        (host_flags & (O_CREAT | O_TRUNC));
         if (writing && !sysroot_writable(img)) {

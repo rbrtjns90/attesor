@@ -16,6 +16,7 @@ Usage: native-resolve.py <sysroot> <pkg> [<pkg>...]
 """
 
 import lzma
+import os
 import re
 import sys
 from pathlib import Path
@@ -170,7 +171,7 @@ if status.exists():
 def dep_ok(dep):
     """Is one alternative (possibly versioned/arch-qualified) satisfied
     by the installed set?"""
-    m = re.match(r"([^ (|]+?)(?::[a-z0-9-]+)?\s*(?:\((\S+)\s*(\S+)\))?", dep.strip())
+    m = re.match(r"([^ (|]+)(?::[a-z0-9-]+)?\s*(?:\((\S+)\s*(\S+)\))?", dep.strip())
     if not m:
         return False
     name, op, ver = m.group(1), m.group(2), m.group(3)
@@ -212,8 +213,9 @@ def add(name):
         else:
             missing.append(name)
         return
-    deps = (st.get("Pre-Depends", "") + ", " + st.get("Depends", "") +
-            ", " + st.get("Recommends", ""))
+    deps = st.get("Pre-Depends", "") + ", " + st.get("Depends", "")
+    if os.environ.get("OAH_NO_RECOMMENDS") != "1":
+        deps += ", " + st.get("Recommends", "")
     for group in re.split(r",\s*(?![^()]*\))", deps):
         group = group.strip()
         if not group:

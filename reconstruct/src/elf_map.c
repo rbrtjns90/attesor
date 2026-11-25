@@ -303,6 +303,16 @@ static int resolve_in_root(const char *root, const char *path, char *out,
         return -ENAMETOOLONG;
     }
     strcpy(out, root);
+    /* Paths a guest already resolved once (dpkg hands debconf a
+     * host-rooted maintainer-script path) get re-anchored to
+     * guest-absolute instead of nesting beneath the root. */
+    {
+        size_t plen = strlen(pending);
+        if (plen > root_len && !strncmp(pending, root, root_len) &&
+            pending[root_len] == '/') {
+            memmove(pending, pending + root_len, plen - root_len + 1);
+        }
+    }
     int links = 0;
     while (*pending) {
         char *p = pending;
@@ -425,6 +435,14 @@ bool oah_darwin_resolve_program(oah_darwin_program *program, const char *sysroot
                                const char *path, bool guest_exec)
 {
     program->depth = 0;
+    /* dpkg -> debconf can hand us an already-rooted maintainer-script
+     * path; re-anchor it as a guest path beneath the sysroot. */
+    if (guest_exec && sysroot && path[0] == '/' && getenv("OAH_SYSROOT_STRICT")) {
+        size_t root_len = strlen(sysroot);
+        if (!strncmp(path, sysroot, root_len) && path[root_len] == '/') {
+            path += root_len;
+        }
+    }
     for (;;) {
         char *resolved = program->executable;
         int fd = -1;
