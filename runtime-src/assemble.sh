@@ -13,6 +13,7 @@ src="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$src/.." && pwd)"
 runtime="$repo/runtime"
 apps="$runtime/Apps"
+swift_target="arm64-apple-macosx${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 
 die() { echo "assemble: $*" >&2; exit 1; }
 
@@ -35,7 +36,7 @@ fi
 mkdir -p "$apps/Attesor Linux Launcher.app/Contents/MacOS" \
          "$apps/Attesor Linux Launcher.app/Contents/Resources"
 echo "assemble: compiling Launcher.swift"
-swiftc -O -o "$apps/Attesor Linux Launcher.app/Contents/MacOS/Launcher" \
+swiftc -target "$swift_target" -O -o "$apps/Attesor Linux Launcher.app/Contents/MacOS/Launcher" \
     "$src/Launcher.swift" || die "swiftc failed"
 cp "$src/apps/Attesor Linux Launcher.plist" \
    "$apps/Attesor Linux Launcher.app/Contents/Info.plist"
@@ -52,7 +53,7 @@ mkdir -p "$apps/Attesor Package Manager.app/Contents/MacOS" \
 echo "assemble: compiling PackageManager.swift"
 # -swift-version 5: the file predates strict concurrency; Swift 6 mode
 # turns its main-actor calls into hard errors.
-swiftc -O -parse-as-library -swift-version 5 -o \
+swiftc -target "$swift_target" -O -parse-as-library -swift-version 5 -o \
     "$apps/Attesor Package Manager.app/Contents/MacOS/PackageManager" \
     "$src/PackageManager.swift" || die "swiftc failed"
 cp "$src/apps/Attesor Package Manager.plist" \

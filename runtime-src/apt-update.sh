@@ -8,7 +8,7 @@
 #   3. verify the signature with the *guest* gpgv under the translator —
 #      a tiny file, no decompression, so it's fast even translated
 #   4. read the Release's SHA256 table and fetch each component's index
-#      (Packages.lz4 preferred, matching apt's on-disk names), verifying
+#      (Packages.gz preferred, readable by macOS tools), verifying
 #      size + sha256
 #   5. install into var/lib/apt/lists/ atomically via partial/
 #
@@ -126,7 +126,7 @@ verify_sig() { # $1=partial data file, $2=keyring, $3=optional detached sig
 # From $PARTIAL/.sums ("path|size|sha"), pick the best compression for $1.
 want_index() {
     local ext line
-    for ext in .lz4 .xz .gz .bz2 ""; do
+    for ext in .gz .xz .lz4 .bz2 ""; do
         line=$(awk -F'|' -v p="$1$ext" '$1==p {print; exit}' "$PARTIAL/.sums")
         if [ -n "$line" ]; then
             printf '%s|%s\n' "$1$ext" "$line"
@@ -194,7 +194,16 @@ while IFS='|' read -r type uri suite comps keyring; do
             fi
             # Retire other compressions of the same index — apt prefers
             # lz4 when reading lists, so a stale .lz4 would shadow this.
-            rm -f "$LISTS"/"${base}_${rel_target//\//_}".*
+            canonical="${base}_${rel_target//\//_}"
+            if [ "$rpath" = "$idx.gz" ]; then
+                if ! /usr/bin/gunzip -c "$PARTIAL/$fname" > "$PARTIAL/$canonical"; then
+                    echo "!! could not decompress $rpath" >&2
+                    fail=1; continue
+                fi
+                rm -f "$PARTIAL/$fname"
+                fname="$canonical"
+            fi
+            rm -f "$LISTS/$canonical".* "$LISTS/$canonical"
             mv "$PARTIAL/$fname" "$LISTS/$fname"
             echo "   $rpath ($got_size bytes)"
         done

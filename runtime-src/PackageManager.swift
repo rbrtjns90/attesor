@@ -11,26 +11,25 @@ import AppKit
 struct Repo {
     /// Where the runtime payload lives once downloaded on first launch —
     /// the "installed" location for a shipped Attesor.app.
-    static var appSupport: URL {
-        URL(fileURLWithPath: NSHomeDirectory()
-            + "/Library/Application Support/Attesor")
+    static var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
     }
 
-    /// The runtime root: payload installed under Application Support
-    /// first, then a development checkout (bundle inside runtime/Apps or
-    // the hardcoded path). Falls through to appSupport so the first-run
-    /// bootstrap has a target to create.
+    static var appSupport: URL {
+        URL(fileURLWithPath: NSHomeDirectory()
+            + "/Library/Application Support/Attesor/Runtime-" + version)
+    }
+
+    /// A development bundle uses its own checkout; the shipped bundle
+    /// lives outside runtime/Apps and uses versioned Application Support.
     static var root: URL {
         let fm = FileManager.default
-        let candidates = [
-            appSupport,
-            Bundle.main.bundleURL
-                .deletingLastPathComponent()   // Contents
-                .deletingLastPathComponent()   // X.app
-                .deletingLastPathComponent()   // Apps
-                .deletingLastPathComponent(),  // runtime
-            URL(fileURLWithPath: "/Users/rob/Documents/GitHub/attesor"),
-        ]
+        let apps = Bundle.main.bundleURL.deletingLastPathComponent()
+        let runtime = apps.deletingLastPathComponent()
+        var candidates = [appSupport]
+        if apps.lastPathComponent == "Apps", runtime.lastPathComponent == "runtime" {
+            candidates.insert(runtime.deletingLastPathComponent(), at: 0)
+        }
         for c in candidates where fm.fileExists(
             atPath: c.appendingPathComponent("reconstruct/oah").path) {
             return c
@@ -42,10 +41,9 @@ struct Repo {
     /// present — false on a fresh install before first-run setup.
     static var payloadPresent: Bool {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: oah.path) else { return false }
-        let sysroots = root.appendingPathComponent("runtime/sysroots")
-        return !((try? fm.contentsOfDirectory(atPath: sysroots.path)) ?? [])
-            .filter { !$0.hasPrefix(".") }.isEmpty
+        return fm.isExecutableFile(atPath: oah.path)
+            && fm.isExecutableFile(atPath: sysroot.appendingPathComponent("usr/bin/dpkg").path)
+            && fm.isExecutableFile(atPath: installer.path)
     }
     static var sysroot: URL { root.appendingPathComponent("runtime/sysroots/debian-expanded") }
     static var sysroots: [URL] {
@@ -268,7 +266,7 @@ final class AppState: ObservableObject {
     /// Release asset the bootstrap downloads; overridable for testing.
     static var runtimeURL: String {
         ProcessInfo.processInfo.environment["ATTESOR_RUNTIME_URL"]
-            ?? "https://github.com/rbrtjns90/attesor/releases/latest/download/attesor-runtime.tar.xz"
+            ?? "https://github.com/rbrtjns90/attesor/releases/download/v\(Repo.version)/attesor-runtime.tar.xz"
     }
 
     /// Download + unpack the Linux runtime into Application Support.
@@ -277,55 +275,66 @@ final class AppState: ObservableObject {
     func beginSetup() {
         setup = .downloading(-1)
         let url = Self.runtimeURL
+        let bundled = Bundle.main.url(forResource: "attesor-runtime.tar", withExtension: "xz")
         Task.detached {
             let fm = FileManager.default
             let dest = Repo.appSupport
-            let tmp = dest.appendingPathComponent("runtime-download.tar.xz")
+            let parent = dest.deletingLastPathComponent()
+            let scratch = parent.appendingPathComponent(".setup-" + UUID().uuidString)
+            let unpacked = scratch.appendingPathComponent("runtime")
+            let tmp = scratch.appendingPathComponent("runtime-download.tar.xz")
+            defer { try? fm.removeItem(at: scratch) }
             do {
-                try fm.createDirectory(at: dest, withIntermediateDirectories: true)
-                try? fm.removeItem(at: tmp)
-                // HEAD first so the progress bar has a denominator.
-                var expected: Int64 = -1
-                if let head = Self.pipeOut("/usr/bin/curl", ["-fsSI", url]),
-                   let text = String(data: head, encoding: .utf8) {
-                    for line in text.split(separator: "\r\n") + text.split(separator: "\n")
-                    where line.lowercased().hasPrefix("content-length:") {
-                        expected = Int64(line.split(separator: ":").last?
-                            .trimmingCharacters(in: .whitespaces) ?? "") ?? -1
+                try fm.createDirectory(at: unpacked, withIntermediateDirectories: true)
+                if bundled == nil {
+                    // HEAD first so the progress bar has a denominator.
+                    var expected: Int64 = -1
+                    if let head = Self.pipeOut("/usr/bin/curl", ["-fsSI", url]),
+                       let text = String(data: head, encoding: .utf8) {
+                        for line in text.split(separator: "\r\n") + text.split(separator: "\n")
+                        where line.lowercased().hasPrefix("content-length:") {
+                            expected = Int64(line.split(separator: ":").last?
+                                .trimmingCharacters(in: .whitespaces) ?? "") ?? -1
+                        }
                     }
-                }
-                let curl = Process()
-                curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                curl.arguments = ["-fSL", "--retry", "3", "-o", tmp.path, url]
-                try curl.run()
-                while curl.isRunning {
-                    if expected > 0, let size = try? tmp.resourceValues(
-                        forKeys: [.fileSizeKey]).fileSize {
-                        let frac = min(0.99, Double(size) / Double(expected))
-                        await MainActor.run { self.setup = .downloading(frac) }
+                    let curl = Process()
+                    curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                    curl.arguments = ["-fSL", "--retry", "3", "-o", tmp.path, url]
+                    try curl.run()
+                    while curl.isRunning {
+                        if expected > 0, let size = try? tmp.resourceValues(
+                            forKeys: [.fileSizeKey]).fileSize {
+                            let frac = min(0.99, Double(size) / Double(expected))
+                            await MainActor.run { self.setup = .downloading(frac) }
+                        }
+                        try await Task.sleep(nanoseconds: 500_000_000)
                     }
-                    try await Task.sleep(nanoseconds: 500_000_000)
-                }
-                guard curl.terminationStatus == 0 else {
-                    throw LaunchError(message: "Download failed (curl exit \(curl.terminationStatus)). Check your connection.")
+                    guard curl.terminationStatus == 0 else {
+                        throw LaunchError(message: "Download failed (curl exit \(curl.terminationStatus)). Check your connection.")
+                    }
                 }
                 await MainActor.run { self.setup = .extracting }
-                try fm.createDirectory(at: dest, withIntermediateDirectories: true)
                 let tar = Process()
                 tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-                tar.arguments = ["-xJf", tmp.path, "-C", dest.path]
+                tar.arguments = ["-xJf", (bundled ?? tmp).path, "-C", unpacked.path]
                 try tar.run(); tar.waitUntilExit()
                 guard tar.terminationStatus == 0 else {
                     throw LaunchError(message: "Couldn't unpack the runtime (bad archive?).")
                 }
-                try? fm.removeItem(at: tmp)
+                guard fm.isExecutableFile(atPath: unpacked.appendingPathComponent("reconstruct/oah").path),
+                      fm.isExecutableFile(atPath: unpacked.appendingPathComponent("runtime-src/apt-install.sh").path),
+                      fm.isExecutableFile(atPath: unpacked.appendingPathComponent(
+                        "runtime/sysroots/debian-expanded/usr/bin/dpkg").path) else {
+                    throw LaunchError(message: "The runtime is incomplete. Open Attesor from a fresh copy of the disk image.")
+                }
                 // Writable-data dirs the tarball may not carry.
                 for d in ["runtime/var/cache/jit", "runtime/var/log",
                           "runtime/var/freeciv/home"] {
                     try? fm.createDirectory(
-                        at: dest.appendingPathComponent(d),
+                        at: unpacked.appendingPathComponent(d),
                         withIntermediateDirectories: true)
                 }
+                try fm.moveItem(at: unpacked, to: dest)
                 await MainActor.run { self.setup = .needed; self.reload() }
             } catch {
                 try? fm.removeItem(at: tmp)
@@ -712,7 +721,8 @@ final class AppState: ObservableObject {
         let rc = await run(Repo.oah.path,
                            ["--sysroot", root, dpkg, "-r", prog.package],
                            env: ["DEBIAN_FRONTEND": "noninteractive",
-                                 "OAH_CACHE_DIR": Repo.root.path + "/runtime/var/cache/jit"],
+                                 "OAH_CACHE_DIR": Repo.root.path + "/runtime/var/cache/jit",
+                                 "OAH_SYSROOT_STRICT": "1"],
                            title: "Removing \(prog.package)")
         if rc != 0 { alert = "Removal of \(prog.package) failed — see log."; return }
         _ = await run("/bin/sh", [Repo.syncer.path], title: "Refreshing launchers")
@@ -728,11 +738,13 @@ final class AppState: ObservableObject {
             try? await Task.sleep(nanoseconds: 12_000_000_000)
             self?.launching = nil
         }
-        do {
-            if prog.isGUI { try launchGUI(prog) } else { try launchTerminal(prog) }
-        } catch {
-            launching = nil
-            alert = error.localizedDescription
+        Task {
+            do {
+                if prog.isGUI { try await launchGUI(prog) } else { try launchTerminal(prog) }
+            } catch {
+                launching = nil
+                alert = error.localizedDescription
+            }
         }
     }
 
@@ -859,7 +871,7 @@ final class AppState: ObservableObject {
         try? p.run()
     }
 
-    private func launchGUI(_ prog: InstalledProgram) throws {
+    private func launchGUI(_ prog: InstalledProgram) async throws {
         var env = ProcessInfo.processInfo.environment
         env["LC_ALL"] = "C"
         env["HOME"] = "/root"
@@ -888,7 +900,7 @@ final class AppState: ObservableObject {
             var ready = false
             for _ in 0..<30 {
                 if displayReady(env) { ready = true; break }
-                Thread.sleep(forTimeInterval: 0.25)
+                try await Task.sleep(nanoseconds: 250_000_000)
             }
             if !ready { throw LaunchError(message: "XQuartz did not start its local display.") }
         }
@@ -1242,7 +1254,7 @@ struct LogView: View {
                 .frame(height: 140)
                 .padding(6)
                 .background(Color(nsColor: .textBackgroundColor))
-                .onChange(of: state.log) { proxy.scrollTo("log-bottom") }
+                .onChange(of: state.log) { _ in proxy.scrollTo("log-bottom") }
             }
         } label: {
             HStack {
@@ -1329,30 +1341,33 @@ struct RootView: View {
     }
 }
 
-/// First-run screen: downloads the Linux runtime into Application
-/// Support so the app itself stays a thin bundle.
+/// First-run screen: installs the matching runtime into Application Support.
 struct SetupView: View {
     @EnvironmentObject var state: AppState
+    private var bundledRuntime: Bool {
+        Bundle.main.url(forResource: "attesor-runtime.tar", withExtension: "xz") != nil
+    }
     var body: some View {
         VStack(spacing: 18) {
             if let tux = LinuxIcon.penguin {
                 Image(nsImage: tux).resizable().frame(width: 96, height: 96)
             }
             Text("Welcome to Attesor").font(.largeTitle).bold()
-            Text("Attesor runs x86-64 Linux programs on your Mac.\n"
-                 + "First launch downloads the Linux runtime (~350 MB) — "
-                 + "this happens once.")
+            Text(bundledRuntime
+                 ? "Run Linux apps on your Mac. Set up the included runtime once to get started."
+                 : "Run Linux apps on your Mac. Download the runtime once to get started.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             switch state.setup {
             case .needed:
-                Button("Download & Set Up") { state.beginSetup() }
+                Button(bundledRuntime ? "Set Up Attesor" : "Download & Set Up") { state.beginSetup() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                 if state.xquartzMissing {
-                    Text("Tip: graphical apps need XQuartz — install it with "
-                         + "“brew install --cask xquartz” anytime.")
+                    Text("Graphical Linux apps use XQuartz.")
                         .font(.caption).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
+                    if let url = URL(string: "https://www.xquartz.org/") {
+                        Link("Get XQuartz", destination: url)
+                    }
                 }
             case .downloading(let frac):
                 if frac >= 0 {

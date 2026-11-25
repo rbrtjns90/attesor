@@ -34,6 +34,7 @@ for arg in "$@"; do
         -f|--force) force=1 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         --) ;;
+        -*) echo "Unknown option: $arg" >&2; exit 2 ;;
         *) pkgs+=("$arg") ;;
     esac
 done
@@ -43,7 +44,7 @@ if [ "${#pkgs[@]}" -eq 0 ]; then
 fi
 
 run_guest() {
-    env DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
+    env OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
         "$OAH" --sysroot "$S" "$@"
 }
 
@@ -55,10 +56,23 @@ if [ "$update" = 1 ]; then
 fi
 
 echo "== resolving: ${pkgs[*]}"
-resolved=$(run_guest "$S/usr/bin/apt-get" install --print-uris -y "${pkgs[@]}") || {
-    echo "!! apt could not resolve: ${pkgs[*]}" >&2
-    exit 1
-}
+# Native resolution is the default — the guest apt-get resolver under the
+# translator is kept only as an opt-in fallback (OAH_GUEST_RESOLVE=1) for
+# debugging, since it takes minutes where the native pass is instant.
+if [ "${OAH_GUEST_RESOLVE:-0}" = 1 ]; then
+    resolved=$(run_guest "$S/usr/bin/apt-get" -o Acquire::Languages=none \
+        -o Dir::Cache::pkgcache=/var/cache/apt/pkgcache.bin \
+        -o Dir::Cache::srcpkgcache=/var/cache/apt/srcpkgcache.bin \
+        install --print-uris -y "${pkgs[@]}") || {
+        echo "!! apt could not resolve: ${pkgs[*]}" >&2
+        exit 1
+    }
+else
+    resolved=$(python3 "$A/runtime-src/native-resolve.py" "$S" "${pkgs[@]}") || {
+        echo "!! could not resolve natively: ${pkgs[*]} (try OAH_GUEST_RESOLVE=1)" >&2
+        exit 1
+    }
+fi
 # --print-uris output lines: '<url>' <filename> <size> <hash>
 uris=$(printf '%s\n' "$resolved" | sed -n "s/^'\([^']*\)'.*/\1/p")
 if [ -z "$uris" ]; then
@@ -73,7 +87,7 @@ n=0
 for url in $uris; do
     n=$((n + 1))
     echo "== fetch $(basename "$url")"
-    curl -fsSL -o "$dir/$(basename "$url")" "$url" || {
+    curl -fsSL --retry 2 --connect-timeout 15 -o "$dir/$(basename "$url")" "$url" || {
         echo "!! download failed: $url" >&2
         exit 1
     }

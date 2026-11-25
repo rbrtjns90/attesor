@@ -23,14 +23,14 @@
 # postinst. We invoke preinst before extraction via the translator when the
 # deb ships one (rare outside base system).
 
-set -uo pipefail
+set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
     echo "usage: $0 <sysroot> <deb...>" >&2
     exit 2
 fi
 
-SYSROOT=$(cd "$1" && pwd)
+SYSROOT=$(cd "$1" && pwd -P)
 shift
 A="$(cd "$(dirname "$0")/.." && pwd)"
 DPKG="$SYSROOT/var/lib/dpkg"
@@ -54,19 +54,19 @@ for deb in "$@"; do
     cm=$(ar_member "$deb" control.tar)
     dm=$(ar_member "$deb" data.tar)
     if [ -z "$cm" ] || [ -z "$dm" ]; then
-        echo "skip $deb: not a deb" >&2
-        continue
+        echo "Invalid Debian archive: $deb" >&2
+        exit 1
     fi
     mkdir -p "$TMP/ctl"
-    (cd "$TMP/ctl" && ar -p "$deb" "$cm" | tar -xf -) || continue
+    (cd "$TMP/ctl" && ar -p "$deb" "$cm" | tar -xf -)
     ctl="$TMP/ctl/control"
     pkg=$(control_field "$ctl" Package)
-    [ -z "$pkg" ] && { echo "skip $deb: no Package field" >&2; continue; }
+    [ -n "$pkg" ] || { echo "Missing Package field in $deb" >&2; exit 1; }
 
     state=$(awk -v p="$pkg" '
         /^Package: / {inpkg = ($2 == p)}
         inpkg && /^Status: / {
-            print ($3 == "installed") ? "installed" : "other"; exit
+            print ($3 == "ok" && $4 == "installed") ? "installed" : "other"; exit
         }' "$STATUS")
     if [ "$state" = "installed" ] && [ "${FORCE:-0}" != "1" ]; then
         echo "== $pkg already installed, skipping"
@@ -81,23 +81,24 @@ for deb in "$@"; do
     if [ -f "$TMP/ctl/preinst" ]; then
         ver=$(control_field "$ctl" Version)
         arch=$(control_field "$ctl" Architecture)
-        chmod +x "$TMP/ctl/preinst"
-        env DEBIAN_FRONTEND=noninteractive DPKG_MAINTSCRIPT_NAME=preinst DPKG_MAINTSCRIPT_PACKAGE="$pkg" \
+        preinst_dir=$(mktemp -d "$SYSROOT/.attesor-preinst.XXXXXX")
+        install -m 700 "$TMP/ctl/preinst" "$preinst_dir/preinst"
+        env OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive DPKG_MAINTSCRIPT_NAME=preinst DPKG_MAINTSCRIPT_PACKAGE="$pkg" \
             DPKG_MAINTSCRIPT_VERSION="$ver" DPKG_MAINTSCRIPT_ARCH="$arch" \
             OAH_CACHE_DIR=$A/runtime/var/cache/jit LC_ALL=C \
             "$A/reconstruct/oah" --sysroot "$SYSROOT" \
-            "$SYSROOT/usr/bin/dash" "$TMP/ctl/preinst" install || {
-                echo "!! $pkg preinst failed, skipping" >&2
-                rm -rf "$TMP/ctl"
-                continue
+            "$SYSROOT/usr/bin/dash" "/${preinst_dir##*/}/preinst" install || {
+                echo "!! $pkg preinst failed" >&2
+                rm -rf "$preinst_dir"
+                exit 1
             }
+        rm -rf "$preinst_dir"
     fi
 
     # Extract payload.
     if ! ar -p "$deb" "$dm" | tar -xpf - -C "$SYSROOT"; then
         echo "!! $pkg extraction failed" >&2
-        rm -rf "$TMP/ctl"
-        continue
+        exit 1
     fi
 
     # info/<pkg>.list — `/.` then every member as absolute path.
@@ -109,10 +110,12 @@ for deb in "$@"; do
     # Control members become info files verbatim.
     for f in md5sums conffiles postinst preinst prerm postrm config \
              templates triggers shlibs symbols; do
-        [ -f "$TMP/ctl/$f" ] && cp "$TMP/ctl/$f" "$INFO/$pkg.$f"
+        if [ -f "$TMP/ctl/$f" ]; then
+            cp "$TMP/ctl/$f" "$INFO/$pkg.$f"
+        fi
     done
     chmod +x "$INFO/$pkg.postinst" "$INFO/$pkg.preinst" \
-             "$INFO/$pkg.prerm" "$INFO/$pkg.postrm" 2>/dev/null
+             "$INFO/$pkg.prerm" "$INFO/$pkg.postrm" 2>/dev/null || true
 
     # Build the replacement status stanza: Package, Status, all remaining
     # control fields, then the Conffiles section dpkg tracks.
@@ -171,7 +174,7 @@ if ls "$TMP"/*.stanza >/dev/null 2>&1; then
 fi
 
 echo "== configuring under translator (dpkg --configure -a)"
-DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR=$A/runtime/var/cache/jit LC_ALL=C \
+OAH_SYSROOT_STRICT=1 DEBIAN_FRONTEND=noninteractive OAH_CACHE_DIR="$A/runtime/var/cache/jit" LC_ALL=C \
     "$A/reconstruct/oah" --sysroot "$SYSROOT" \
     "$SYSROOT/usr/bin/dpkg" --configure -a
 
